@@ -1220,17 +1220,28 @@ Deno.serve(async (req) => {
                 }
 
                 // 2. Navigate to patient page using the ID from search
-                const { body: patientPageBody } = await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patientId}`);
+                const { body: patientPageBody, finalUrl } = await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patientId}`);
                 if (processedCount < 3) {
-                  logParts.push(`Patient page ${patient.firstName} ${patient.lastName} (id=${patientId}): bodyLen=${patientPageBody.length}`);
+                  logParts.push(`Patient page ${patient.firstName} ${patient.lastName} (id=${patientId}): bodyLen=${patientPageBody.length} finalUrl=${finalUrl}`);
+                  logParts.push(`Patient page content: ${patientPageBody.substring(0, 300)}`);
                 }
 
-                // 3. Get file list from blob storage (session-based, patient already loaded)
+                // 2b. Also try navigating to the Medical File tab specifically
+                const { body: medFileBody, finalUrl: medFileUrl } = await fetchWithCookies(`${BASE_URL}/User/Patient/MedicalFile?patientId=${patientId}`);
+                if (processedCount < 3) {
+                  logParts.push(`Medical File page: bodyLen=${medFileBody.length} finalUrl=${medFileUrl}`);
+                  logParts.push(`Med File content: ${medFileBody.substring(0, 300)}`);
+                }
+
+                // 3. Try multiple endpoints for getting the file list
+                // 3a. GetFilesFromBlob
                 const filesRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "Referer": `${BASE_URL}/Patient`,
+                    "ClientPatientId": String(patientId),
+                    ...(_practiceId ? { "practiceId": _practiceId } : {}),
                   },
                   body: new URLSearchParams({
                     sort: "",
@@ -1243,7 +1254,21 @@ Deno.serve(async (req) => {
 
                 if (processedCount < 3) {
                   logParts.push(`GetFilesFromBlob ${patient.firstName} ${patient.lastName}: status=${filesRes.status} len=${filesRes.body.length}`);
-                  logParts.push(`Response preview: ${filesRes.body.substring(0, 500)}`);
+                  logParts.push(`Response: ${filesRes.body.substring(0, 500)}`);
+                }
+
+                // 3b. Try GetMedicalFileList / GetPatientMedicalFile as alternatives
+                if (processedCount < 3) {
+                  const altEndpoints = [
+                    `/Patient/Patient/GetMedicalFileList?patientId=${patientId}`,
+                    `/Patient/Patient/GetPatientMedicalFile?patientId=${patientId}`,
+                    `/User/Scheduler/GetSopaNoteReportDetailsAsync?patientId=${patientId}`,
+                    `/Patient/Patient/GetPatientDocuments?patientId=${patientId}`,
+                  ];
+                  for (const ep of altEndpoints) {
+                    const res = await ajaxFetch(ep);
+                    logParts.push(`Alt ${ep.split("?")[0]}: status=${res.status} len=${res.body.length} preview=${res.body.substring(0, 300)}`);
+                  }
                 }
 
                 if (filesRes.status !== 200 || filesRes.body.length < 10) {
