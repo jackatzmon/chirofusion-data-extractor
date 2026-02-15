@@ -163,14 +163,34 @@ Deno.serve(async (req) => {
         throw new Error(`Unexpected login response: ${loginResponse.substring(0, 200)}`);
       }
 
-      // If multi-location, we may need to call SetLocationDetailsInSession
-      // For now, check if singlelocation (most common for single-practice)
+      // After SingleLocation login, call FirstLook to finalize session
+      if (lowerResponse.includes("singlelocation")) {
+        console.log("Step 3: Calling FirstLook to finalize session...");
+        const firstLookRes = await fetch("https://www.chirofusionlive.com/Account/Login/FirstLook", {
+          method: "POST",
+          headers: {
+            "Cookie": sessionCookies,
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: "",
+          redirect: "manual",
+        });
+        sessionCookies = mergeCookies(sessionCookies, firstLookRes);
+        const firstLookBody = await firstLookRes.text();
+        logParts.push(`\n===== FirstLook RESPONSE =====`);
+        logParts.push(`Status: ${firstLookRes.status}`);
+        logParts.push(`Response (first 500): ${firstLookBody.substring(0, 500)}`);
+        logParts.push(`Cookies after FirstLook: ${sessionCookies}`);
+      }
+
+      // If multi-location, may need SetLocationDetailsInSession
       if (lowerResponse !== "singlelocation" && lowerResponse !== "sysadmin" && loginResponse.includes("location")) {
-        logParts.push(`\n⚠️ MULTI-LOCATION account detected. May need to select a location.`);
+        logParts.push(`\n⚠️ MULTI-LOCATION account detected.`);
         logParts.push(`Location response HTML: ${loginResponse.substring(0, 2000)}`);
       }
 
-      logParts.push(`\n✅ Login appears successful. Response: "${loginResponse.substring(0, 100)}"`);
+      logParts.push(`\n✅ Login complete. Cookies: ${sessionCookies.substring(0, 100)}...`);
 
     } catch (loginError: any) {
       logParts.push(`\n❌ LOGIN ERROR: ${loginError.message}`);
