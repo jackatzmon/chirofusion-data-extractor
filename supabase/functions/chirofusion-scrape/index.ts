@@ -350,66 +350,97 @@ Deno.serve(async (req) => {
         switch (dataType) {
           // ==================== DEMOGRAPHICS ====================
           case "demographics": {
-            // Primary: Use Patient Reports "Export To Excel" (Schedule > Patient Reports)
-            // This returns ALL 2321+ patients with full demographics
-            logParts.push(`Trying ExportPatientReports (Patient Reports > Export To Excel)...`);
+            // ChiroFusion requires: 1) Load Patient Reports page, 2) Run Report, 3) Export
+            // This mimics clicking Schedule > Patient Reports > Run Report > Export To Excel
 
-            // Try the export endpoint that backs the "Export To Excel" button
-            const exportRes = await ajaxFetch("/User/Scheduler/ExportPatientReports", {
+            // Step 1: Navigate to Patient Reports page to establish session context
+            logParts.push(`Step 1: Loading Patient Reports page...`);
+            const { body: reportPageHtml, finalUrl } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
+            logParts.push(`Scheduler page loaded: ${finalUrl} length=${reportPageHtml.length}`);
+
+            // Step 2: Try running the Patient Report (this populates server-side data)
+            logParts.push(`Step 2: Running Patient Report...`);
+            
+            // Try the AJAX endpoint that "Run Report" button calls
+            const runReportRes = await ajaxFetch("/User/Scheduler/GetPatientReportData", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                reportType: "PatientList",
+                patientStatus: "All",
+                page: 1,
+                pageSize: 5000,
+              }),
+            });
+            logParts.push(`GetPatientReportData (JSON POST): status=${runReportRes.status} type=${runReportRes.contentType} length=${runReportRes.body.length}`);
+            logParts.push(`Preview: ${runReportRes.body.substring(0, 500)}`);
+
+            // Check if we got data directly from the report endpoint
+            if (runReportRes.status === 200 && runReportRes.contentType.includes("json") && runReportRes.body.length > 100) {
+              try {
+                const reportData = JSON.parse(runReportRes.body);
+                const items = reportData.Data || reportData.data || reportData.Items || reportData;
+                if (Array.isArray(items) && items.length > 0) {
+                  csvContent = jsonToCsv(items);
+                  rowCount = items.length;
+                  logParts.push(`✅ Demographics (report JSON): ${rowCount} patients`);
+                  break;
+                }
+              } catch { /* continue to other methods */ }
+            }
+
+            // Try form-encoded POST variant
+            const runReport2 = await ajaxFetch("/User/Scheduler/GetPatientReportData", {
               method: "POST",
               headers: { "Content-Type": "application/x-www-form-urlencoded" },
               body: new URLSearchParams({
                 reportType: "PatientList",
                 patientStatus: "All",
+                page: "1",
+                pageSize: "5000",
               }).toString(),
             });
-            logParts.push(`ExportPatientReports POST: status=${exportRes.status} type=${exportRes.contentType} length=${exportRes.body.length}`);
-            logParts.push(`Preview: ${exportRes.body.substring(0, 500)}`);
+            logParts.push(`GetPatientReportData (form POST): status=${runReport2.status} type=${runReport2.contentType} length=${runReport2.body.length}`);
+            logParts.push(`Preview: ${runReport2.body.substring(0, 500)}`);
+
+            if (runReport2.status === 200 && runReport2.body.length > 100 && !runReport2.body.includes("<!DOCTYPE")) {
+              try {
+                const reportData = JSON.parse(runReport2.body);
+                const items = reportData.Data || reportData.data || reportData;
+                if (Array.isArray(items) && items.length > 0) {
+                  csvContent = jsonToCsv(items);
+                  rowCount = items.length;
+                  logParts.push(`✅ Demographics (report form): ${rowCount} patients`);
+                  break;
+                }
+              } catch { /* continue */ }
+            }
+
+            // Step 3: Now try the Export after the report was run (session should have data)
+            logParts.push(`Step 3: Trying export after report run...`);
+            const exportRes = await ajaxFetch("/User/Scheduler/ExportPatientReports");
+            logParts.push(`ExportPatientReports: status=${exportRes.status} type=${exportRes.contentType} length=${exportRes.body.length}`);
+            logParts.push(`Preview: ${exportRes.body.substring(0, 300)}`);
 
             if (exportRes.body.length > 200 && !exportRes.body.includes("<!DOCTYPE") && !exportRes.body.includes("<html")) {
               csvContent = exportRes.body;
               rowCount = csvContent.split("\n").length - 1;
-              logParts.push(`✅ Demographics (ExportPatientReports): ${rowCount} rows`);
+              logParts.push(`✅ Demographics (export): ${rowCount} rows`);
             } else {
-              // Try GET variant
-              const getRes = await ajaxFetch("/User/Scheduler/ExportPatientReports?reportType=PatientList&patientStatus=All");
-              logParts.push(`ExportPatientReports GET: status=${getRes.status} type=${getRes.contentType} length=${getRes.body.length}`);
-              logParts.push(`GET Preview: ${getRes.body.substring(0, 500)}`);
-
-              if (getRes.body.length > 200 && !getRes.body.includes("<!DOCTYPE") && !getRes.body.includes("<html")) {
-                csvContent = getRes.body;
-                rowCount = csvContent.split("\n").length - 1;
-                logParts.push(`✅ Demographics (GET): ${rowCount} rows`);
-              } else {
-                // Try ExportPatientList
-                const listRes = await ajaxFetch("/Patient/Patient/ExportPatientList", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                  body: "",
-                });
-                logParts.push(`ExportPatientList: status=${listRes.status} type=${listRes.contentType} length=${listRes.body.length}`);
-                logParts.push(`Preview: ${listRes.body.substring(0, 500)}`);
-
-                if (listRes.body.length > 200 && !listRes.body.includes("<!DOCTYPE") && !listRes.body.includes("<html")) {
-                  csvContent = listRes.body;
-                  rowCount = csvContent.split("\n").length - 1;
-                  logParts.push(`✅ Demographics (ExportPatientList): ${rowCount} rows`);
-                } else {
-                  // Final fallback: JSON endpoint (partial)
-                  const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
-                  if (contentType.includes("application/json")) {
-                    const patients = (JSON.parse(body)).PatientData || JSON.parse(body);
-                    if (Array.isArray(patients) && patients.length > 0) {
-                      const expanded = patients.map((p: any) => ({
-                        PatientID: p.I || "", FirstName: p.F || "", LastName: p.L || "",
-                        DateOfBirth: p.DOB || "", HomePhone: p.HP || "", MobilePhone: p.MP || "",
-                        Email: p.E || "",
-                      }));
-                      csvContent = jsonToCsv(expanded);
-                      rowCount = expanded.length;
-                      logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients (partial)`);
-                    }
-                  }
+              // Final fallback: JSON endpoint (partial)
+              logParts.push(`Export still failing. Falling back to JSON endpoint...`);
+              const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
+              if (contentType.includes("application/json")) {
+                const patients = (JSON.parse(body)).PatientData || JSON.parse(body);
+                if (Array.isArray(patients) && patients.length > 0) {
+                  const expanded = patients.map((p: any) => ({
+                    PatientID: p.I || "", FirstName: p.F || "", LastName: p.L || "",
+                    DateOfBirth: p.DOB || "", HomePhone: p.HP || "", MobilePhone: p.MP || "",
+                    Email: p.E || "",
+                  }));
+                  csvContent = jsonToCsv(expanded);
+                  rowCount = expanded.length;
+                  logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients (partial)`);
                 }
               }
             }
