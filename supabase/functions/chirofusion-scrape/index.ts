@@ -506,10 +506,10 @@ Deno.serve(async (req) => {
 
       logParts.push(`✅ Login: "${lowerResponse}"`);
       console.log("Login successful:", lowerResponse);
-    } catch (loginError: any) {
-      logParts.push(`❌ LOGIN ERROR: ${loginError.message}`);
-      await serviceClient.from("scrape_jobs").update({ status: "failed", error_message: loginError.message, log_output: logParts.join("\n") }).eq("id", job.id);
-      return new Response(JSON.stringify({ error: loginError.message }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    } catch (loginError) {
+      logParts.push(`❌ LOGIN ERROR: ${(loginError as any).message}`);
+      await serviceClient.from("scrape_jobs").update({ status: "failed", error_message: (loginError as any).message, log_output: logParts.join("\n") }).eq("id", job.id);
+      return new Response(JSON.stringify({ error: (loginError as any).message }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
     // ==================== DISCOVER MODE (COMPREHENSIVE) ====================
@@ -620,12 +620,12 @@ Deno.serve(async (req) => {
               logParts.push(`\nALL URLs in ${shortName}:`);
               for (const u of [...urls].sort()) logParts.push(`  ${u}`);
             }
-          } catch (e: any) {
-            logParts.push(`JS fetch error ${jsUrl}: ${e.message}`);
+          } catch (e) {
+            logParts.push(`JS fetch error ${jsUrl}: ${(e as any).message}`);
           }
         }
-      } catch (err: any) {
-        logParts.push(`SCHEDULER ERROR: ${err.message}`);
+      } catch (err) {
+        logParts.push(`SCHEDULER ERROR: ${(err as any).message}`);
       }
 
       // ===== 2. EXTRACT MULTISELECT OPTIONS & TEST ENDPOINTS =====
@@ -666,8 +666,8 @@ Deno.serve(async (req) => {
           logParts.push(`GetPatientReports(Status=${params.PatientStatus || "empty"}): status=${res.status} len=${res.body.length} type=${res.contentType}`);
           if (res.body.length > 0 && res.body.length < 2000) logParts.push(`  Body: ${res.body}`);
           else if (res.body.length >= 2000) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
-        } catch (e: any) {
-          logParts.push(`GetPatientReports error: ${e.message}`);
+        } catch (e) {
+          logParts.push(`GetPatientReports error: ${(e as any).message}`);
         }
       }
 
@@ -684,8 +684,8 @@ Deno.serve(async (req) => {
         });
         logParts.push(`ExportPatientReports: status=${res.status} len=${res.body.length} type=${res.contentType}`);
         if (res.body.length > 0) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
-      } catch (e: any) {
-        logParts.push(`ExportPatientReports error: ${e.message}`);
+      } catch (e) {
+        logParts.push(`ExportPatientReports error: ${(e as any).message}`);
       }
 
       // 2c: Try ExportPatientReports with fetchWithCookies (non-AJAX, like browser form submit)
@@ -709,8 +709,8 @@ Deno.serve(async (req) => {
         logParts.push(`ExportPatientReports(raw): status=${rawRes.status} len=${rawBody.length}`);
         logParts.push(`  Headers: ${JSON.stringify(Object.fromEntries(rawRes.headers.entries()))}`);
         logParts.push(`  Full body: ${rawBody.substring(0, 1000)}`);
-      } catch (e: any) {
-        logParts.push(`Raw export error: ${e.message}`);
+      } catch (e) {
+        logParts.push(`Raw export error: ${(e as any).message}`);
       }
 
       // 2d: ExportPatientList - try multiple paths
@@ -727,8 +727,8 @@ Deno.serve(async (req) => {
           if (res.status === 200 && res.body.length > 50 && !res.body.includes("<!DOCTYPE")) {
             logParts.push(`  ✅ FOUND DATA: ${res.body.substring(0, 300)}`);
           }
-        } catch (e: any) {
-          logParts.push(`${path}: error ${e.message}`);
+        } catch (e) {
+          logParts.push(`${path}: error ${(e as any).message}`);
         }
       }
 
@@ -742,8 +742,8 @@ Deno.serve(async (req) => {
           if (res.status === 200 && body.length > 50 && !body.includes("<!DOCTYPE")) {
             logParts.push(`  ✅ FOUND DATA: ${body.substring(0, 300)}`);
           }
-        } catch (e: any) {
-          logParts.push(`GET ${path}: error ${e.message}`);
+        } catch (e) {
+          logParts.push(`GET ${path}: error ${(e as any).message}`);
         }
       }
 
@@ -777,8 +777,8 @@ Deno.serve(async (req) => {
           logParts.push(`${path}: status=${res.status} len=${res.body.length} type=${res.contentType}`);
           if (res.body.length > 0 && res.body.length < 1000) logParts.push(`  Body: ${res.body}`);
           else if (res.body.length >= 1000) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
-        } catch (e: any) {
-          logParts.push(`${path}: error ${e.message}`);
+        } catch (e) {
+          logParts.push(`${path}: error ${(e as any).message}`);
         }
       }
 
@@ -798,8 +798,8 @@ Deno.serve(async (req) => {
           });
           logParts.push(`${path}: status=${res.status} len=${res.body.length} type=${res.contentType}`);
           if (res.body.length > 0) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
-        } catch (e: any) {
-          logParts.push(`${path}: error ${e.message}`);
+        } catch (e) {
+          logParts.push(`${path}: error ${(e as any).message}`);
         }
       }
 
@@ -817,16 +817,16 @@ Deno.serve(async (req) => {
           const tag = bfm[0].substring(0, bfm[0].indexOf(">") + 1);
           logParts.push(`  Billing form: ${tag.substring(0, 200)}`);
         }
-      } catch (e: any) {
-        logParts.push(`Billing page error: ${e.message}`);
+      } catch (e) {
+        logParts.push(`Billing page error: ${(e as any).message}`);
       }
 
       // 4b: Home page (SOAP notes search)
       try {
         const { body: homeHtml } = await fetchWithCookies(`${BASE_URL}/`);
         logParts.push(`Home page: ${homeHtml.length} chars`);
-      } catch (e: any) {
-        logParts.push(`Home page error: ${e.message}`);
+      } catch (e) {
+        logParts.push(`Home page error: ${(e as any).message}`);
       }
 
       // 4c: Try patient search/SOAP endpoints
@@ -854,14 +854,14 @@ Deno.serve(async (req) => {
                 const res = await ajaxFetch(sp);
                 logParts.push(`${sp}: status=${res.status} len=${res.body.length} type=${res.contentType}`);
                 if (res.status === 200 && res.body.length > 0 && res.body.length < 1000) logParts.push(`  Body: ${res.body.substring(0, 500)}`);
-              } catch (e: any) {
-                logParts.push(`${sp}: error ${e.message}`);
+              } catch (e) {
+                logParts.push(`${sp}: error ${(e as any).message}`);
               }
             }
           }
         }
-      } catch (e: any) {
-        logParts.push(`Patient JSON error: ${e.message}`);
+      } catch (e) {
+        logParts.push(`Patient JSON error: ${(e as any).message}`);
       }
 
       // ===== 5. WAIT 20s AND TRY EXPORT AGAIN (report might have primed) =====
@@ -880,8 +880,8 @@ Deno.serve(async (req) => {
         });
         logParts.push(`ExportPatientReports(after 20s): status=${res.status} len=${res.body.length} type=${res.contentType}`);
         if (res.body.length > 0) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
-      } catch (e: any) {
-        logParts.push(`Export after wait error: ${e.message}`);
+      } catch (e) {
+        logParts.push(`Export after wait error: ${(e as any).message}`);
       }
 
       // Also try appointment export after the wait
@@ -895,8 +895,8 @@ Deno.serve(async (req) => {
         });
         logParts.push(`ExportAppointmentReport(after 20s): status=${res.status} len=${res.body.length} type=${res.contentType}`);
         if (res.body.length > 0) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
-      } catch (e: any) {
-        logParts.push(`Appt export after wait error: ${e.message}`);
+      } catch (e) {
+        logParts.push(`Appt export after wait error: ${(e as any).message}`);
       }
 
       await serviceClient.from("scrape_jobs").update({ status: "completed", progress: 100, log_output: logParts.join("\n") }).eq("id", job.id);
@@ -1126,8 +1126,8 @@ Deno.serve(async (req) => {
                   while ((urlMatch = gridReadRegex.exec(jsBody)) !== null) {
                     logParts.push(`URL in ${src.split("/").pop()}: ${urlMatch[1]}`);
                   }
-                } catch (e: any) {
-                  logParts.push(`JS fetch error: ${e.message}`);
+                } catch (e) {
+                  logParts.push(`JS fetch error: ${(e as any).message}`);
                 }
               }
             }
@@ -1170,8 +1170,8 @@ Deno.serve(async (req) => {
                 } else if (formRes.body.length > 0) {
                   logParts.push(`  Form response preview: ${formRes.body.substring(0, 500)}`);
                 }
-              } catch (e: any) {
-                logParts.push(`  Form POST error: ${e.message}`);
+              } catch (e) {
+                logParts.push(`  Form POST error: ${(e as any).message}`);
               }
             }
 
@@ -1243,8 +1243,8 @@ Deno.serve(async (req) => {
                       break;
                     }
                   }
-                } catch (e: any) {
-                  logParts.push(`    Error: ${e.message}`);
+                } catch (e) {
+                  logParts.push(`    Error: ${(e as any).message}`);
                 }
               }
             }
@@ -1269,8 +1269,8 @@ Deno.serve(async (req) => {
                 } else if (formRes.body.length > 0) {
                   logParts.push(`  Response preview: ${formRes.body.substring(0, 500)}`);
                 }
-              } catch (e: any) {
-                logParts.push(`  Form POST error: ${e.message}`);
+              } catch (e) {
+                logParts.push(`  Form POST error: ${(e as any).message}`);
               }
             }
 
@@ -1307,8 +1307,8 @@ Deno.serve(async (req) => {
                       }
                     } catch { /* not JSON */ }
                   }
-                } catch (e: any) {
-                  logParts.push(`Kendo ${kp}: error ${e.message}`);
+                } catch (e) {
+                  logParts.push(`Kendo ${kp}: error ${(e as any).message}`);
                 }
               }
             }
@@ -1345,8 +1345,8 @@ Deno.serve(async (req) => {
                     logParts.push(`Sample patient data: ${JSON.stringify(patients[0]).substring(0, 500)}`);
                   }
                 }
-              } catch (err: any) {
-                logParts.push(`JSON fallback error: ${err.message}`);
+              } catch (err) {
+                logParts.push(`JSON fallback error: ${(err as any).message}`);
               }
             }
             break;
@@ -1412,8 +1412,8 @@ Deno.serve(async (req) => {
                   }
                 } catch { /* not JSON, try export */ }
               }
-            } catch (e: any) {
-              logParts.push(`Trigger error: ${e.message}`);
+            } catch (e) {
+              logParts.push(`Trigger error: ${(e as any).message}`);
             }
 
             // Step 3: Poll ExportAppointmentReport if direct response didn't have data
@@ -1454,8 +1454,8 @@ Deno.serve(async (req) => {
                   if (expRes.body.length > 0 && expRes.body.length < 1000) {
                     logParts.push(`  Body: ${expRes.body}`);
                   }
-                } catch (e: any) {
-                  logParts.push(`  Attempt ${attempt} error: ${e.message}`);
+                } catch (e) {
+                  logParts.push(`  Attempt ${attempt} error: ${(e as any).message}`);
                 }
               }
             }
@@ -1619,8 +1619,8 @@ Deno.serve(async (req) => {
                   });
                   apptPdfCount++;
                 }
-              } catch (err: any) {
-                logParts.push(`❌ PDF ${pName}: ${err.message}`);
+              } catch (err) {
+                logParts.push(`❌ PDF ${pName}: ${(err as any).message}`);
                 appointmentsIndex.push({ PatientName: pName, Appointments: pAppts.length, PDFLink: "", Status: "Error" });
               }
 
@@ -1888,8 +1888,8 @@ Deno.serve(async (req) => {
                 } else {
                   if (processedCount < 3) logParts.push(`PDF export ${patient.firstName}: status=${pdfRes.status}`);
                 }
-              } catch (err: any) {
-                logParts.push(`❌ ${patient.firstName} ${patient.lastName}: ${err.message}`);
+              } catch (err) {
+                logParts.push(`❌ ${patient.firstName} ${patient.lastName}: ${(err as any).message}`);
               }
 
               processedCount = i + 1;
@@ -2039,8 +2039,8 @@ Deno.serve(async (req) => {
                 ledgerFetched++;
                 if (isDebug) logParts.push(`  ✅ ${ledgerRows.length} ledger rows for ${patientName}`);
 
-              } catch (err: any) {
-                logParts.push(`❌ Ledger ${patient.firstName} ${patient.lastName}: ${err.message}`);
+              } catch (err) {
+                logParts.push(`❌ Ledger ${patient.firstName} ${patient.lastName}: ${(err as any).message}`);
               }
 
               processedCount = i + 1;
@@ -2069,60 +2069,6 @@ Deno.serve(async (req) => {
             }
             break;
           }
-
-                // Parse Kendo grid JSON response: { Data: [...], Total: N }
-                let parsed: { Data?: Record<string, unknown>[]; Total?: number };
-                try {
-                  parsed = JSON.parse(res.body);
-                } catch {
-                  logParts.push(`⚠️ Non-JSON response: ${res.body.substring(0, 500)}`);
-                  break;
-                }
-
-                const rows = parsed.Data || [];
-                if (rows.length === 0) {
-                  hasMore = false;
-                  break;
-                }
-
-                // Clean .NET dates in all rows
-                for (const row of rows) {
-                  for (const key of Object.keys(row)) {
-                    if (typeof row[key] === "string" && (row[key] as string).includes("/Date(")) {
-                      row[key] = parseNetDate(row[key] as string);
-                    }
-                  }
-                }
-
-                allStatementRows.push(...rows);
-                logParts.push(`  Got ${rows.length} rows (total so far: ${allStatementRows.length}/${parsed.Total || "?"})`);
-
-                if (allStatementRows.length >= (parsed.Total || Infinity)) {
-                  hasMore = false;
-                } else {
-                  page++;
-                }
-
-                // Progress update
-                const pct = parsed.Total ? Math.round((allStatementRows.length / parsed.Total) * (100 / totalTypes)) : 0;
-                await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + pct, 99), log_output: logParts.join("\n") }).eq("id", job.id);
-
-                await new Promise(r => setTimeout(r, 300));
-              } catch (err: any) {
-                logParts.push(`❌ Statements page ${page} error: ${err.message}`);
-                break;
-              }
-            }
-
-            if (allStatementRows.length > 0) {
-              csvContent = jsonToCsv(allStatementRows);
-              rowCount = allStatementRows.length;
-              logParts.push(`✅ Patient Statements: ${rowCount} records`);
-            } else {
-              logParts.push(`⚠️ Patient Statements: No data retrieved`);
-            }
-            break;
-          }
         }
 
         // Collect CSV for consolidated workbook (instead of uploading individually)
@@ -2134,8 +2080,8 @@ Deno.serve(async (req) => {
         progress += Math.round(100 / totalTypes);
         await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress, 99) }).eq("id", job.id);
 
-      } catch (scrapeError: any) {
-        logParts.push(`❌ Error scraping ${dataType}: ${scrapeError.message}`);
+      } catch (scrapeError) {
+        logParts.push(`❌ Error scraping ${dataType}: ${(scrapeError as any).message}`);
         console.error(`Error scraping ${dataType}:`, scrapeError);
       }
     }
@@ -2256,8 +2202,8 @@ Deno.serve(async (req) => {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
 
-  } catch (error: any) {
+  } catch (error) {
     console.error("Error:", error);
-    return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ error: (error as any).message }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
   }
 });
