@@ -527,135 +527,73 @@ Deno.serve(async (req) => {
               logParts.push(`ExportPatientList error: ${err.message}`);
             }
 
-            // ===== Attempt 2: Try GetPatientReports with Kendo grid params =====
+            // ===== Attempt 2: Use CORRECT endpoint /Scheduler/Scheduler/GetPatientReports =====
+            // (discovered from AppointmentReport.js: RunPatientReport posts to /Scheduler/Scheduler/GetPatientReports)
             if (!found) {
-              logParts.push(`Step 2: Kendo grid read attempts...`);
-              const reportParams: Record<string, string> = {
-                PatientReportType: "1",
-                ReportType: "1",
-                PatientStatus: "Active",
-                PatientStatusString: "Active",
-                IsAllPatientValue: "true",
-                IsAllPatient: "true",
+              logParts.push(`Step 2: Correct endpoint /Scheduler/Scheduler/GetPatientReports...`);
+              
+              // Match exactly what RunPatientReport sends:
+              // {ReportType: value, BirthMonths: "", PatientStatus: "", PatientInsurance: ""}
+              const reportData = {
+                ReportType: "1",  // PatientReportType.PatientList = 1
                 BirthMonths: "",
-                BirthMonthString: "",
+                PatientStatus: "",
                 PatientInsurance: "",
-                PatientInsuranceString: "",
-                isOverrideDate: "false",
               };
 
-              // 2a: Form-encoded POST (current approach)
               try {
-                const formRes = await ajaxFetch("/User/Scheduler/GetPatientReports", {
+                const res = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/x-www-form-urlencoded",
                     "RequestVerificationToken": schedToken,
                   },
-                  body: new URLSearchParams({
-                    ...reportParams,
-                    take: "5000", skip: "0", page: "1", pageSize: "5000",
-                  }).toString(),
+                  body: new URLSearchParams(reportData).toString(),
                 });
-                logParts.push(`2a form: status=${formRes.status} len=${formRes.body.length} type=${formRes.contentType}`);
-                if (formRes.body.length > 10) logParts.push(`  Preview: ${formRes.body.substring(0, 400)}`);
-                if (formRes.body.length > 50 && formRes.contentType.includes("json")) {
-                  const data = JSON.parse(formRes.body);
-                  const items = data.Data || data.data || (Array.isArray(data) ? data : null);
-                  if (items && Array.isArray(items) && items.length > 0) {
-                    csvContent = jsonToCsv(items);
-                    rowCount = items.length;
-                    logParts.push(`✅ Demographics: ${rowCount} patients`);
-                    found = true;
-                  } else {
-                    logParts.push(`  Keys: ${Object.keys(data).join(",")}, Total: ${data.Total || "N/A"}`);
-                  }
-                }
-              } catch (e: any) { logParts.push(`2a error: ${e.message}`); }
-
-              // 2b: JSON POST (Kendo sometimes sends JSON body)
-              if (!found) {
-                try {
-                  const jsonRes = await ajaxFetch("/User/Scheduler/GetPatientReports", {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                      "RequestVerificationToken": schedToken,
-                    },
-                    body: JSON.stringify({
-                      ...reportParams,
-                      take: 5000, skip: 0, page: 1, pageSize: 5000,
-                    }),
-                  });
-                  logParts.push(`2b JSON: status=${jsonRes.status} len=${jsonRes.body.length}`);
-                  if (jsonRes.body.length > 10) logParts.push(`  Preview: ${jsonRes.body.substring(0, 400)}`);
-                  if (jsonRes.body.length > 50 && jsonRes.contentType.includes("json")) {
-                    const data = JSON.parse(jsonRes.body);
+                logParts.push(`GetPatientReports: status=${res.status} len=${res.body.length} type=${res.contentType}`);
+                if (res.body.length > 10) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
+                if (res.body.length > 50 && res.contentType.includes("json")) {
+                  try {
+                    const data = JSON.parse(res.body);
                     const items = data.Data || data.data || (Array.isArray(data) ? data : null);
                     if (items && Array.isArray(items) && items.length > 0) {
                       csvContent = jsonToCsv(items);
                       rowCount = items.length;
                       logParts.push(`✅ Demographics: ${rowCount} patients`);
                       found = true;
+                    } else {
+                      logParts.push(`  Keys: ${Object.keys(data).join(",")}, Total: ${data.Total || "N/A"}`);
+                      // Log first item sample if exists
+                      if (items && items[0]) logParts.push(`  Sample: ${JSON.stringify(items[0]).substring(0, 300)}`);
                     }
-                  }
-                } catch (e: any) { logParts.push(`2b error: ${e.message}`); }
-              }
-
-              // 2c: Try RunPatientReport endpoint (might be separate from grid read)
-              if (!found) {
-                const runEndpoints = [
-                  "/User/Scheduler/RunPatientReport",
-                  "/User/Scheduler/RunReport",
-                  "/User/Scheduler/PatientReports",
-                ];
-                for (const ep of runEndpoints) {
-                  if (found) break;
-                  try {
-                    const res = await ajaxFetch(ep, {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "RequestVerificationToken": schedToken,
-                      },
-                      body: new URLSearchParams({
-                        ...reportParams,
-                        take: "5000", skip: "0", page: "1", pageSize: "5000",
-                      }).toString(),
-                    });
-                    logParts.push(`${ep}: status=${res.status} len=${res.body.length}`);
-                    if (res.body.length > 10) logParts.push(`  Preview: ${res.body.substring(0, 300)}`);
-                    if (res.body.length > 50 && res.contentType.includes("json")) {
-                      const data = JSON.parse(res.body);
-                      const items = data.Data || data.data || (Array.isArray(data) ? data : null);
-                      if (items && Array.isArray(items) && items.length > 0) {
-                        csvContent = jsonToCsv(items);
-                        rowCount = items.length;
-                        logParts.push(`✅ Demographics from ${ep}: ${rowCount}`);
-                        found = true;
-                      }
-                    }
-                  } catch { /* skip */ }
+                  } catch (e: any) { logParts.push(`  Parse error: ${e.message}`); }
                 }
-              }
+              } catch (e: any) { logParts.push(`GetPatientReports error: ${e.message}`); }
 
-              // 2d: Try ExportPatientReports directly (skip the 20s wait - it never helped)
+              // 2b: Also try ExportPatientReports with correct prefix
               if (!found) {
                 try {
-                  const expRes = await ajaxFetch("/User/Scheduler/ExportPatientReports", {
+                  const expRes = await ajaxFetch("/Scheduler/Scheduler/ExportPatientReports", {
                     method: "POST",
                     headers: {
                       "Content-Type": "application/x-www-form-urlencoded",
                       "RequestVerificationToken": schedToken,
                     },
                     body: new URLSearchParams({
-                      ...reportParams,
+                      ...reportData,
                       __RequestVerificationToken: schedToken,
                     }).toString(),
                   });
-                  logParts.push(`ExportPatientReports: status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
+                  logParts.push(`ExportPatientReports (correct path): status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
                   if (expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE")) {
                     logParts.push(`  Preview: ${expRes.body.substring(0, 300)}`);
+                    // Check if it's CSV/Excel data
+                    if (expRes.body.includes(",") && expRes.body.includes("\n") && !expRes.body.includes("<html")) {
+                      csvContent = expRes.body;
+                      rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
+                      logParts.push(`✅ Demographics CSV: ${rowCount} rows`);
+                      found = true;
+                    }
                   }
                 } catch (e: any) { logParts.push(`Export error: ${e.message}`); }
               }
