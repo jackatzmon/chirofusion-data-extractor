@@ -438,33 +438,38 @@ Deno.serve(async (req) => {
       const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
       const fnUrl = `${supabaseUrl}/functions/v1/chirofusion-scrape`;
       // Fire and forget — only pass minimal fields in body
-      fetch(fnUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": authHeader!,
-        },
-        body: JSON.stringify({
-          dataTypes, mode, dateFrom, dateTo,
-          _batchJobId: job.id,
-          _batchState: {
-            resumeIndex: batchState.resumeIndex,
-            pdfCount: batchState.pdfCount,
-            searchFailed: batchState.searchFailed,
-            withFiles: batchState.withFiles,
-            skippedDefaultCase: batchState.skippedDefaultCase,
-            dataTypeIndex: batchState.dataTypeIndex,
-            // Financials-specific counters
-            ledgerFetched: batchState.ledgerFetched,
-            ledgerEmpty: batchState.ledgerEmpty,
-            ledgerSearchFailed: batchState.ledgerSearchFailed,
-            // Appointments-specific counters
-            apptPdfResumeIndex: batchState.apptPdfResumeIndex,
-            apptPdfCount: batchState.apptPdfCount,
-            apptSearchFailed: batchState.apptSearchFailed,
+      try {
+        const invokeRes = await fetch(fnUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": authHeader!,
           },
-        }),
-      }).catch(err => console.error("Self-invoke error:", err));
+          body: JSON.stringify({
+            dataTypes, mode, dateFrom, dateTo,
+            _batchJobId: job.id,
+            _batchState: {
+              resumeIndex: batchState.resumeIndex,
+              pdfCount: batchState.pdfCount,
+              searchFailed: batchState.searchFailed,
+              withFiles: batchState.withFiles,
+              skippedDefaultCase: batchState.skippedDefaultCase,
+              dataTypeIndex: batchState.dataTypeIndex,
+              // Financials-specific counters
+              ledgerFetched: batchState.ledgerFetched,
+              ledgerEmpty: batchState.ledgerEmpty,
+              ledgerSearchFailed: batchState.ledgerSearchFailed,
+              // Appointments-specific counters
+              apptPdfResumeIndex: batchState.apptPdfResumeIndex,
+              apptPdfCount: batchState.apptPdfCount,
+              apptSearchFailed: batchState.apptSearchFailed,
+            },
+          }),
+        });
+        console.log(`Self-invoke response: ${invokeRes.status}`);
+      } catch (err) {
+        console.error("Self-invoke error:", err);
+      }
     }
 
     // Helper: follow redirects manually preserving cookies
