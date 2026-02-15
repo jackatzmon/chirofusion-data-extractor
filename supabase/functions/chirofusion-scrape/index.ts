@@ -636,7 +636,6 @@ Deno.serve(async (req) => {
       const token = schedHtml.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/)?.[1] || "";
       setPracticeId(schedHtml);
 
-      // Extract PatientStatus multiselect options
       const statusSelectMatch = schedHtml.match(/<select[^>]*id="patientReportPatientStatusMultiSelect"[^>]*>([\s\S]*?)<\/select>/i);
       const statusOpts: string[] = [];
       if (statusSelectMatch) {
@@ -648,7 +647,8 @@ Deno.serve(async (req) => {
       }
       const allStatusValues = statusOpts.join("^") || "1^2^3";
 
-      // Step 2: Run GetPatientReports to prime the session (this returns demographics but no IDs)
+      // Step 2: Run GetPatientReports to get names (no IDs) and prime session
+      let nameList: { firstName: string; lastName: string }[] = [];
       const reportRes = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
@@ -660,40 +660,91 @@ Deno.serve(async (req) => {
         }).toString(),
       });
 
-      let demographicCount = 0;
       if (reportRes.status === 200 && reportRes.body.length > 100) {
         try {
           const reportData = JSON.parse(reportRes.body);
           const items = reportData.Data || reportData.data || (Array.isArray(reportData) ? reportData : null);
-          if (items && Array.isArray(items)) demographicCount = items.length;
+          if (items && Array.isArray(items)) {
+            nameList = items.map((p: any) => ({
+              firstName: p.FirstName || "",
+              lastName: p.LastName || "",
+            }));
+            logParts.push(`Report primed: ${nameList.length} patient names retrieved`);
+          }
         } catch { /* not JSON */ }
       }
-      logParts.push(`Report primed session: ${demographicCount} demographics returned`);
 
-      // Step 3: Now call GetAllPatientForLocalStorage - after priming, this should return more patients
-      // This endpoint has the actual patient IDs (p.I field)
+      // Step 3: Try GetAllPatientForLocalStorage for IDs
       const { body: lsBody, contentType: lsCt } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
       if (lsCt.includes("application/json")) {
         try {
           const parsed = JSON.parse(lsBody);
           const patients = parsed.PatientData || parsed;
           if (Array.isArray(patients) && patients.length > 0) {
-            logParts.push(`GetAllPatientForLocalStorage: ${patients.length} patients, sample keys: ${JSON.stringify(Object.keys(patients[0]))}`);
-            logParts.push(`Sample patient: ${JSON.stringify(patients[0]).substring(0, 300)}`);
+            logParts.push(`GetAllPatientForLocalStorage: ${patients.length} patients, sample: ${JSON.stringify(patients[0]).substring(0, 300)}`);
             _cachedPatients = patients.map((p: any) => ({
               id: p.I || p.Id || p.PatientId || p.PkPatientId,
               firstName: p.F || p.FirstName || "",
               lastName: p.L || p.LastName || "",
             }));
             const withId = _cachedPatients!.filter(p => p.id);
-            logParts.push(`✅ Patient list: ${_cachedPatients!.length} total, ${withId.length} with valid IDs`);
-            return _cachedPatients!;
+            logParts.push(`✅ Patient list from LocalStorage: ${_cachedPatients!.length} total, ${withId.length} with valid IDs`);
+            if (withId.length > 0) return _cachedPatients!;
           }
         } catch { /* ignore */ }
       }
-      logParts.push(`⚠️ GetAllPatientForLocalStorage failed or empty (status len=${lsBody.length}, ct=${lsCt})`);
 
-      _cachedPatients = [];
+      // Step 4: If LocalStorage returned too few/no IDs, use name-based search
+      // Try autocomplete/search endpoints to resolve names → IDs
+      if (nameList.length > 0) {
+        logParts.push(`Attempting name-based ID lookup for ${nameList.length} patients...`);
+        
+        // Try a few search endpoint patterns to find the right one
+        const testName = nameList[0].lastName;
+        const searchEndpoints = [
+          `/Patient/Patient/SearchPatient?searchText=${encodeURIComponent(testName)}`,
+          `/Patient/Patient/GetPatientBySearchText?searchText=${encodeURIComponent(testName)}`,
+          `/api/Patient/Search?query=${encodeURIComponent(testName)}`,
+          `/Patient/Patient/AutoCompletePatient?term=${encodeURIComponent(testName)}`,
+          `/Home/Home/SearchPatient?searchText=${encodeURIComponent(testName)}`,
+          `/Home/Home/GetPatientBySearchText?searchText=${encodeURIComponent(testName)}`,
+        ];
+
+        let workingEndpoint: string | null = null;
+        for (const ep of searchEndpoints) {
+          try {
+            const res = await ajaxFetch(ep);
+            logParts.push(`Search test ${ep.split("?")[0]}: status=${res.status} len=${res.body.length} preview=${res.body.substring(0, 300)}`);
+            if (res.status === 200 && res.body.length > 10) {
+              try {
+                const data = JSON.parse(res.body);
+                const arr = Array.isArray(data) ? data : (data.Data || data.data || data.Results || []);
+                if (Array.isArray(arr) && arr.length > 0) {
+                  logParts.push(`✅ Working search endpoint: ${ep.split("?")[0]}, keys: ${Object.keys(arr[0]).join(", ")}`);
+                  workingEndpoint = ep.split("?")[0].replace(encodeURIComponent(testName), "");
+                  
+                  // Check what ID field the search results use
+                  const sample = arr[0];
+                  const idField = sample.PatientId || sample.Id || sample.I || sample.PkPatientId || sample.ClientPatientId;
+                  logParts.push(`Search result ID field value: ${idField}, sample: ${JSON.stringify(sample).substring(0, 300)}`);
+                  break;
+                }
+              } catch { /* not JSON array */ }
+            }
+          } catch { /* endpoint doesn't exist */ }
+          if (isTimingOut()) break;
+        }
+
+        if (!workingEndpoint) {
+          logParts.push(`⚠️ No working search endpoint found. Tried ${searchEndpoints.length} patterns.`);
+        }
+      }
+
+      // If we still have no IDs, return empty
+      if (!_cachedPatients || _cachedPatients.filter(p => p.id).length === 0) {
+        logParts.push(`⚠️ Could not resolve patient IDs. Per-patient operations will be skipped.`);
+        _cachedPatients = [];
+      }
       return _cachedPatients;
     }
 
