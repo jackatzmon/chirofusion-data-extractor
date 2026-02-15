@@ -681,7 +681,7 @@ Deno.serve(async (req) => {
     // Search for a patient by name and navigate to their file
     // Returns the patient ID if found, or null
     async function searchAndNavigateToPatient(firstName: string, lastName: string, debugLog: boolean): Promise<number | null> {
-      const searchTerm = `${lastName} ${firstName}`.trim();
+      const searchTerm = `${lastName}, ${firstName}`.trim();
       
       // Step 1: Search on the home page
       const { body: homeHtml } = await fetchWithCookies(`${BASE_URL}/`);
