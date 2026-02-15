@@ -679,65 +679,96 @@ Deno.serve(async (req) => {
     }
 
     // Search for a patient by name and navigate to their file
-    // Returns true if we successfully landed on their patient page
-    async function navigateToPatient(firstName: string, lastName: string): Promise<boolean> {
-      const searchTerm = `${lastName}, ${firstName}`.trim();
+    // Returns the patient ID if found, or null
+    async function searchAndNavigateToPatient(firstName: string, lastName: string, debugLog: boolean): Promise<number | null> {
+      const searchTerm = `${lastName} ${firstName}`.trim();
       
-      // Try multiple search endpoint patterns
+      // Step 1: Search on the home page
+      const { body: homeHtml } = await fetchWithCookies(`${BASE_URL}/`);
+      
+      // Find the search form/endpoint from the home page
+      // Try autocomplete-style search endpoints
       const searchEndpoints = [
-        { url: `/Patient/Patient/SearchPatient`, param: "searchText" },
-        { url: `/Patient/Patient/GetPatientBySearchText`, param: "searchText" },
-        { url: `/Patient/Patient/AutoCompletePatient`, param: "term" },
-        { url: `/Home/Home/SearchPatient`, param: "searchText" },
-        { url: `/Home/Home/GetPatientBySearchText`, param: "searchText" },
-        { url: `/Patient/Patient/SearchPatientByName`, param: "name" },
+        `/Home/Home/GetPatientBySearchText?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Patient/Patient/SearchPatient?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Patient/Patient/AutoCompletePatient?term=${encodeURIComponent(searchTerm)}`,
+        `/Home/Home/SearchPatient?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Patient/Patient/GetPatientBySearchText?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Patient/Patient/SearchPatientByName?name=${encodeURIComponent(searchTerm)}`,
       ];
 
       for (const ep of searchEndpoints) {
         try {
-          const res = await ajaxFetch(`${ep.url}?${ep.param}=${encodeURIComponent(searchTerm)}`);
+          const res = await ajaxFetch(ep);
+          if (debugLog) {
+            logParts.push(`Search ${ep.split("?")[0]}: status=${res.status} len=${res.body.length} preview=${res.body.substring(0, 300)}`);
+          }
           if (res.status === 200 && res.body.length > 10) {
             try {
               const data = JSON.parse(res.body);
               const arr = Array.isArray(data) ? data : (data.Data || data.data || data.Results || []);
               if (Array.isArray(arr) && arr.length > 0) {
-                // Found results - get patient ID from search result and navigate
+                if (debugLog) {
+                  logParts.push(`✅ Search hit: ${arr.length} results, keys: ${Object.keys(arr[0]).join(", ")}`);
+                  logParts.push(`Sample: ${JSON.stringify(arr[0]).substring(0, 400)}`);
+                }
                 const match = arr[0];
-                const patientId = match.PatientId || match.Id || match.I || match.PkPatientId || match.ClientPatientId || match.id;
-                if (patientId) {
-                  // Navigate to patient page using the ID from search
-                  await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patientId}`);
-                  return true;
-                }
-                // If no ID field, try clicking/navigating by URL in the result
-                const url = match.Url || match.url || match.Link || match.link;
-                if (url) {
-                  await fetchWithCookies(`${BASE_URL}${url}`);
-                  return true;
-                }
-                return false;
+                const patientId = match.PatientId || match.Id || match.I || match.PkPatientId || match.ClientPatientId || match.id || match.Value || match.value;
+                if (patientId) return Number(patientId);
               }
             } catch { /* not JSON */ }
           }
         } catch { /* endpoint doesn't exist */ }
       }
 
-      // Fallback: try the home page search (form-based)
-      try {
-        const homeRes = await ajaxFetch("/Home/Home/Index", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
-          body: new URLSearchParams({ searchText: searchTerm }).toString(),
-        });
-        if (homeRes.status === 200 && homeRes.body.length > 100) {
-          // Check if we landed on a patient page
-          if (homeRes.body.includes("patientFile") || homeRes.body.includes("MedicalFile")) {
-            return true;
-          }
-        }
-      } catch { /* ignore */ }
+      // Step 2: If not found, try "retrieve from archive" button
+      // Look for archive/load-more type endpoints
+      if (debugLog) logParts.push(`Patient "${searchTerm}" not found in search, trying archive retrieval...`);
+      
+      const archiveEndpoints = [
+        `/Home/Home/LoadArchivedPatient?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Patient/Patient/LoadArchivedPatient?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Home/Home/RetrieveArchivedPatient?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Patient/Patient/RetrieveFromArchive?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Home/Home/GetArchivedPatient?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Patient/Patient/SearchAllPatient?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Home/Home/SearchAllPatient?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Home/Home/LoadMorePatient?searchText=${encodeURIComponent(searchTerm)}`,
+        `/Patient/Patient/LoadMorePatient?searchText=${encodeURIComponent(searchTerm)}`,
+      ];
 
-      return false;
+      for (const ep of archiveEndpoints) {
+        try {
+          // Try both GET and POST
+          let res = await ajaxFetch(ep);
+          if (res.status !== 200 || res.body.length < 10) {
+            res = await ajaxFetch(ep.split("?")[0], {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+              body: new URLSearchParams({ searchText: searchTerm }).toString(),
+            });
+          }
+          if (debugLog) {
+            logParts.push(`Archive ${ep.split("?")[0]}: status=${res.status} len=${res.body.length} preview=${res.body.substring(0, 300)}`);
+          }
+          if (res.status === 200 && res.body.length > 10) {
+            try {
+              const data = JSON.parse(res.body);
+              const arr = Array.isArray(data) ? data : (data.Data || data.data || data.Results || []);
+              if (Array.isArray(arr) && arr.length > 0) {
+                if (debugLog) {
+                  logParts.push(`✅ Archive hit: ${arr.length} results, keys: ${Object.keys(arr[0]).join(", ")}`);
+                }
+                const match = arr[0];
+                const patientId = match.PatientId || match.Id || match.I || match.PkPatientId || match.ClientPatientId || match.id || match.Value || match.value;
+                if (patientId) return Number(patientId);
+              }
+            } catch { /* not JSON */ }
+          }
+        } catch { /* endpoint doesn't exist */ }
+      }
+
+      return null;
     }
 
     for (const dataType of dataTypes) {
@@ -1181,7 +1212,7 @@ Deno.serve(async (req) => {
 
           // ==================== SOAP NOTES / MEDICAL FILES ====================
           case "soap_notes": {
-            const patients = await getAllPatientIds();
+            const patients = await getAllPatientNames();
 
             if (patients.length === 0) {
               logParts.push(`⚠️ Medical Files: No patients found`);
@@ -1189,53 +1220,67 @@ Deno.serve(async (req) => {
             }
 
             logParts.push(`Processing ${patients.length} patients for medical file PDFs`);
-            logParts.push(`DEBUG: First 3 patient IDs: ${patients.slice(0, 3).map(p => `${p.id}(${p.firstName} ${p.lastName})`).join(", ")}`);
             logParts.push(`DEBUG: isTimingOut=${isTimingOut()}, elapsed=${Date.now() - startTime}ms`);
 
+            // First, discover the working search endpoint with the first patient
+            logParts.push(`\n--- Discovery: testing search with "${patients[0].lastName} ${patients[0].firstName}" ---`);
+            const testId = await searchAndNavigateToPatient(patients[0].firstName, patients[0].lastName, true);
+            logParts.push(`Discovery result: patientId=${testId}`);
+
+            if (testId === null) {
+              logParts.push(`⚠️ Could not find a working search endpoint. Cannot process medical files.`);
+              // Save discovery log output for review
+              await serviceClient.from("scrape_jobs").update({ log_output: logParts.join("\n") }).eq("id", job.id);
+              break;
+            }
+
+            // We found a working search endpoint! Now process patients
             let processedCount = 0;
             let pdfCount = 0;
-            let skippedNoId = 0;
+            let searchFailed = 0;
 
             for (const patient of patients) {
-              if (!patient.id) { skippedNoId++; continue; }
               if (isTimingOut()) {
-                logParts.push(`⏱️ Medical Files: Stopped at ${processedCount}/${patients.length} (timeout safety, skippedNoId=${skippedNoId})`);
+                logParts.push(`⏱️ Medical Files: Stopped at ${processedCount}/${patients.length} (timeout safety)`);
                 break;
               }
 
               try {
-                // 1. Navigate to patient page to set them in session
-                const { body: patientPageBody, finalUrl } = await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patient.id}`);
-                if (processedCount < 3) {
-                  logParts.push(`DEBUG patient page ${patient.id}: finalUrl=${finalUrl} bodyLen=${patientPageBody.length}`);
+                // 1. Search for patient by name to get their ID
+                const patientId = processedCount === 0 ? testId : await searchAndNavigateToPatient(patient.firstName, patient.lastName, processedCount < 3);
+                
+                if (!patientId) {
+                  searchFailed++;
+                  if (processedCount < 5) logParts.push(`⚠️ Search failed: ${patient.firstName} ${patient.lastName}`);
+                  processedCount++;
+                  continue;
                 }
 
-                const visitRes = await ajaxFetch(`/Patient/Patient/SetVisitIdInSession?patientId=${patient.id}`, { method: "POST" });
+                // 2. Navigate to patient page using the ID from search
+                const { body: patientPageBody } = await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patientId}`);
                 if (processedCount < 3) {
-                  logParts.push(`DEBUG SetVisitId ${patient.id}: status=${visitRes.status} body=${visitRes.body.substring(0, 200)}`);
+                  logParts.push(`Patient page ${patient.firstName} ${patient.lastName} (id=${patientId}): bodyLen=${patientPageBody.length}`);
                 }
 
-                // 2. Get file list from blob storage
+                // 3. Get file list from blob storage (session-based, patient already loaded)
                 const filesRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "Referer": `${BASE_URL}/Patient`,
-                    "ClientPatientId": String(patient.id),
                   },
                   body: new URLSearchParams({
                     sort: "",
                     group: "",
                     filter: "",
-                    patientId: String(patient.id),
+                    patientId: String(patientId),
                     practiceId: _practiceId,
                   }).toString(),
                 });
 
-                // Always log first 3 patients for debugging
                 if (processedCount < 3) {
-                  logParts.push(`DEBUG GetFilesFromBlob ${patient.firstName} ${patient.lastName} (${patient.id}): status=${filesRes.status} len=${filesRes.body.length} type=${filesRes.contentType}`);
-                  logParts.push(`DEBUG response preview: ${filesRes.body.substring(0, 800)}`);
+                  logParts.push(`GetFilesFromBlob ${patient.firstName} ${patient.lastName}: status=${filesRes.status} len=${filesRes.body.length}`);
+                  logParts.push(`Response preview: ${filesRes.body.substring(0, 500)}`);
                 }
 
                 if (filesRes.status !== 200 || filesRes.body.length < 10) {
@@ -1243,65 +1288,49 @@ Deno.serve(async (req) => {
                   continue;
                 }
 
-                // 3. Parse response to extract blob names
+                // 4. Parse file list
                 let filesData: any;
                 try {
                   filesData = JSON.parse(filesRes.body);
                 } catch {
-                  if (processedCount < 5) {
-                    logParts.push(`Medical Files ${patient.firstName}: non-JSON (${filesRes.body.length} chars): ${filesRes.body.substring(0, 500)}`);
-                  }
+                  if (processedCount < 5) logParts.push(`Medical Files ${patient.firstName}: non-JSON response`);
                   processedCount++;
                   continue;
                 }
 
-                // Log parsed structure for first patients
                 if (processedCount < 3) {
-                  logParts.push(`DEBUG parsed keys: ${JSON.stringify(Object.keys(filesData))}`);
-                  if (filesData.Data) logParts.push(`DEBUG Data length: ${filesData.Data.length}`);
-                  if (filesData.Data && filesData.Data.length > 0) logParts.push(`DEBUG first item keys: ${JSON.stringify(Object.keys(filesData.Data[0]))}`);
-                  if (filesData.Data && filesData.Data.length > 0) logParts.push(`DEBUG first item: ${JSON.stringify(filesData.Data[0]).substring(0, 500)}`);
-                  // Also check if it's a flat array
-                  if (Array.isArray(filesData) && filesData.length > 0) logParts.push(`DEBUG array first item: ${JSON.stringify(filesData[0]).substring(0, 500)}`);
+                  logParts.push(`Parsed keys: ${JSON.stringify(Object.keys(filesData))}`);
+                  const dataArr = filesData.Data || (Array.isArray(filesData) ? filesData : []);
+                  if (dataArr.length > 0) logParts.push(`First file: ${JSON.stringify(dataArr[0]).substring(0, 500)}`);
                 }
 
                 const files = filesData.Data || (Array.isArray(filesData) ? filesData : []);
                 if (files.length === 0) {
-                  if (processedCount < 5) logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: 0 files`);
+                  if (processedCount < 5) logParts.push(`${patient.firstName} ${patient.lastName}: 0 files`);
                   processedCount++;
                   continue;
                 }
 
-                // Log first patient's file structure to understand the schema
-                if (processedCount < 2) {
-                  logParts.push(`Medical Files sample keys: ${JSON.stringify(Object.keys(files[0]))}`);
-                  logParts.push(`Medical Files sample row: ${JSON.stringify(files[0]).substring(0, 500)}`);
-                }
-
-                // Build BlobName from all files - look for common blob name fields
+                // 5. Extract blob names
                 const blobNames: string[] = [];
                 for (const file of files) {
-                  // Try common field names for the blob reference
                   const blobName = file.BlobName || file.blobName || file.FileName || file.fileName || file.Name || file.name || file.FileKey || file.fileKey;
-                  if (blobName && typeof blobName === "string") {
-                    blobNames.push(blobName);
-                  }
+                  if (blobName && typeof blobName === "string") blobNames.push(blobName);
                 }
 
                 if (blobNames.length === 0) {
-                  // Fallback: if no obvious blob field, log all fields for debugging
-                  logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: ${files.length} files but no blob name field found. Keys: ${JSON.stringify(Object.keys(files[0]))}`);
+                  if (processedCount < 3) logParts.push(`${patient.firstName} ${patient.lastName}: ${files.length} files but no blob name field. Keys: ${Object.keys(files[0]).join(", ")}`);
                   processedCount++;
                   continue;
                 }
 
-                logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: ${blobNames.length} documents`);
+                logParts.push(`${patient.firstName} ${patient.lastName}: ${blobNames.length} documents`);
 
-                // 4. Export all files as PDF
-                const patientName = `${patient.firstName || ""}${patient.lastName || ""}`.replace(/[^a-zA-Z0-9]/g, "").substring(0, 20);
+                // 6. Export as PDF
+                const patientName = `${patient.firstName}${patient.lastName}`.replace(/[^a-zA-Z0-9]/g, "").substring(0, 20);
                 const exportBody = new URLSearchParams({
                   BlobName: blobNames.join("|"),
-                  FileName: patientName || `patient_${patient.id}`,
+                  FileName: patientName || `patient_${patientId}`,
                 }).toString();
 
                 const pdfRes = await fetch(`${BASE_URL}/User/Navigation/ExportToPdf`, {
@@ -1321,18 +1350,13 @@ Deno.serve(async (req) => {
                 sessionCookies = mergeCookies(sessionCookies, pdfRes);
 
                 if (pdfRes.status === 200) {
-                  const contentType = pdfRes.headers.get("content-type") || "";
                   const pdfBuffer = await pdfRes.arrayBuffer();
-
                   if (pdfBuffer.byteLength > 100) {
-                    // Upload PDF to storage
-                    const filePath = `${userId}/medical_files/${patient.id}_${patientName}_${Date.now()}.pdf`;
+                    const filePath = `${userId}/medical_files/${patientId}_${patientName}_${Date.now()}.pdf`;
                     const blob = new Blob([pdfBuffer], { type: "application/pdf" });
-
                     const { error: uploadError } = await serviceClient.storage
                       .from("scraped-data")
                       .upload(filePath, blob, { contentType: "application/pdf" });
-
                     if (uploadError) {
                       logParts.push(`❌ Upload error ${patient.firstName}: ${uploadError.message}`);
                     } else {
@@ -1344,35 +1368,28 @@ Deno.serve(async (req) => {
                         row_count: blobNames.length,
                       });
                       pdfCount++;
-                      logParts.push(`✅ PDF ${patient.firstName} ${patient.lastName}: ${blobNames.length} docs, ${Math.round(pdfBuffer.byteLength / 1024)}KB`);
-                    }
-                  } else {
-                    logParts.push(`⚠️ PDF ${patient.firstName}: empty response (${pdfBuffer.byteLength} bytes, type=${contentType})`);
-                    // Log first few bytes for debugging
-                    if (processedCount < 3) {
-                      const text = new TextDecoder().decode(pdfBuffer.slice(0, 500));
-                      logParts.push(`  Response preview: ${text}`);
                     }
                   }
                 } else {
-                  const errorBody = await pdfRes.text();
-                  logParts.push(`⚠️ PDF ${patient.firstName}: status=${pdfRes.status} ${errorBody.substring(0, 200)}`);
+                  if (processedCount < 3) logParts.push(`PDF export ${patient.firstName}: status=${pdfRes.status}`);
                 }
               } catch (err: any) {
-                logParts.push(`❌ Medical Files ${patient.firstName} ${patient.lastName} error: ${err.message}`);
+                logParts.push(`❌ ${patient.firstName} ${patient.lastName}: ${err.message}`);
               }
 
               processedCount++;
               if (processedCount % 10 === 0) {
                 const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
-                await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + newProgress, 99), log_output: logParts.join("\n") }).eq("id", job.id);
+                await serviceClient.from("scrape_jobs").update({ 
+                  progress: Math.min(progress + newProgress, 99), 
+                  log_output: logParts.join("\n") 
+                }).eq("id", job.id);
               }
 
-              await new Promise(r => setTimeout(r, 500)); // slightly slower to avoid rate limits on PDF generation
+              await new Promise(r => setTimeout(r, 500));
             }
 
-            // Don't set csvContent - PDFs are uploaded individually per patient
-            logParts.push(`✅ Medical Files complete: ${pdfCount} PDFs from ${processedCount} patients`);
+            logParts.push(`✅ Medical Files complete: ${pdfCount} PDFs from ${processedCount} patients (${searchFailed} search failures)`);
             hasAnyData = pdfCount > 0;
             break;
           }
