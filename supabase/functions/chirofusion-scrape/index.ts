@@ -333,14 +333,32 @@ Deno.serve(async (req) => {
         logParts.push(`SCHEDULER ERROR: ${err.message}`);
       }
 
-      // ===== 2. TEST KEY ENDPOINTS WITH DIFFERENT PARAMS =====
+      // ===== 2. EXTRACT MULTISELECT OPTIONS & TEST ENDPOINTS =====
       logParts.push(`\n===== ENDPOINT TESTS =====`);
 
-      // 2a: GetPatientReports with ReportType=1 (PatientList)
+      // Extract PatientStatus multiselect values from the Scheduler page
+      const schedHtmlForOpts = (await fetchWithCookies(`${BASE_URL}/User/Scheduler`)).body;
+      const selectRegex2 = new RegExp(`<select[^>]*id="patientReportPatientStatusMultiSelect"[^>]*>([\\s\\S]*?)</select>`, "i");
+      const selectMatch2 = schedHtmlForOpts.match(selectRegex2);
+      const statusOpts: string[] = [];
+      if (selectMatch2) {
+        const optRegex2 = /<option[^>]*value="([^"]*)"[^>]*>([^<]*)<\/option>/gi;
+        let om2;
+        while ((om2 = optRegex2.exec(selectMatch2[1])) !== null) {
+          statusOpts.push(om2[1]);
+          logParts.push(`  PatientStatus option: value="${om2[1]}" text="${om2[2]}"`);
+        }
+      }
+      const allStatusJoined = statusOpts.filter(v => v).join(",");
+      logParts.push(`PatientStatus all values joined: "${allStatusJoined}"`);
+
+      // 2a: GetPatientReports with different PatientStatus values
       const patientReportParams = [
+        { ReportType: "1", BirthMonths: "", PatientStatus: allStatusJoined, PatientInsurance: "" },
+        { ReportType: "1", BirthMonths: "", PatientStatus: "1,2,3,4,5", PatientInsurance: "" },
+        { ReportType: "1", BirthMonths: "", PatientStatus: "1,2", PatientInsurance: "" },
+        { ReportType: "1", BirthMonths: "", PatientStatus: "1", PatientInsurance: "" },
         { ReportType: "1", BirthMonths: "", PatientStatus: "", PatientInsurance: "" },
-        { ReportType: "1", BirthMonths: "", PatientStatus: "Active", PatientInsurance: "" },
-        { ReportType: "1", BirthMonths: "", PatientStatus: "All", PatientInsurance: "" },
       ];
 
       for (const params of patientReportParams) {
@@ -726,11 +744,17 @@ Deno.serve(async (req) => {
               return opts;
             }
 
-            // ===== Step 1: Load Scheduler page, scan INLINE scripts for function bodies =====
+            // ===== Step 1: Load Scheduler page, extract multiselect values =====
             logParts.push(`Step 1: Loading Scheduler page...`);
             const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
             const schedToken = extractVerifToken(schedHtml);
             logParts.push(`Scheduler: ${schedHtml.length} chars, token: ${schedToken ? "YES" : "NONE"}`);
+
+            // Extract PatientStatus multiselect options from HTML
+            const patientStatusOpts = extractSelectOptions(schedHtml, "patientReportPatientStatusMultiSelect");
+            const allStatusValues = patientStatusOpts.map(o => o.value).filter(v => v).join(",");
+            logParts.push(`PatientStatus options: ${JSON.stringify(patientStatusOpts)}`);
+            logParts.push(`PatientStatus all values: "${allStatusValues}"`);
 
             // Scan INLINE <script> blocks for RunPatientReport, ExportPatientReport, ExportPatientList
             const inlineScriptRegex = /<script(?:\s[^>]*)?>(?!.*src)([\s\S]*?)<\/script>/gi;
@@ -835,84 +859,80 @@ Deno.serve(async (req) => {
             // ===== Step 2b: Trigger GetPatientReports with EMPTY PatientStatus (= no filter = all) =====
             if (!found) {
               logParts.push(`Step 2b: Trigger GetPatientReports (empty PatientStatus = all)...`);
-              const reportData = {
-                ReportType: "1",
-                BirthMonths: "",
-                PatientStatus: "",
-                PatientInsurance: "",
-              };
+              // Try multiple PatientStatus values: extracted multiselect values, then fallbacks
+              const statusCandidates = [
+                allStatusValues,  // All multiselect values joined
+                "1,2,3,4,5",     // Common numeric pattern
+                "1,2",           // Active + Inactive
+                "1",             // Just Active
+                "",              // Empty (no filter)
+              ].filter((v, i, a) => a.indexOf(v) === i); // dedupe
 
-              try {
-                const triggerRes = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "RequestVerificationToken": schedToken,
-                  },
-                  body: new URLSearchParams(reportData).toString(),
-                });
-                logParts.push(`  Trigger: status=${triggerRes.status} len=${triggerRes.body.length} type=${triggerRes.contentType}`);
-                if (triggerRes.body.length > 0 && triggerRes.body.length < 2000) {
-                  logParts.push(`  Trigger body: ${triggerRes.body}`);
-                } else if (triggerRes.body.length >= 2000) {
-                  logParts.push(`  Trigger body preview: ${triggerRes.body.substring(0, 1000)}`);
-                  // If trigger itself returns data (Kendo grid JSON), try to use it
-                  try {
-                    const triggerData = JSON.parse(triggerRes.body);
-                    const items = triggerData.Data || triggerData.data || (Array.isArray(triggerData) ? triggerData : null);
-                    if (items && Array.isArray(items) && items.length > 0) {
-                      csvContent = jsonToCsv(items);
-                      rowCount = items.length;
-                      logParts.push(`✅ Demographics from trigger response: ${rowCount} patients`);
-                      found = true;
-                    }
-                  } catch { /* not JSON */ }
-                }
+              for (const statusVal of statusCandidates) {
+                if (found) break;
+                const reportData = {
+                  ReportType: "1",
+                  BirthMonths: "",
+                  PatientStatus: statusVal,
+                  PatientInsurance: "",
+                };
+                logParts.push(`  Trying PatientStatus="${statusVal}"...`);
 
-                // Poll ExportPatientReports
-                if (!found) {
-                  const MAX_RETRIES = 6;
-                  const RETRY_INTERVAL_MS = 5000;
+                try {
+                  const triggerRes = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/x-www-form-urlencoded",
+                      "RequestVerificationToken": schedToken,
+                    },
+                    body: new URLSearchParams(reportData).toString(),
+                  });
+                  logParts.push(`    Trigger: status=${triggerRes.status} len=${triggerRes.body.length} type=${triggerRes.contentType}`);
 
-                  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-                    if (isTimingOut()) { logParts.push(`⏱️ Timeout at attempt ${attempt}`); break; }
-                    logParts.push(`  Export attempt ${attempt}/${MAX_RETRIES} (waiting ${RETRY_INTERVAL_MS / 1000}s)...`);
-                    await new Promise(r => setTimeout(r, RETRY_INTERVAL_MS));
-
+                  if (triggerRes.body.length > 0 && triggerRes.body.length < 2000) {
+                    logParts.push(`    Trigger body: ${triggerRes.body}`);
+                  } else if (triggerRes.body.length >= 2000) {
+                    logParts.push(`    Trigger body preview: ${triggerRes.body.substring(0, 1000)}`);
                     try {
-                      const expRes = await ajaxFetch("/Scheduler/Scheduler/ExportPatientReports", {
-                        method: "POST",
-                        headers: {
-                          "Content-Type": "application/x-www-form-urlencoded",
-                          "RequestVerificationToken": schedToken,
-                        },
-                        body: new URLSearchParams({
-                          ...reportData,
-                          __RequestVerificationToken: schedToken,
-                        }).toString(),
-                      });
-                      logParts.push(`    status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
-
-                      // LOG THE ERROR BODY so we can debug
-                      if (expRes.status >= 400) {
-                        logParts.push(`    ERROR BODY: ${expRes.body.substring(0, 500)}`);
-                        continue;
-                      }
-
-                      if (expRes.status === 200 && expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE") && !expRes.body.includes("<html")) {
-                        csvContent = expRes.body;
-                        rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
-                        logParts.push(`✅ Demographics export: ${rowCount} rows (attempt ${attempt})`);
+                      const triggerData = JSON.parse(triggerRes.body);
+                      const items = triggerData.Data || triggerData.data || (Array.isArray(triggerData) ? triggerData : null);
+                      if (items && Array.isArray(items) && items.length > 0) {
+                        csvContent = jsonToCsv(items);
+                        rowCount = items.length;
+                        logParts.push(`✅ Demographics from trigger response: ${rowCount} patients`);
                         found = true;
                         break;
                       }
-                    } catch (e: any) {
-                      logParts.push(`    Attempt ${attempt} error: ${e.message}`);
+                    } catch { /* not JSON */ }
+                  }
+
+                  // If trigger returned data (len > 0), try export
+                  if (!found && triggerRes.body.length > 0) {
+                    logParts.push(`    Data returned, polling export...`);
+                    await new Promise(r => setTimeout(r, 5000));
+                    const expRes = await ajaxFetch("/Scheduler/Scheduler/ExportPatientReports", {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "RequestVerificationToken": schedToken,
+                      },
+                      body: new URLSearchParams({
+                        ...reportData,
+                        __RequestVerificationToken: schedToken,
+                      }).toString(),
+                    });
+                    logParts.push(`    Export: status=${expRes.status} len=${expRes.body.length}`);
+                    if (expRes.status === 200 && expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE")) {
+                      csvContent = expRes.body;
+                      rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
+                      logParts.push(`✅ Demographics export: ${rowCount} rows`);
+                      found = true;
+                      break;
                     }
                   }
+                } catch (e: any) {
+                  logParts.push(`    Error: ${e.message}`);
                 }
-              } catch (e: any) {
-                logParts.push(`  Trigger error: ${e.message}`);
               }
             }
 
