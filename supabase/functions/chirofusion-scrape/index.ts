@@ -1396,9 +1396,7 @@ Deno.serve(async (req) => {
                   continue;
                 }
 
-                const dob = match.Dob || "";
-                const by2 = birthYear2(dob);
-                const fileName = `${patient.lastName}${by2}`.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+                const fileName = `${patient.lastName}${patient.firstName}`.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 
                 // 2. Set patient context then get file list
                 const catRes = await ajaxFetch("/Patient/Patient/GetFileCategory", {
