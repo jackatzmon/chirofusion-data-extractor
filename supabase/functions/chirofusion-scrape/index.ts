@@ -415,76 +415,212 @@ Deno.serve(async (req) => {
         switch (dataType) {
           // ==================== DEMOGRAPHICS ====================
           case "demographics": {
-            // Discovery found these real endpoints:
-            //   1. /Patient/Patient/ExportPatientList (form #exportPatientListCsv - direct CSV)
-            //   2. /User/Scheduler/ExportPatientReports (form #exportPatientReport - report export)
-            //   3. /Patient/Patient/GetAllPatientForLocalStorage (JSON fallback)
             let found = false;
 
-            // Attempt 1: Direct patient list CSV export (from discovery: ExportPatientList onclick)
-            logParts.push(`Attempt 1: /Patient/Patient/ExportPatientList (direct CSV)...`);
+            // Helper: extract __RequestVerificationToken from page HTML
+            function extractVerifToken(html: string): string {
+              const m = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
+              return m ? m[1] : "";
+            }
+
+            // Helper: extract select option values from HTML
+            function extractSelectOptions(html: string, selectId: string): { value: string; text: string }[] {
+              const selectRegex = new RegExp(`<select[^>]*id="${selectId}"[^>]*>([\\s\\S]*?)</select>`, "i");
+              const selectMatch = html.match(selectRegex);
+              if (!selectMatch) return [];
+              const opts: { value: string; text: string }[] = [];
+              const optRegex = /<option[^>]*value="([^"]*)"[^>]*>([^<]*)<\/option>/gi;
+              let om;
+              while ((om = optRegex.exec(selectMatch[1])) !== null) {
+                opts.push({ value: om[1], text: om[2] });
+              }
+              return opts;
+            }
+
+            // ===== Attempt 1: ExportPatientList from the Patient List page =====
+            // This endpoint lives on /Patient/Patient, so we need THAT page's CSRF token
+            logParts.push(`Step 1: Loading Patient List page for ExportPatientList...`);
             try {
-              const { response: expRes, body: expBody } = await fetchWithCookies(
-                `${BASE_URL}/Patient/Patient/ExportPatientList`,
-                { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" } }
-              );
-              logParts.push(`ExportPatientList: status=${expRes.status} length=${expBody.length} type=${expRes.headers.get("content-type") || "unknown"}`);
-              if (expBody.length > 100) {
-                logParts.push(`Preview: ${expBody.substring(0, 500)}`);
-                // Check if it's CSV/Excel content
-                if (expBody.includes(",") && expBody.includes("\n") && !expBody.includes("<!DOCTYPE")) {
-                  csvContent = expBody;
-                  rowCount = expBody.split("\n").length - 1;
-                  logParts.push(`✅ Demographics (CSV export): ${rowCount} rows`);
-                  found = true;
+              const { body: patientPageHtml } = await fetchWithCookies(`${BASE_URL}/Patient/Patient`);
+              const patientPageToken = extractVerifToken(patientPageHtml);
+              logParts.push(`Patient page loaded: ${patientPageHtml.length} chars, token: ${patientPageToken ? patientPageToken.substring(0, 20) + "..." : "NONE"}`);
+
+              if (patientPageToken) {
+                // POST with the Patient page's own verification token
+                const { response: expRes, body: expBody } = await fetchWithCookies(
+                  `${BASE_URL}/Patient/Patient/ExportPatientList`,
+                  {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: `__RequestVerificationToken=${encodeURIComponent(patientPageToken)}`,
+                  }
+                );
+                const ct = expRes.headers.get("content-type") || "unknown";
+                const cd = expRes.headers.get("content-disposition") || "";
+                logParts.push(`ExportPatientList: status=${expRes.status} length=${expBody.length} type=${ct} disposition=${cd}`);
+
+                if (expBody.length > 50) {
+                  logParts.push(`Preview: ${expBody.substring(0, 500)}`);
+                  if (!expBody.includes("<!DOCTYPE") && !expBody.includes("<html")) {
+                    csvContent = expBody;
+                    rowCount = csvContent.split("\n").filter(l => l.trim()).length - 1;
+                    logParts.push(`✅ Demographics (ExportPatientList CSV): ${rowCount} rows`);
+                    found = true;
+                  }
                 }
               }
             } catch (err: any) {
               logParts.push(`ExportPatientList error: ${err.message}`);
             }
 
-            // Attempt 2: Patient Report export (ReportType=1 = Patient List)
+            // ===== Attempt 2: Run Report first, wait, then Export from Scheduler =====
+            // ChiroFusion reports are async: submit → server generates (3-5s) → then export
             if (!found) {
-              logParts.push(`Attempt 2: /User/Scheduler/ExportPatientReports (report)...`);
+              logParts.push(`Step 2: Loading Scheduler page for Run Report → Export flow...`);
               try {
-                const reportParams = new URLSearchParams({
-                  ReportType: "1",
+                const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
+                const schedToken = extractVerifToken(schedHtml);
+                logParts.push(`Scheduler page: ${schedHtml.length} chars, token: ${schedToken ? schedToken.substring(0, 20) + "..." : "NONE"}`);
+
+                // Extract actual option values from form selects
+                const reportTypes = extractSelectOptions(schedHtml, "ReportType");
+                const patientStatuses = extractSelectOptions(schedHtml, "PatientStatus");
+                logParts.push(`ReportType options: ${JSON.stringify(reportTypes.slice(0, 10))}`);
+                logParts.push(`PatientStatus options: ${JSON.stringify(patientStatuses.slice(0, 10))}`);
+
+                // Find the right ReportType for patient list
+                const patientReportType = reportTypes.find(
+                  o => o.text.toLowerCase().includes("patient") && o.text.toLowerCase().includes("list")
+                )?.value || reportTypes.find(
+                  o => o.text.toLowerCase().includes("patient")
+                )?.value || "1";
+
+                // Get all patient status values
+                const allStatusValues = patientStatuses.map(o => o.value).filter(Boolean).join(",");
+                logParts.push(`Using ReportType=${patientReportType}, PatientStatus=${allStatusValues || "all"}`);
+
+                // Build the report parameters
+                const reportParams: Record<string, string> = {
+                  __RequestVerificationToken: schedToken,
+                  ReportType: patientReportType,
+                  PatientStatus: allStatusValues || "Active",
+                  PatientStatusString: allStatusValues || "Active",
+                  IsAllPatientValue: "true",
                   BirthMonths: "",
-                  PatientStatus: "1,2,3",
-                  PatientStatusString: "1,2,3",
+                  BirthMonthString: "",
                   PatientInsurance: "",
                   PatientInsuranceString: "",
-                  IsAllPatientValue: "true",
-                });
+                  isOverrideDate: "false",
+                };
 
-                const { response: rptRes, body: rptBody } = await fetchWithCookies(
-                  `${BASE_URL}/User/Scheduler/ExportPatientReports`,
-                  {
-                    method: "POST",
-                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                    body: reportParams.toString(),
-                  }
-                );
-                logParts.push(`ExportPatientReports: status=${rptRes.status} length=${rptBody.length} type=${rptRes.headers.get("content-type") || "unknown"}`);
-                if (rptBody.length > 100) {
-                  logParts.push(`Preview: ${rptBody.substring(0, 500)}`);
+                // Step 2a: First "Run" the report via AJAX (this generates data server-side)
+                // Try multiple possible "run report" endpoints
+                const runEndpoints = [
+                  "/User/Scheduler/GetPatientReports",
+                  "/User/Scheduler/RunPatientReport",
+                  "/User/Scheduler/GetPatientReportData",
+                ];
+                for (const endpoint of runEndpoints) {
                   try {
-                    const data = JSON.parse(rptBody);
-                    const items = data.Data || data.data || data.Items || (Array.isArray(data) ? data : null);
-                    if (items && Array.isArray(items) && items.length > 0) {
-                      csvContent = jsonToCsv(items);
-                      rowCount = items.length;
-                      logParts.push(`✅ Demographics: ${rowCount} patients from report`);
-                      found = true;
-                    } else {
-                      logParts.push(`Response keys: ${Object.keys(data).join(", ")}`);
+                    const runRes = await ajaxFetch(endpoint, {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "__RequestVerificationToken": schedToken,
+                      },
+                      body: new URLSearchParams(reportParams).toString(),
+                    });
+                    logParts.push(`Run ${endpoint}: status=${runRes.status} length=${runRes.body.length} type=${runRes.contentType}`);
+                    if (runRes.body.length > 50) {
+                      logParts.push(`  Preview: ${runRes.body.substring(0, 300)}`);
                     }
-                  } catch {
-                    if (rptBody.includes(",") && rptBody.includes("\n") && !rptBody.includes("<!DOCTYPE")) {
-                      csvContent = rptBody;
-                      rowCount = rptBody.split("\n").length - 1;
-                      logParts.push(`✅ Demographics (CSV from report): ${rowCount} rows`);
-                      found = true;
+                    // If this returns data directly (JSON array), use it
+                    if (runRes.status === 200 && runRes.body.length > 50 && runRes.contentType.includes("json")) {
+                      try {
+                        const data = JSON.parse(runRes.body);
+                        const items = data.Data || data.data || data.Items || (Array.isArray(data) ? data : null);
+                        if (items && Array.isArray(items) && items.length > 0) {
+                          csvContent = jsonToCsv(items);
+                          rowCount = items.length;
+                          logParts.push(`  ✅ Demographics from ${endpoint}: ${rowCount} patients`);
+                          found = true;
+                          break;
+                        }
+                      } catch { /* not parseable JSON array */ }
+                    }
+                  } catch (err: any) {
+                    logParts.push(`Run ${endpoint} error: ${err.message}`);
+                  }
+                }
+
+                // Step 2b: Wait for report generation (user says ~3 seconds)
+                if (!found) {
+                  logParts.push(`Waiting 4 seconds for report generation...`);
+                  await new Promise(r => setTimeout(r, 4000));
+
+                  // Step 2c: Now try the Export endpoint (report should be ready)
+                  logParts.push(`Attempting ExportPatientReports after wait...`);
+                  const params = new URLSearchParams(reportParams);
+
+                  // Form POST (like browser form submit)
+                  const { response: rptRes, body: rptBody } = await fetchWithCookies(
+                    `${BASE_URL}/User/Scheduler/ExportPatientReports`,
+                    {
+                      method: "POST",
+                      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                      body: params.toString(),
+                    }
+                  );
+                  const rptCt = rptRes.headers.get("content-type") || "unknown";
+                  const rptCd = rptRes.headers.get("content-disposition") || "";
+                  logParts.push(`ExportPatientReports: status=${rptRes.status} length=${rptBody.length} type=${rptCt} disposition=${rptCd}`);
+
+                  if (rptBody.length > 50) {
+                    logParts.push(`Preview: ${rptBody.substring(0, 500)}`);
+                    if (!rptBody.includes("<!DOCTYPE") && !rptBody.includes("<html")) {
+                      try {
+                        const data = JSON.parse(rptBody);
+                        const items = data.Data || data.data || data.Items || (Array.isArray(data) ? data : null);
+                        if (items && Array.isArray(items) && items.length > 0) {
+                          csvContent = jsonToCsv(items);
+                          rowCount = items.length;
+                          logParts.push(`✅ Demographics: ${rowCount} patients from export`);
+                          found = true;
+                        }
+                      } catch {
+                        if (rptBody.includes(",") && rptBody.includes("\n")) {
+                          csvContent = rptBody;
+                          rowCount = rptBody.split("\n").filter(l => l.trim()).length - 1;
+                          logParts.push(`✅ Demographics CSV: ${rowCount} rows`);
+                          found = true;
+                        }
+                      }
+                    }
+                  }
+
+                  // Also try AJAX version after wait
+                  if (!found) {
+                    const ajaxRes = await ajaxFetch("/User/Scheduler/ExportPatientReports", {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "__RequestVerificationToken": schedToken,
+                      },
+                      body: params.toString(),
+                    });
+                    logParts.push(`AJAX Export after wait: status=${ajaxRes.status} length=${ajaxRes.body.length} type=${ajaxRes.contentType}`);
+                    if (ajaxRes.body.length > 50 && !ajaxRes.body.includes("<!DOCTYPE")) {
+                      logParts.push(`AJAX Preview: ${ajaxRes.body.substring(0, 300)}`);
+                      try {
+                        const data = JSON.parse(ajaxRes.body);
+                        const items = data.Data || data.data || data.Items || (Array.isArray(data) ? data : null);
+                        if (items && Array.isArray(items) && items.length > 0) {
+                          csvContent = jsonToCsv(items);
+                          rowCount = items.length;
+                          logParts.push(`✅ Demographics (AJAX after wait): ${rowCount} patients`);
+                          found = true;
+                        }
+                      } catch { /* not JSON */ }
                     }
                   }
                 }
@@ -493,9 +629,9 @@ Deno.serve(async (req) => {
               }
             }
 
-            // Attempt 3: JSON endpoint (partial data but reliable)
+            // ===== Attempt 3: JSON endpoint (partial data but reliable) =====
             if (!found) {
-              logParts.push(`Attempt 3: JSON fallback /Patient/Patient/GetAllPatientForLocalStorage...`);
+              logParts.push(`Step 3: JSON fallback /Patient/Patient/GetAllPatientForLocalStorage...`);
               try {
                 const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
                 logParts.push(`JSON endpoint: type=${contentType} length=${body.length}`);
@@ -503,14 +639,28 @@ Deno.serve(async (req) => {
                   const parsed = JSON.parse(body);
                   const patients = parsed.PatientData || parsed;
                   if (Array.isArray(patients) && patients.length > 0) {
+                    // Map all available fields from the JSON response
                     const expanded = patients.map((p: any) => ({
-                      PatientID: p.I || "", FirstName: p.F || "", LastName: p.L || "",
-                      DateOfBirth: p.DOB || "", HomePhone: p.HP || "", MobilePhone: p.MP || "",
-                      Email: p.E || "",
+                      PatientID: p.I || p.Id || "",
+                      FirstName: p.F || p.FirstName || "",
+                      LastName: p.L || p.LastName || "",
+                      DateOfBirth: parseNetDate(p.DOB || p.DateOfBirth || ""),
+                      HomePhone: p.HP || p.HomePhone || "",
+                      MobilePhone: p.MP || p.MobilePhone || "",
+                      Email: p.E || p.Email || "",
+                      Gender: p.G || p.Gender || "",
+                      Address: p.A || p.Address || "",
+                      City: p.C || p.City || "",
+                      State: p.S || p.State || "",
+                      Zip: p.Z || p.Zip || "",
+                      Insurance: p.Ins || p.Insurance || "",
                     }));
                     csvContent = jsonToCsv(expanded);
                     rowCount = expanded.length;
-                    logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients (partial fields)`);
+                    logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients`);
+                    // Log first patient's raw keys so we can map more fields next time
+                    logParts.push(`Sample patient keys: ${Object.keys(patients[0]).join(", ")}`);
+                    logParts.push(`Sample patient data: ${JSON.stringify(patients[0]).substring(0, 500)}`);
                   }
                 }
               } catch (err: any) {
