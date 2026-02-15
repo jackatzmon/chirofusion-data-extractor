@@ -1253,111 +1253,7 @@ Deno.serve(async (req) => {
             if (processedCount > 0) {
               logParts.push(`🔄 Resuming from patient ${processedCount}/${patients.length}`);
             } else {
-              logParts.push(`Processing ${patients.length} patients for medical file PDFs`);
-
-              // === TARGETED TEST: search a patient and log all ID fields ===
-              logParts.push(`🧪 TESTING: searching for a patient to inspect ID fields...`);
-              
-              // Search for a patient we know has files
-              const testSearch = await ajaxFetch("/Patient/Patient/GetSearchedPatient", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                  "ClientPatientId": "0",
-                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
-                },
-                body: new URLSearchParams({
-                  SelectedCriteria: "10", SelectedFilter: "2",
-                  searchText: "",  // empty to get first results
-                  archiveFilter: "0",
-                }).toString(),
-              });
-              logParts.push(`  Search status=${testSearch.status}`);
-              
-              let testPatients: any[] = [];
-              try {
-                const sp = JSON.parse(testSearch.body);
-                testPatients = Array.isArray(sp) ? sp : (sp.Data || []);
-              } catch {}
-              
-              if (testPatients.length > 0) {
-                // Log ALL keys and values of first patient
-                const first = testPatients[0];
-                logParts.push(`  Patient keys: ${Object.keys(first).join(", ")}`);
-                logParts.push(`  Full record: ${JSON.stringify(first).substring(0, 800)}`);
-                
-                // Try GetFilesFromBlob with every ID-like field
-                for (const key of Object.keys(first)) {
-                  const val = first[key];
-                  if (typeof val === "number" || (typeof val === "string" && /^\d+$/.test(val))) {
-                    // Prime context
-                    await ajaxFetch("/Patient/Patient/GetFileCategory", {
-                      method: "GET",
-                      headers: {
-                        "Referer": `${BASE_URL}/Patient`,
-                        "ClientPatientId": String(val),
-                        ...(_practiceId ? { "practiceId": _practiceId } : {}),
-                      },
-                    });
-                    const tr = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                        "Referer": `${BASE_URL}/Patient`,
-                        "ClientPatientId": String(val),
-                        ...(_practiceId ? { "practiceId": _practiceId } : {}),
-                      },
-                      body: new URLSearchParams({
-                        sort: "", group: "", filter: "",
-                        patientId: String(val), practiceId: _practiceId, fileCategoryId: "0",
-                      }).toString(),
-                    });
-                    const pr = JSON.parse(tr.body);
-                    if (pr.Total > 0) {
-                      logParts.push(`  ✅ FOUND FILES using ${key}=${val}: Total=${pr.Total}`);
-                      logParts.push(`  Sample: ${JSON.stringify(pr.Data[0]).substring(0, 500)}`);
-                    } else {
-                      logParts.push(`  ❌ ${key}=${val}: Total=0`);
-                    }
-                  }
-                }
-                
-                // Also try second and third patients
-                for (let pi = 1; pi < Math.min(3, testPatients.length); pi++) {
-                  const p = testPatients[pi];
-                  const pName = `${p.FirstName || p.firstName || ""} ${p.LastName || p.lastName || ""}`;
-                  logParts.push(`  --- Patient ${pi+1}: ${pName} ---`);
-                  for (const key of Object.keys(p)) {
-                    const val = p[key];
-                    if (typeof val === "number" || (typeof val === "string" && /^\d+$/.test(val))) {
-                      await ajaxFetch("/Patient/Patient/GetFileCategory", {
-                        method: "GET",
-                        headers: { "ClientPatientId": String(val), ...(_practiceId ? { "practiceId": _practiceId } : {}) },
-                      });
-                      const tr = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
-                        method: "POST",
-                        headers: {
-                          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                          "ClientPatientId": String(val),
-                          ...(_practiceId ? { "practiceId": _practiceId } : {}),
-                        },
-                        body: new URLSearchParams({
-                          sort: "", group: "", filter: "",
-                          patientId: String(val), practiceId: _practiceId, fileCategoryId: "0",
-                        }).toString(),
-                      });
-                      const pr = JSON.parse(tr.body);
-                      logParts.push(`    ${key}=${val}: Total=${pr.Total}`);
-                      if (pr.Total > 0) {
-                        logParts.push(`    ✅ FOUND! Sample: ${JSON.stringify(pr.Data[0]).substring(0, 300)}`);
-                      }
-                    }
-                  }
-                }
-              } else {
-                logParts.push(`  No patients from search`);
-              }
-              logParts.push(`🧪 END TEST`);
+              logParts.push(`Processing ${patients.length} patients for medical file PDFs (using SetVisitIdInSession for context)`);
             }
 
             for (let i = processedCount; i < patients.length; i++) {
@@ -1426,9 +1322,10 @@ Deno.serve(async (req) => {
                   continue;
                 }
 
-                // Use first matching entry
-                const match = searchData[0];
+                // Use first non-default-case entry to get patientId and caseId
+                const match = searchData.find((entry: any) => !(entry.CaseName || "").toLowerCase().includes("default case")) || searchData[0];
                 const patientId = match.File_Number || match.PatientId || match.Id;
+                const caseId = match.CaseId || match.Case_Id || match.caseId || "";
                 if (!patientId) {
                   searchFailed++;
                   processedCount++;
@@ -1436,9 +1333,34 @@ Deno.serve(async (req) => {
                 }
 
                 const fileName = `${patient.lastName}${patient.firstName}`.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+                const isDebugPatient = i < 5;
 
-                // 2. Set patient context then get file list
-                const catRes = await ajaxFetch("/Patient/Patient/GetFileCategory", {
+                if (isDebugPatient) {
+                  logParts.push(`🔍 DEBUG ${patient.firstName} ${patient.lastName} (id=${patientId}, caseId=${caseId}):`);
+                  logParts.push(`  Match keys: ${Object.keys(match).join(", ")}`);
+                }
+
+                // 2. Set patient context via SetVisitIdInSession (critical for GetFilesFromBlob)
+                const visitRes = await ajaxFetch("/Patient/Patient/SetVisitIdInSession", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Referer": `${BASE_URL}/Patient`,
+                    "ClientPatientId": String(patientId),
+                    ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                  },
+                  body: new URLSearchParams({
+                    PatientId: String(patientId),
+                    CaseId: String(caseId),
+                  }).toString(),
+                });
+
+                if (isDebugPatient) {
+                  logParts.push(`  SetVisitIdInSession: status=${visitRes.status} body=${visitRes.body.substring(0, 200)}`);
+                }
+
+                // Also call GetFileCategory to further prime context
+                await ajaxFetch("/Patient/Patient/GetFileCategory", {
                   method: "GET",
                   headers: {
                     "Referer": `${BASE_URL}/Patient`,
@@ -1447,21 +1369,7 @@ Deno.serve(async (req) => {
                   },
                 });
 
-                // Debug: log first 5 non-default patients fully
-                const isDebugPatient = processedCount < 5 && !allDefault;
-                if (isDebugPatient) {
-                  logParts.push(`🔍 DEBUG ${patient.firstName} ${patient.lastName} (id=${patientId}):`);
-                  logParts.push(`  GetFileCategory status=${catRes.status} body=${catRes.body.substring(0, 500)}`);
-                }
-
-                // Parse categories to get IDs
-                let categories: any[] = [];
-                try {
-                  const catParsed = JSON.parse(catRes.body);
-                  categories = Array.isArray(catParsed) ? catParsed : (catParsed.Data || catParsed.data || []);
-                } catch { /* ignore */ }
-
-                // Try with fileCategoryId=0 (all categories) first
+                // 3. Get file list
                 const filesRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
                   method: "POST",
                   headers: {
@@ -1474,46 +1382,11 @@ Deno.serve(async (req) => {
                     sort: "", group: "", filter: "",
                     patientId: String(patientId),
                     practiceId: _practiceId,
-                    fileCategoryId: "0",
                   }).toString(),
                 });
 
                 if (isDebugPatient) {
-                  logParts.push(`  GetFilesFromBlob(catId=0) status=${filesRes.status} body=${filesRes.body.substring(0, 500)}`);
-                  // Also try without fileCategoryId to compare
-                  const filesRes2 = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json; charset=UTF-8",
-                      "Referer": `${BASE_URL}/Patient`,
-                      "ClientPatientId": String(patientId),
-                      ...(_practiceId ? { "practiceId": _practiceId } : {}),
-                    },
-                    body: JSON.stringify({
-                      sort: "", group: "", filter: "",
-                      patientId: Number(patientId),
-                      practiceId: Number(_practiceId),
-                      fileCategoryId: 0,
-                    }),
-                  });
-                  logParts.push(`  GetFilesFromBlob(JSON) status=${filesRes2.status} body=${filesRes2.body.substring(0, 500)}`);
-                  // Try the Kendo grid format
-                  const filesRes3 = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                      "Referer": `${BASE_URL}/Patient`,
-                      "ClientPatientId": String(patientId),
-                      ...(_practiceId ? { "practiceId": _practiceId } : {}),
-                    },
-                    body: new URLSearchParams({
-                      take: "100", skip: "0", page: "1", pageSize: "100",
-                      sort: "", group: "", filter: "",
-                      patientId: String(patientId),
-                      practiceId: _practiceId,
-                    }).toString(),
-                  });
-                  logParts.push(`  GetFilesFromBlob(Kendo) status=${filesRes3.status} body=${filesRes3.body.substring(0, 500)}`);
+                  logParts.push(`  GetFilesFromBlob: status=${filesRes.status} body=${filesRes.body.substring(0, 500)}`);
                 }
 
                 if (filesRes.status !== 200 || filesRes.body.length < 10) {
