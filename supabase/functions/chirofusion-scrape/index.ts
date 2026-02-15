@@ -1161,8 +1161,15 @@ Deno.serve(async (req) => {
 
               try {
                 // 1. Navigate to patient page to set them in session
-                await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patient.id}`);
-                await ajaxFetch(`/Patient/Patient/SetVisitIdInSession?patientId=${patient.id}`, { method: "POST" });
+                const { body: patientPageBody, finalUrl } = await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patient.id}`);
+                if (processedCount < 3) {
+                  logParts.push(`DEBUG patient page ${patient.id}: finalUrl=${finalUrl} bodyLen=${patientPageBody.length}`);
+                }
+
+                const visitRes = await ajaxFetch(`/Patient/Patient/SetVisitIdInSession?patientId=${patient.id}`, { method: "POST" });
+                if (processedCount < 3) {
+                  logParts.push(`DEBUG SetVisitId ${patient.id}: status=${visitRes.status} body=${visitRes.body.substring(0, 200)}`);
+                }
 
                 // 2. Get file list from blob storage
                 const filesRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
@@ -1181,28 +1188,42 @@ Deno.serve(async (req) => {
                   }).toString(),
                 });
 
+                // Always log first 3 patients for debugging
+                if (processedCount < 3) {
+                  logParts.push(`DEBUG GetFilesFromBlob ${patient.firstName} ${patient.lastName} (${patient.id}): status=${filesRes.status} len=${filesRes.body.length} type=${filesRes.contentType}`);
+                  logParts.push(`DEBUG response preview: ${filesRes.body.substring(0, 800)}`);
+                }
+
                 if (filesRes.status !== 200 || filesRes.body.length < 10) {
-                  logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: no files (status=${filesRes.status})`);
                   processedCount++;
                   continue;
                 }
 
                 // 3. Parse response to extract blob names
-                let filesData: { Data?: Array<Record<string, unknown>>; Total?: number };
+                let filesData: any;
                 try {
                   filesData = JSON.parse(filesRes.body);
                 } catch {
-                  // Log first response to understand format
-                  if (processedCount < 3) {
-                    logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: non-JSON response (${filesRes.body.length} chars): ${filesRes.body.substring(0, 500)}`);
+                  if (processedCount < 5) {
+                    logParts.push(`Medical Files ${patient.firstName}: non-JSON (${filesRes.body.length} chars): ${filesRes.body.substring(0, 500)}`);
                   }
                   processedCount++;
                   continue;
                 }
 
-                const files = filesData.Data || [];
+                // Log parsed structure for first patients
+                if (processedCount < 3) {
+                  logParts.push(`DEBUG parsed keys: ${JSON.stringify(Object.keys(filesData))}`);
+                  if (filesData.Data) logParts.push(`DEBUG Data length: ${filesData.Data.length}`);
+                  if (filesData.Data && filesData.Data.length > 0) logParts.push(`DEBUG first item keys: ${JSON.stringify(Object.keys(filesData.Data[0]))}`);
+                  if (filesData.Data && filesData.Data.length > 0) logParts.push(`DEBUG first item: ${JSON.stringify(filesData.Data[0]).substring(0, 500)}`);
+                  // Also check if it's a flat array
+                  if (Array.isArray(filesData) && filesData.length > 0) logParts.push(`DEBUG array first item: ${JSON.stringify(filesData[0]).substring(0, 500)}`);
+                }
+
+                const files = filesData.Data || (Array.isArray(filesData) ? filesData : []);
                 if (files.length === 0) {
-                  logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: 0 files`);
+                  if (processedCount < 5) logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: 0 files`);
                   processedCount++;
                   continue;
                 }
