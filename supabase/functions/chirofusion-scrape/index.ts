@@ -260,47 +260,66 @@ Deno.serve(async (req) => {
         switch (dataType) {
           // ==================== DEMOGRAPHICS ====================
           case "demographics": {
-            // Primary: Use the bulk export endpoint which returns ALL patients
-            logParts.push(`Trying ExportPatientList (bulk export)...`);
-            const exportRes = await ajaxFetch("/Patient/Patient/ExportPatientList", {
+            // Primary: Use Patient Reports "Export To Excel" (Schedule > Patient Reports)
+            // This returns ALL 2321+ patients with full demographics
+            logParts.push(`Trying ExportPatientReports (Patient Reports > Export To Excel)...`);
+
+            // Try the export endpoint that backs the "Export To Excel" button
+            const exportRes = await ajaxFetch("/User/Scheduler/ExportPatientReports", {
               method: "POST",
               headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body: "",
+              body: new URLSearchParams({
+                reportType: "PatientList",
+                patientStatus: "All",
+              }).toString(),
             });
-            logParts.push(`ExportPatientList: status=${exportRes.status} type=${exportRes.contentType} length=${exportRes.body.length}`);
-            logParts.push(`Export preview (first 500): ${exportRes.body.substring(0, 500)}`);
+            logParts.push(`ExportPatientReports POST: status=${exportRes.status} type=${exportRes.contentType} length=${exportRes.body.length}`);
+            logParts.push(`Preview: ${exportRes.body.substring(0, 500)}`);
 
-            if (exportRes.body.length > 100 && !exportRes.body.includes("<!DOCTYPE") && !exportRes.body.includes("<html")) {
+            if (exportRes.body.length > 200 && !exportRes.body.includes("<!DOCTYPE") && !exportRes.body.includes("<html")) {
               csvContent = exportRes.body;
               rowCount = csvContent.split("\n").length - 1;
-              logParts.push(`✅ Demographics (export): ${rowCount} rows`);
+              logParts.push(`✅ Demographics (ExportPatientReports): ${rowCount} rows`);
             } else {
-              // Fallback: JSON endpoint (may only return subset)
-              logParts.push(`Export failed, falling back to JSON endpoint...`);
-              const { status, body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
-              logParts.push(`Patient API: status=${status} type=${contentType} length=${body.length}`);
+              // Try GET variant
+              const getRes = await ajaxFetch("/User/Scheduler/ExportPatientReports?reportType=PatientList&patientStatus=All");
+              logParts.push(`ExportPatientReports GET: status=${getRes.status} type=${getRes.contentType} length=${getRes.body.length}`);
+              logParts.push(`GET Preview: ${getRes.body.substring(0, 500)}`);
 
-              if (contentType.includes("application/json")) {
-                const parsed = JSON.parse(body);
-                const patients = parsed.PatientData || parsed;
+              if (getRes.body.length > 200 && !getRes.body.includes("<!DOCTYPE") && !getRes.body.includes("<html")) {
+                csvContent = getRes.body;
+                rowCount = csvContent.split("\n").length - 1;
+                logParts.push(`✅ Demographics (GET): ${rowCount} rows`);
+              } else {
+                // Try ExportPatientList
+                const listRes = await ajaxFetch("/Patient/Patient/ExportPatientList", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                  body: "",
+                });
+                logParts.push(`ExportPatientList: status=${listRes.status} type=${listRes.contentType} length=${listRes.body.length}`);
+                logParts.push(`Preview: ${listRes.body.substring(0, 500)}`);
 
-                if (Array.isArray(patients) && patients.length > 0) {
-                  const expanded = patients.map((p: any) => ({
-                    PatientID: p.I || "",
-                    FirstName: p.F || "",
-                    LastName: p.L || "",
-                    Nickname: p.N || "",
-                    DateOfBirth: p.DOB || parseNetDate(p.D ? `/Date(${p.D})/` : null),
-                    HomePhone: p.HP || "",
-                    MobilePhone: p.MP || "",
-                    WorkPhone: p.WP || "",
-                    Email: p.E || "",
-                    IsDeactivated: p.ID ? "Yes" : "No",
-                  }));
-
-                  csvContent = jsonToCsv(expanded);
-                  rowCount = expanded.length;
-                  logParts.push(`✅ Demographics (JSON): ${rowCount} patients (may be partial)`);
+                if (listRes.body.length > 200 && !listRes.body.includes("<!DOCTYPE") && !listRes.body.includes("<html")) {
+                  csvContent = listRes.body;
+                  rowCount = csvContent.split("\n").length - 1;
+                  logParts.push(`✅ Demographics (ExportPatientList): ${rowCount} rows`);
+                } else {
+                  // Final fallback: JSON endpoint (partial)
+                  const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
+                  if (contentType.includes("application/json")) {
+                    const patients = (JSON.parse(body)).PatientData || JSON.parse(body);
+                    if (Array.isArray(patients) && patients.length > 0) {
+                      const expanded = patients.map((p: any) => ({
+                        PatientID: p.I || "", FirstName: p.F || "", LastName: p.L || "",
+                        DateOfBirth: p.DOB || "", HomePhone: p.HP || "", MobilePhone: p.MP || "",
+                        Email: p.E || "",
+                      }));
+                      csvContent = jsonToCsv(expanded);
+                      rowCount = expanded.length;
+                      logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients (partial)`);
+                    }
+                  }
                 }
               }
             }
