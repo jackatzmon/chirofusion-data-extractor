@@ -1044,103 +1044,112 @@ Deno.serve(async (req) => {
 
           // ==================== APPOINTMENTS ====================
           case "appointments": {
-            // Discovery found: form #exportPatientAppntList POSTs to /User/Scheduler/ExportAppointmentReport
-            // Hidden fields: ReportType, DateFrom, DateTo, PhysicianId, AppointmentTypeId, LocationId
+            // Based on browser cURL: POST to /Scheduler/Scheduler/GetAppointmentReport
+            // ReportType=1204 (Appointment Hx), IsAllPatient=true, with __RequestVerificationToken
             const fromDate = dateFrom || "08/10/2021";
             const toDate = dateTo || new Date().toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
 
             logParts.push(`Date range: ${fromDate} to ${toDate}`);
 
-            // Get physicians list to include all providers
-            let physicianId = "";
-            try {
-              const { body: physBody } = await ajaxFetch("/User/Scheduler/GetPhysiciansForRunReport");
-              const physicians = JSON.parse(physBody);
-              if (Array.isArray(physicians) && physicians.length > 0) {
-                physicianId = physicians.map((p: any) => p.Value || p.Id || "").filter(Boolean).join(",");
-                logParts.push(`Physicians found: ${physicians.length} (IDs: ${physicianId})`);
-              }
-            } catch { /* ignore */ }
-
-            // Get appointment types
-            let appointmentTypeId = "";
-            try {
-              const { body: atBody } = await ajaxFetch("/User/Scheduler/GetAppointmentTypes");
-              const types = JSON.parse(atBody);
-              if (Array.isArray(types) && types.length > 0) {
-                logParts.push(`Appointment types: ${types.length}`);
-              }
-            } catch { /* ignore */ }
-
-            // Step 1: Trigger the appointment report via GetAppointmentReport
+            // Step 1: Load Scheduler page to get verification token and practiceId
             const { body: schedHtmlAppt } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
             const apptToken = extractVerifToken(schedHtmlAppt);
+            setPracticeId(schedHtmlAppt);
+            logParts.push(`Scheduler loaded. Token: ${apptToken ? "YES" : "NONE"}, practiceId: ${_practiceId}`);
 
-            const apptFormData = new URLSearchParams({
-              ReportType: "CompletedVisits",
+            // Step 2: Call GetAppointmentReport with exact browser payload
+            const apptBody = new URLSearchParams({
+              __RequestVerificationToken: apptToken,
+              ReportType_input: "Appointment Hx",
+              ReportType: "1204",
               DateFrom: fromDate,
               DateTo: toDate,
-              PhysicianId: physicianId || "0",
-              AppointmentTypeId: appointmentTypeId,
-              LocationId: "",
-            });
+              IsAllPatient: "true",
+              ReportAppointmentTypeId_input: "",
+              ReportAppointmentTypeId: "",
+              ReportProviderId_input: "",
+              ReportProviderId: "",
+            }).toString();
 
-            logParts.push(`Step 1: Trigger GetAppointmentReport...`);
+            logParts.push(`Step 2: GetAppointmentReport (ReportType=1204, IsAllPatient=true)...`);
+            let apptFound = false;
+
             try {
               const triggerRes = await ajaxFetch("/Scheduler/Scheduler/GetAppointmentReport", {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                 },
-                body: apptFormData.toString(),
+                body: apptBody,
               });
-              logParts.push(`Trigger: status=${triggerRes.status} len=${triggerRes.body.length}`);
+              logParts.push(`Trigger: status=${triggerRes.status} len=${triggerRes.body.length} type=${triggerRes.contentType}`);
+
+              // Check if the response itself contains the data (JSON array)
+              if (triggerRes.status === 200 && triggerRes.body.length > 100) {
+                if (triggerRes.body.length < 2000) {
+                  logParts.push(`  Body: ${triggerRes.body}`);
+                } else {
+                  logParts.push(`  Preview: ${triggerRes.body.substring(0, 500)}`);
+                }
+
+                try {
+                  const triggerData = JSON.parse(triggerRes.body);
+                  const items = triggerData.Data || triggerData.data || (Array.isArray(triggerData) ? triggerData : null);
+                  if (items && Array.isArray(items) && items.length > 0) {
+                    csvContent = jsonToCsv(items);
+                    rowCount = items.length;
+                    logParts.push(`✅ Appointments from direct response: ${rowCount} rows`);
+                    apptFound = true;
+                  }
+                } catch { /* not JSON, try export */ }
+              }
             } catch (e: any) {
               logParts.push(`Trigger error: ${e.message}`);
             }
 
-            // Step 2: Poll ExportAppointmentReport with retries (don't press OK)
-            const MAX_APPT_RETRIES = 8;
-            const APPT_RETRY_MS = 4000;
+            // Step 3: Poll ExportAppointmentReport if direct response didn't have data
+            if (!apptFound) {
+              const MAX_APPT_RETRIES = 8;
+              const APPT_RETRY_MS = 4000;
 
-            for (let attempt = 1; attempt <= MAX_APPT_RETRIES; attempt++) {
-              if (isTimingOut()) {
-                logParts.push(`⏱️ Appt export: timeout at attempt ${attempt}`);
-                break;
-              }
-
-              logParts.push(`Export attempt ${attempt}/${MAX_APPT_RETRIES} (waiting ${APPT_RETRY_MS / 1000}s)...`);
-              await new Promise(r => setTimeout(r, APPT_RETRY_MS));
-
-              try {
-                const expRes = await ajaxFetch("/Scheduler/Scheduler/ExportAppointmentReport", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                  },
-                  body: new URLSearchParams(
-                    Object.fromEntries(apptFormData),
-                  ).toString(),
-                });
-                logParts.push(`  status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
-
-                if (expRes.status === 200 && expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE") && !expRes.body.includes("<html")) {
-                  csvContent = expRes.body;
-                  rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
-                  logParts.push(`✅ Appointments export: ${rowCount} rows (attempt ${attempt})`);
+              for (let attempt = 1; attempt <= MAX_APPT_RETRIES; attempt++) {
+                if (isTimingOut()) {
+                  logParts.push(`⏱️ Appt export: timeout at attempt ${attempt}`);
                   break;
                 }
 
-                if (expRes.status >= 400) {
-                  logParts.push(`  Not ready yet (${expRes.status}), retrying...`);
+                logParts.push(`Export attempt ${attempt}/${MAX_APPT_RETRIES} (waiting ${APPT_RETRY_MS / 1000}s)...`);
+                await new Promise(r => setTimeout(r, APPT_RETRY_MS));
+
+                try {
+                  const expRes = await ajaxFetch("/Scheduler/Scheduler/ExportAppointmentReport", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    },
+                    body: apptBody,
+                  });
+                  logParts.push(`  status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
+
+                  if (expRes.status === 200 && expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE") && !expRes.body.includes("<html")) {
+                    csvContent = expRes.body;
+                    rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
+                    logParts.push(`✅ Appointments export: ${rowCount} rows (attempt ${attempt})`);
+                    apptFound = true;
+                    break;
+                  }
+
+                  if (expRes.body.length > 0 && expRes.body.length < 1000) {
+                    logParts.push(`  Body: ${expRes.body}`);
+                  }
+                } catch (e: any) {
+                  logParts.push(`  Attempt ${attempt} error: ${e.message}`);
                 }
-              } catch (e: any) {
-                logParts.push(`  Attempt ${attempt} error: ${e.message}`);
               }
             }
 
-            if (!csvContent) {
-              logParts.push(`⚠️ Appointments: Export polling exhausted after ${MAX_APPT_RETRIES} attempts`);
+            if (!apptFound) {
+              logParts.push(`⚠️ Appointments: No data retrieved after all attempts`);
             }
             break;
           }
