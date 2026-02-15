@@ -1186,8 +1186,31 @@ Deno.serve(async (req) => {
             logParts.push(`Processing ${patients.length} patients for medical file PDFs`);
             logParts.push(`DEBUG: isTimingOut=${isTimingOut()}, elapsed=${Date.now() - startTime}ms`);
 
+            // Helper: call GetFileCategory to set patient context before GetFilesFromBlob
+            async function setPatientContext(pid: string): Promise<void> {
+              await ajaxFetch("/Patient/Patient/GetFileCategory", {
+                method: "GET",
+                headers: {
+                  "Referer": `${BASE_URL}/Patient`,
+                  "ClientPatientId": pid,
+                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                },
+              });
+            }
+
             // Test with a known-good patient (from user's curl) to verify GetFilesFromBlob works
             logParts.push(`\n--- Testing GetFilesFromBlob with known patient 2568509 ---`);
+            // Step 1: Set patient context via GetFileCategory
+            const catRes = await ajaxFetch("/Patient/Patient/GetFileCategory", {
+              method: "GET",
+              headers: {
+                "Referer": `${BASE_URL}/Patient`,
+                "ClientPatientId": "2568509",
+                ...(_practiceId ? { "practiceId": _practiceId } : {}),
+              },
+            });
+            logParts.push(`GetFileCategory context: status=${catRes.status} len=${catRes.body.length}`);
+            // Step 2: Now fetch files
             const knownTestRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
               method: "POST",
               headers: {
@@ -1255,7 +1278,10 @@ Deno.serve(async (req) => {
                 const by2 = birthYear2(info.dob);
                 const fileName = `${patient.lastName}${by2}`.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 
-                // 2. Get file list via GetFilesFromBlob (no page navigation needed - API works directly)
+                // 2a. Set patient context via GetFileCategory (required before GetFilesFromBlob returns data)
+                await setPatientContext(String(patientId));
+
+                // 2b. Get file list via GetFilesFromBlob
                 const filesRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
                   method: "POST",
                   headers: {
