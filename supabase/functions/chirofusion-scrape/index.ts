@@ -678,218 +678,60 @@ Deno.serve(async (req) => {
       return _cachedPatientNames;
     }
 
-    // Search for a patient by name and navigate to their file
-    // Returns the patient ID if found, or null
-    let _workingSearchEndpoint: string | null = null;
-    let _workingArchiveEndpoint: string | null = null;
-    
-    async function searchAndNavigateToPatient(firstName: string, lastName: string, debugLog: boolean): Promise<number | null> {
-      const searchTerm = `${lastName}, ${firstName}`.trim();
-      
-      // Helper to extract patient ID from search results
-      function extractPatientId(body: string): number | null {
+    // Search for a patient by name using the real GetSearchedPatient endpoint
+    // Regular search: archiveFilter=0, Archive search: archiveFilter=1
+    async function searchPatient(searchText: string, archiveFilter: number, debugLog: boolean): Promise<number | null> {
+      const res = await ajaxFetch("/Patient/Patient/GetSearchedPatient", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "ClientPatientId": "0",
+          ...(_practiceId ? { "practiceId": _practiceId } : {}),
+        },
+        body: new URLSearchParams({
+          SelectedCriteria: "10",
+          SelectedFilter: "2",
+          searchText: searchText,
+          archiveFilter: String(archiveFilter),
+        }).toString(),
+      });
+
+      if (debugLog) {
+        logParts.push(`GetSearchedPatient(archive=${archiveFilter}, text="${searchText}"): status=${res.status} len=${res.body.length}`);
+        logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
+      }
+
+      if (res.status === 200 && res.body.length > 10) {
         try {
-          const data = JSON.parse(body);
-          const arr = Array.isArray(data) ? data : (data.Data || data.data || data.Results || data.d || []);
+          const data = JSON.parse(res.body);
+          const arr = Array.isArray(data) ? data : (data.Data || data.data || data.Results || []);
           if (Array.isArray(arr) && arr.length > 0) {
             if (debugLog) {
-              logParts.push(`  Search results: ${arr.length} items, keys: ${Object.keys(arr[0]).join(", ")}`);
+              logParts.push(`  Results: ${arr.length} items, keys: ${Object.keys(arr[0]).join(", ")}`);
               logParts.push(`  Sample: ${JSON.stringify(arr[0]).substring(0, 400)}`);
             }
-            // Try to find best match by name
-            const match = arr.find((p: any) => {
-              const fn = (p.FirstName || p.F || p.firstName || "").toLowerCase();
-              const ln = (p.LastName || p.L || p.lastName || "").toLowerCase();
-              const label = (p.Label || p.label || p.Text || p.text || p.Name || p.name || "").toLowerCase();
-              return (fn === firstName.toLowerCase() && ln === lastName.toLowerCase()) ||
-                     label.includes(lastName.toLowerCase());
-            }) || arr[0];
-            
-            const patientId = match.PatientId || match.Id || match.I || match.PkPatientId || 
+            const match = arr[0];
+            const patientId = match.PatientId || match.Id || match.I || match.PkPatientId ||
                              match.ClientPatientId || match.id || match.Value || match.value;
             if (patientId) return Number(patientId);
           }
         } catch { /* not JSON */ }
-        return null;
       }
-
-      // If we already know the working endpoint, use it directly
-      if (_workingSearchEndpoint) {
-        const res = await ajaxFetch(`${_workingSearchEndpoint}${encodeURIComponent(searchTerm)}`);
-        let id = (res.status === 200 && res.body.length > 10) ? extractPatientId(res.body) : null;
-        
-        // If not found and we have an archive endpoint, try that
-        if (id === null && _workingArchiveEndpoint) {
-          if (debugLog) logParts.push(`"${searchTerm}" not in primary search, trying archive...`);
-          const archRes = await ajaxFetch(`${_workingArchiveEndpoint}${encodeURIComponent(searchTerm)}`);
-          if (archRes.status === 200 && archRes.body.length > 10) {
-            id = extractPatientId(archRes.body);
-            if (id === null) {
-              // Archive might just trigger a load — re-search after
-              const res2 = await ajaxFetch(`${_workingSearchEndpoint}${encodeURIComponent(searchTerm)}`);
-              if (res2.status === 200 && res2.body.length > 10) id = extractPatientId(res2.body);
-            }
-          }
-        }
-        return id;
-      }
-
-      // Discovery mode: find the working search endpoint
-      // Step 1: Load home page and scan for "load more" / archive button
-      const { body: homeHtml } = await fetchWithCookies(`${BASE_URL}/`);
-      if (debugLog) {
-        // Look for the "click here to load more" button/link and search-related elements
-        const loadMoreMatch = homeHtml.match(/click here to load more|load\s*more|LoadMore|loadMore|retrieveArchive|archived|clickHereToLoadMore/gi);
-        logParts.push(`Home page "load more" references: ${loadMoreMatch ? loadMoreMatch.join(", ") : "none found"}`);
-        
-        // Find search input and its autocomplete source
-        const searchInputMatch = homeHtml.match(/<input[^>]*(search|patient|autocomplete)[^>]*>/gi);
-        if (searchInputMatch) {
-          for (const si of searchInputMatch.slice(0, 5)) {
-            logParts.push(`Search input: ${si}`);
-          }
-        }
-
-        // Find all script src tags to identify JS bundles
-        const scriptSrcs: string[] = [];
-        const scriptRegex = /<script[^>]*src="([^"]+)"[^>]*>/gi;
-        let sm;
-        while ((sm = scriptRegex.exec(homeHtml)) !== null) {
-          scriptSrcs.push(sm[1]);
-        }
-        logParts.push(`Script bundles on home page: ${scriptSrcs.length}`);
-        for (const src of scriptSrcs) {
-          logParts.push(`  Script: ${src}`);
-        }
-
-        // Find inline scripts that mention patient/search
-        const inlineScripts = homeHtml.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
-        for (const scr of inlineScripts) {
-          if (/patient|search|autocomplete|loadMore|ajax.*patient/i.test(scr)) {
-            const relevant = scr.match(/.{0,150}(patient|search|autocomplete|loadMore|ajax).{0,150}/gi);
-            if (relevant) {
-              for (const r of relevant.slice(0, 5)) {
-                logParts.push(`Inline JS: ${r.replace(/<\/?script[^>]*>/gi, "").replace(/\s+/g, " ").trim().substring(0, 300)}`);
-              }
-            }
-          }
-        }
-
-        // Scan app-related JS bundles for AJAX calls related to search/patient
-        const appScripts = scriptSrcs.filter(s => !s.includes("jquery") && !s.includes("kendo") && !s.includes("bootstrap") && !s.includes("signalr"));
-        for (const src of appScripts.slice(0, 3)) {
-          try {
-            const scriptUrl = src.startsWith("http") ? src : `${BASE_URL}${src.startsWith("/") ? "" : "/"}${src}`;
-            const { body: jsBody } = await fetchWithCookies(scriptUrl);
-            // Look for search/patient/loadMore related AJAX calls
-            const ajaxMatches = jsBody.match(/.{0,100}(\.ajax|\.post|\.get|fetch)\s*\([^)]*(?:patient|search|load\s*more|archive)[^)]{0,200}\)/gi);
-            if (ajaxMatches) {
-              logParts.push(`\nJS bundle ${src}:`);
-              for (const am of ajaxMatches.slice(0, 10)) {
-                logParts.push(`  AJAX: ${am.replace(/\s+/g, " ").trim().substring(0, 300)}`);
-              }
-            }
-            // Also look for URL patterns with Patient/Search/Load
-            const urlMatches = jsBody.match(/["']\/[A-Za-z]+\/[A-Za-z]+\/[A-Za-z]*(?:Patient|Search|Load|Archive)[A-Za-z]*["']/gi);
-            if (urlMatches) {
-              const unique = [...new Set(urlMatches)];
-              logParts.push(`  URL patterns: ${unique.slice(0, 15).join(", ")}`);
-            }
-          } catch (e: any) {
-            logParts.push(`  Failed to fetch ${src}: ${e.message}`);
-          }
-        }
-      }
-
-      // Try search endpoints
-      const searchEndpoints = [
-        `/Home/Home/GetPatientBySearchText?searchText=`,
-        `/Patient/Patient/SearchPatient?searchText=`,
-        `/Patient/Patient/AutoCompletePatient?term=`,
-        `/Home/Home/SearchPatient?searchText=`,
-        `/Patient/Patient/GetPatientBySearchText?searchText=`,
-        `/Home/Home/AutoCompletePatient?term=`,
-      ];
-
-      for (const ep of searchEndpoints) {
-        try {
-          const res = await ajaxFetch(`${ep}${encodeURIComponent(searchTerm)}`);
-          if (debugLog) {
-            logParts.push(`Search ${ep.split("?")[0]}: status=${res.status} len=${res.body.length} preview=${res.body.substring(0, 300)}`);
-          }
-          if (res.status === 200 && res.body.length > 10) {
-            const id = extractPatientId(res.body);
-            if (id !== null) {
-              _workingSearchEndpoint = ep;
-              if (debugLog) logParts.push(`✅ Working search endpoint: ${ep}`);
-              return id;
-            }
-            // Even if no ID yet, if we got a valid JSON array response, this endpoint works
-            try {
-              const data = JSON.parse(res.body);
-              const arr = Array.isArray(data) ? data : (data.Data || data.data || []);
-              if (Array.isArray(arr)) {
-                _workingSearchEndpoint = ep;
-                if (debugLog) logParts.push(`Search endpoint responds (${arr.length} results): ${ep}`);
-              }
-            } catch {}
-          }
-        } catch { /* endpoint doesn't exist */ }
-      }
-
-      // Step 2: Try archive/load-more endpoints
-      if (debugLog) logParts.push(`Trying archive/load-more endpoints for "${searchTerm}"...`);
-      
-      const archiveEndpoints = [
-        { url: `/Home/Home/LoadMorePatient?searchText=`, method: "GET" },
-        { url: `/Patient/Patient/LoadMorePatient?searchText=`, method: "GET" },
-        { url: `/Home/Home/LoadArchivedPatient?searchText=`, method: "GET" },
-        { url: `/Patient/Patient/LoadArchivedPatient?searchText=`, method: "GET" },
-        { url: `/Home/Home/GetPatientFromServer?searchText=`, method: "GET" },
-        { url: `/Patient/Patient/GetPatientFromServer?searchText=`, method: "GET" },
-        { url: `/Home/Home/SearchPatientFromServer?searchText=`, method: "GET" },
-        { url: `/Home/Home/GetMorePatient?searchText=`, method: "GET" },
-      ];
-
-      for (const ep of archiveEndpoints) {
-        try {
-          let res = await ajaxFetch(`${ep.url}${encodeURIComponent(searchTerm)}`);
-          // Also try POST
-          if (res.status !== 200 || res.body.length < 5) {
-            res = await ajaxFetch(ep.url.split("?")[0], {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
-              body: new URLSearchParams({ searchText: searchTerm }).toString(),
-            });
-          }
-          if (debugLog) {
-            logParts.push(`Archive ${ep.url.split("?")[0]}: status=${res.status} len=${res.body.length} preview=${res.body.substring(0, 300)}`);
-          }
-          if (res.status === 200 && res.body.length > 10) {
-            const id = extractPatientId(res.body);
-            if (id !== null) {
-              _workingArchiveEndpoint = ep.url;
-              if (debugLog) logParts.push(`✅ Working archive endpoint: ${ep.url}`);
-              return id;
-            }
-            // Archive might just trigger loading — try re-searching with the primary endpoint
-            if (_workingSearchEndpoint) {
-              const res2 = await ajaxFetch(`${_workingSearchEndpoint}${encodeURIComponent(searchTerm)}`);
-              if (res2.status === 200 && res2.body.length > 10) {
-                const id2 = extractPatientId(res2.body);
-                if (id2 !== null) {
-                  _workingArchiveEndpoint = ep.url;
-                  if (debugLog) logParts.push(`✅ Archive+re-search worked: ${ep.url}`);
-                  return id2;
-                }
-              }
-            }
-          }
-        } catch { /* endpoint doesn't exist */ }
-      }
-
-      if (debugLog) logParts.push(`⚠️ Could not find "${searchTerm}" via any endpoint`);
       return null;
+    }
+
+    // Search by name: first try regular search, then archive if not found
+    async function findPatientId(firstName: string, lastName: string, debugLog: boolean): Promise<number | null> {
+      const searchText = `${lastName}, ${firstName}`.trim();
+      
+      // Try regular search first
+      let id = await searchPatient(searchText, 0, debugLog);
+      if (id !== null) return id;
+
+      // Not found — try archive search ("click here to load more")
+      if (debugLog) logParts.push(`"${searchText}" not in regular search, trying archive...`);
+      id = await searchPatient(searchText, 1, debugLog);
+      return id;
     }
 
     for (const dataType of dataTypes) {
@@ -1343,10 +1185,10 @@ Deno.serve(async (req) => {
             logParts.push(`Processing ${patients.length} patients for medical file PDFs`);
             logParts.push(`DEBUG: isTimingOut=${isTimingOut()}, elapsed=${Date.now() - startTime}ms`);
 
-            // First, discover the working search endpoint with the first patient
-            logParts.push(`\n--- Discovery: testing search with "${patients[0].lastName} ${patients[0].firstName}" ---`);
-            const testId = await searchAndNavigateToPatient(patients[0].firstName, patients[0].lastName, true);
-            logParts.push(`Discovery result: patientId=${testId}`);
+            // Test search with first patient
+            logParts.push(`\n--- Testing search with "${patients[0].lastName}, ${patients[0].firstName}" ---`);
+            const testId = await findPatientId(patients[0].firstName, patients[0].lastName, true);
+            logParts.push(`Test result: patientId=${testId}`);
 
             if (testId === null) {
               logParts.push(`⚠️ Could not find a working search endpoint. Cannot process medical files.`);
@@ -1368,7 +1210,7 @@ Deno.serve(async (req) => {
 
               try {
                 // 1. Search for patient by name to get their ID
-                const patientId = processedCount === 0 ? testId : await searchAndNavigateToPatient(patient.firstName, patient.lastName, processedCount < 3);
+                const patientId = processedCount === 0 ? testId : await findPatientId(patient.firstName, patient.lastName, processedCount < 3);
                 
                 if (!patientId) {
                   searchFailed++;
