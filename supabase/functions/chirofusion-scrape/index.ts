@@ -454,6 +454,14 @@ Deno.serve(async (req) => {
             withFiles: batchState.withFiles,
             skippedDefaultCase: batchState.skippedDefaultCase,
             dataTypeIndex: batchState.dataTypeIndex,
+            // Financials-specific counters
+            ledgerFetched: batchState.ledgerFetched,
+            ledgerEmpty: batchState.ledgerEmpty,
+            ledgerSearchFailed: batchState.ledgerSearchFailed,
+            // Appointments-specific counters
+            apptPdfResumeIndex: batchState.apptPdfResumeIndex,
+            apptPdfCount: batchState.apptPdfCount,
+            apptSearchFailed: batchState.apptSearchFailed,
           },
         }),
       }).catch(err => console.error("Self-invoke error:", err));
@@ -1960,9 +1968,19 @@ Deno.serve(async (req) => {
           // ==================== FINANCIALS (Per-Patient Account Ledger) ====================
           case "financials": {
             logParts.push(`Fetching per-patient account ledgers via ShowLedger...`);
+            console.log("Financials: fetching patient list...");
 
             // Get all patient names from demographics report
-            const patients = await getAllPatientNames();
+            let patients: { firstName: string; lastName: string }[];
+            try {
+              patients = await getAllPatientNames();
+              console.log(`Financials: got ${patients.length} patients`);
+              logParts.push(`Got ${patients.length} patients for ledger processing`);
+            } catch (patientErr) {
+              logParts.push(`❌ Failed to get patient list: ${(patientErr as any).message}`);
+              console.error("Financials: getAllPatientNames failed:", patientErr);
+              break;
+            }
             if (patients.length === 0) {
               logParts.push(`⚠️ No patients found — cannot fetch ledgers`);
               break;
@@ -2259,6 +2277,27 @@ Deno.serve(async (req) => {
 
   } catch (error) {
     console.error("Error:", error);
+    // Try to mark the job as failed so it doesn't stay stuck as "running"
+    try {
+      const supabase = createClient(
+        Deno.env.get("SUPABASE_URL")!,
+        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+      );
+      // Find the most recent running job and mark it failed
+      const { data: runningJobs } = await supabase.from("scrape_jobs")
+        .select("id")
+        .eq("status", "running")
+        .order("created_at", { ascending: false })
+        .limit(5);
+      if (runningJobs && runningJobs.length > 0) {
+        for (const j of runningJobs) {
+          await supabase.from("scrape_jobs").update({
+            status: "failed",
+            error_message: `Unexpected error: ${(error as any).message}. Please retry.`,
+          }).eq("id", j.id);
+        }
+      }
+    } catch { /* best effort */ }
     return new Response(JSON.stringify({ error: (error as any).message }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
   }
 });
