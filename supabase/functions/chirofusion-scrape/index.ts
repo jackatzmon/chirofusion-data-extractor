@@ -108,24 +108,54 @@ Deno.serve(async (req) => {
     const logParts: string[] = [];
     let sessionCookies = "";
 
+    const browserHeaders = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.5",
+    };
+
+    /** Follow redirects manually to preserve cookies */
+    async function fetchWithCookies(url: string, opts: RequestInit = {}): Promise<{ response: Response; body: string; finalUrl: string }> {
+      let currentUrl = url;
+      let redirectCount = 0;
+      while (redirectCount < 10) {
+        const res = await fetch(currentUrl, {
+          ...opts,
+          headers: { ...browserHeaders, Cookie: sessionCookies, ...(opts.headers || {}) },
+          redirect: "manual",
+        });
+        sessionCookies = mergeCookies(sessionCookies, res);
+        const location = res.headers.get("location");
+        if (location && (res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307)) {
+          await res.text(); // consume body
+          currentUrl = location.startsWith("http") ? location : `https://www.chirofusionlive.com${location}`;
+          redirectCount++;
+          continue;
+        }
+        const body = await res.text();
+        return { response: res, body, finalUrl: currentUrl };
+      }
+      throw new Error(`Too many redirects for ${url}`);
+    }
+
     // ==================== LOGIN ====================
     try {
       // Step 1: GET login page for session cookie
       console.log("Step 1: Fetching login page...");
-      const loginPageRes = await fetch("https://www.chirofusionlive.com/Account", { redirect: "follow" });
-      sessionCookies = mergeCookies(sessionCookies, loginPageRes);
-      await loginPageRes.text(); // consume body
+      const { body: loginPageHtml } = await fetchWithCookies("https://www.chirofusionlive.com/Account");
       logParts.push(`Session cookie: ${sessionCookies}`);
 
       // Step 2: POST to /Account/Login/DoLogin (the real AJAX endpoint)
-      // The Login() JS function sends: { userName: ..., password: ... }
       console.log("Step 2: POST to /Account/Login/DoLogin...");
       const loginRes = await fetch("https://www.chirofusionlive.com/Account/Login/DoLogin", {
         method: "POST",
         headers: {
+          ...browserHeaders,
           "Content-Type": "application/x-www-form-urlencoded",
           "Cookie": sessionCookies,
           "X-Requested-With": "XMLHttpRequest",
+          "Referer": "https://www.chirofusionlive.com/Account",
+          "Origin": "https://www.chirofusionlive.com",
         },
         body: new URLSearchParams({
           userName: creds.cf_username,
@@ -140,57 +170,25 @@ Deno.serve(async (req) => {
       logParts.push(`\n===== DoLogin RESPONSE =====`);
       logParts.push(`Status: ${loginRes.status}`);
       logParts.push(`Response: ${loginResponse.substring(0, 1000)}`);
+      logParts.push(`Set-Cookie headers: ${JSON.stringify(loginRes.headers.getSetCookie?.() || [])}`);
       logParts.push(`Cookies after login: ${sessionCookies}`);
 
-      console.log("DoLogin status:", loginRes.status, "response:", loginResponse.substring(0, 200));
-
-      // Check for login failure
-      const lowerResponse = loginResponse.toLowerCase();
+      const lowerResponse = loginResponse.toLowerCase().replace(/^"|"$/g, '').trim();
       if (lowerResponse.includes("invalidcredentials")) {
-        throw new Error("Invalid credentials. Please check your ChiroFusion username and password.");
+        throw new Error("Invalid credentials.");
       }
       if (lowerResponse === "blocked") {
-        throw new Error("Account locked due to too many failed login attempts. Try again in 20 minutes.");
+        throw new Error("Account locked. Try again in 20 minutes.");
       }
       if (lowerResponse === "paused") {
-        throw new Error("ChiroFusion account is paused. Contact ChiroFusion support.");
+        throw new Error("Account paused.");
       }
 
-      // Success responses: "singlelocation", "sysadmin", or HTML for multi-location
-      const isLoggedIn = lowerResponse === "singlelocation" || lowerResponse === "sysadmin" || loginRes.status === 200;
+      logParts.push(`\n✅ Login response: "${lowerResponse}"`);
 
-      if (!isLoggedIn) {
-        throw new Error(`Unexpected login response: ${loginResponse.substring(0, 200)}`);
-      }
-
-      // After SingleLocation login, call FirstLook to finalize session
-      if (lowerResponse.includes("singlelocation")) {
-        console.log("Step 3: Calling FirstLook to finalize session...");
-        const firstLookRes = await fetch("https://www.chirofusionlive.com/Account/Login/FirstLook", {
-          method: "POST",
-          headers: {
-            "Cookie": sessionCookies,
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/x-www-form-urlencoded",
-          },
-          body: "",
-          redirect: "manual",
-        });
-        sessionCookies = mergeCookies(sessionCookies, firstLookRes);
-        const firstLookBody = await firstLookRes.text();
-        logParts.push(`\n===== FirstLook RESPONSE =====`);
-        logParts.push(`Status: ${firstLookRes.status}`);
-        logParts.push(`Response (first 500): ${firstLookBody.substring(0, 500)}`);
-        logParts.push(`Cookies after FirstLook: ${sessionCookies}`);
-      }
-
-      // If multi-location, may need SetLocationDetailsInSession
-      if (lowerResponse !== "singlelocation" && lowerResponse !== "sysadmin" && loginResponse.includes("location")) {
-        logParts.push(`\n⚠️ MULTI-LOCATION account detected.`);
-        logParts.push(`Location response HTML: ${loginResponse.substring(0, 2000)}`);
-      }
-
-      logParts.push(`\n✅ Login complete. Cookies: ${sessionCookies.substring(0, 100)}...`);
+      // Skip FirstLook (returns 500) - try directly accessing pages
+      // Also try the AJAX content endpoints that the SPA uses
+      logParts.push(`\nSkipping FirstLook. Testing direct page access...`);
 
     } catch (loginError: any) {
       logParts.push(`\n❌ LOGIN ERROR: ${loginError.message}`);
@@ -203,30 +201,54 @@ Deno.serve(async (req) => {
     }
 
     // ==================== FETCH PAGES ====================
+    // Try both full page loads AND AJAX content endpoints
     console.log("Fetching authenticated pages...");
     const pagesToFetch = [
-      { name: "Home", url: "https://www.chirofusionlive.com/" },
-      { name: "Scheduler", url: "https://www.chirofusionlive.com/User/Scheduler" },
-      { name: "Billing", url: "https://www.chirofusionlive.com/Billing/" },
+      { name: "Scheduler (full page)", url: "https://www.chirofusionlive.com/User/Scheduler" },
+      { name: "Scheduler (AJAX)", url: "https://www.chirofusionlive.com/User/Home/GetContent", ajax: true },
+      { name: "Patient Search", url: "https://www.chirofusionlive.com/Patient/Patient/GetAllPatientForLocalStorage", ajax: true },
+      { name: "Billing Main", url: "https://www.chirofusionlive.com/Billing/Billing/MainDashboard", ajax: true },
+      { name: "Billing (full page)", url: "https://www.chirofusionlive.com/Billing/" },
+      { name: "Dashboard Providers", url: "https://www.chirofusionlive.com/Dashboard/Dashboard/GetAllProviders", ajax: true },
     ];
 
     for (const page of pagesToFetch) {
       try {
         console.log(`Fetching ${page.name}...`);
-        const res = await fetch(page.url, {
-          headers: { Cookie: sessionCookies },
-          redirect: "follow",
-        });
 
-        const html = await res.text();
-        const isLoginPage = html.includes("txtLoginUserName") || html.includes("Login()");
-        const structure = extractPageStructure(html);
+        if (page.ajax) {
+          // AJAX endpoints - use XMLHttpRequest headers
+          const res = await fetch(page.url, {
+            headers: {
+              ...browserHeaders,
+              "Cookie": sessionCookies,
+              "X-Requested-With": "XMLHttpRequest",
+              "Accept": "application/json, text/html, */*",
+              "Referer": "https://www.chirofusionlive.com/User/Scheduler",
+            },
+            redirect: "manual",
+          });
+          sessionCookies = mergeCookies(sessionCookies, res);
+          const body = await res.text();
+          const contentType = res.headers.get("content-type") || "unknown";
+          const isLoginPage = body.includes("txtLoginUserName");
 
-        logParts.push(`\n===== ${page.name.toUpperCase()} (${page.url}) =====`);
-        logParts.push(`Status: ${res.status} | Final URL: ${res.url}`);
-        logParts.push(`HTML Length: ${html.length} | Is Login Page: ${isLoginPage}`);
-        logParts.push(structure);
-        logParts.push(`\n--- RAW HTML (first 5000 chars) ---\n${html.substring(0, 5000)}`);
+          logParts.push(`\n===== ${page.name.toUpperCase()} =====`);
+          logParts.push(`Status: ${res.status} | Content-Type: ${contentType} | Is Login: ${isLoginPage}`);
+          logParts.push(`Body length: ${body.length}`);
+          logParts.push(`Body (first 3000): ${body.substring(0, 3000)}`);
+        } else {
+          // Full page - use manual redirect following
+          const { response: res, body: html, finalUrl } = await fetchWithCookies(page.url);
+          const isLoginPage = html.includes("txtLoginUserName");
+          const structure = extractPageStructure(html);
+
+          logParts.push(`\n===== ${page.name.toUpperCase()} =====`);
+          logParts.push(`Status: ${res.status} | Final URL: ${finalUrl} | Is Login: ${isLoginPage}`);
+          logParts.push(`HTML Length: ${html.length}`);
+          logParts.push(structure);
+          logParts.push(`\n--- RAW HTML (first 5000 chars) ---\n${html.substring(0, 5000)}`);
+        }
       } catch (err: any) {
         logParts.push(`\n===== ${page.name.toUpperCase()} ERROR =====\n${err.message}`);
       }
