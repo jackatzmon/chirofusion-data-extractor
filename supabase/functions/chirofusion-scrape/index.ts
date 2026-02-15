@@ -1154,56 +1154,176 @@ Deno.serve(async (req) => {
             break;
           }
 
-          // ==================== SOAP NOTES ====================
+          // ==================== SOAP NOTES / MEDICAL FILES ====================
           case "soap_notes": {
             const patients = await getAllPatientIds();
 
             if (patients.length === 0) {
-              logParts.push(`⚠️ SOAP Notes: No patients found`);
+              logParts.push(`⚠️ Medical Files: No patients found`);
               break;
             }
 
-            logParts.push(`Processing ${patients.length} patients for SOAP notes`);
+            logParts.push(`Processing ${patients.length} patients for medical file PDFs`);
 
-            const soapResults: string[] = [];
             let processedCount = 0;
+            let pdfCount = 0;
 
             for (const patient of patients) {
               if (!patient.id) continue;
               if (isTimingOut()) {
-                logParts.push(`⏱️ SOAP Notes: Stopped at ${processedCount}/${patients.length} (timeout safety)`);
+                logParts.push(`⏱️ Medical Files: Stopped at ${processedCount}/${patients.length} (timeout safety)`);
                 break;
               }
 
               try {
-                const { status, body: soapBody } = await ajaxFetch(
-                  `/User/Scheduler/GetSopaNoteReportDetailsAsync?patientId=${patient.id}`
-                );
+                // 1. Set patient in session
+                await ajaxFetch(`/Patient/Patient/SetVisitIdInSession?patientId=${patient.id}`, { method: "POST" });
 
-                if (status === 200 && soapBody.length > 10) {
-                  soapResults.push(`Patient ${patient.firstName} ${patient.lastName} (${patient.id}): ${soapBody.substring(0, 200)}`);
-                  logParts.push(`SOAP ${patient.firstName} ${patient.lastName}: status=${status} length=${soapBody.length}`);
+                // 2. Get file list from blob storage
+                const filesRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Referer": `${BASE_URL}/Patient`,
+                    "ClientPatientId": String(patient.id),
+                  },
+                  body: new URLSearchParams({
+                    sort: "",
+                    group: "",
+                    filter: "",
+                    patientId: String(patient.id),
+                    practiceId: _practiceId,
+                  }).toString(),
+                });
+
+                if (filesRes.status !== 200 || filesRes.body.length < 10) {
+                  logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: no files (status=${filesRes.status})`);
+                  processedCount++;
+                  continue;
+                }
+
+                // 3. Parse response to extract blob names
+                let filesData: { Data?: Array<Record<string, unknown>>; Total?: number };
+                try {
+                  filesData = JSON.parse(filesRes.body);
+                } catch {
+                  // Log first response to understand format
+                  if (processedCount < 3) {
+                    logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: non-JSON response (${filesRes.body.length} chars): ${filesRes.body.substring(0, 500)}`);
+                  }
+                  processedCount++;
+                  continue;
+                }
+
+                const files = filesData.Data || [];
+                if (files.length === 0) {
+                  logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: 0 files`);
+                  processedCount++;
+                  continue;
+                }
+
+                // Log first patient's file structure to understand the schema
+                if (processedCount < 2) {
+                  logParts.push(`Medical Files sample keys: ${JSON.stringify(Object.keys(files[0]))}`);
+                  logParts.push(`Medical Files sample row: ${JSON.stringify(files[0]).substring(0, 500)}`);
+                }
+
+                // Build BlobName from all files - look for common blob name fields
+                const blobNames: string[] = [];
+                for (const file of files) {
+                  // Try common field names for the blob reference
+                  const blobName = file.BlobName || file.blobName || file.FileName || file.fileName || file.Name || file.name || file.FileKey || file.fileKey;
+                  if (blobName && typeof blobName === "string") {
+                    blobNames.push(blobName);
+                  }
+                }
+
+                if (blobNames.length === 0) {
+                  // Fallback: if no obvious blob field, log all fields for debugging
+                  logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: ${files.length} files but no blob name field found. Keys: ${JSON.stringify(Object.keys(files[0]))}`);
+                  processedCount++;
+                  continue;
+                }
+
+                logParts.push(`Medical Files ${patient.firstName} ${patient.lastName}: ${blobNames.length} documents`);
+
+                // 4. Export all files as PDF
+                const patientName = `${patient.firstName || ""}${patient.lastName || ""}`.replace(/[^a-zA-Z0-9]/g, "").substring(0, 20);
+                const exportBody = new URLSearchParams({
+                  BlobName: blobNames.join("|"),
+                  FileName: patientName || `patient_${patient.id}`,
+                }).toString();
+
+                const pdfRes = await fetch(`${BASE_URL}/User/Navigation/ExportToPdf`, {
+                  method: "POST",
+                  headers: {
+                    ...browserHeaders,
+                    "Cookie": sessionCookies,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": BASE_URL,
+                    "Referer": `${BASE_URL}/Patient`,
+                    ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                  },
+                  redirect: "manual",
+                  body: exportBody,
+                });
+
+                sessionCookies = mergeCookies(sessionCookies, pdfRes);
+
+                if (pdfRes.status === 200) {
+                  const contentType = pdfRes.headers.get("content-type") || "";
+                  const pdfBuffer = await pdfRes.arrayBuffer();
+
+                  if (pdfBuffer.byteLength > 100) {
+                    // Upload PDF to storage
+                    const filePath = `${userId}/medical_files/${patient.id}_${patientName}_${Date.now()}.pdf`;
+                    const blob = new Blob([pdfBuffer], { type: "application/pdf" });
+
+                    const { error: uploadError } = await serviceClient.storage
+                      .from("scraped-data")
+                      .upload(filePath, blob, { contentType: "application/pdf" });
+
+                    if (uploadError) {
+                      logParts.push(`❌ Upload error ${patient.firstName}: ${uploadError.message}`);
+                    } else {
+                      await serviceClient.from("scraped_data_results").insert({
+                        scrape_job_id: job.id,
+                        user_id: userId,
+                        data_type: "soap_notes",
+                        file_path: filePath,
+                        row_count: blobNames.length,
+                      });
+                      pdfCount++;
+                      logParts.push(`✅ PDF ${patient.firstName} ${patient.lastName}: ${blobNames.length} docs, ${Math.round(pdfBuffer.byteLength / 1024)}KB`);
+                    }
+                  } else {
+                    logParts.push(`⚠️ PDF ${patient.firstName}: empty response (${pdfBuffer.byteLength} bytes, type=${contentType})`);
+                    // Log first few bytes for debugging
+                    if (processedCount < 3) {
+                      const text = new TextDecoder().decode(pdfBuffer.slice(0, 500));
+                      logParts.push(`  Response preview: ${text}`);
+                    }
+                  }
+                } else {
+                  const errorBody = await pdfRes.text();
+                  logParts.push(`⚠️ PDF ${patient.firstName}: status=${pdfRes.status} ${errorBody.substring(0, 200)}`);
                 }
               } catch (err: any) {
-                logParts.push(`SOAP ${patient.firstName} ${patient.lastName} error: ${err.message}`);
+                logParts.push(`❌ Medical Files ${patient.firstName} ${patient.lastName} error: ${err.message}`);
               }
 
               processedCount++;
-              if (processedCount % 20 === 0) {
+              if (processedCount % 10 === 0) {
                 const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
                 await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + newProgress, 99), log_output: logParts.join("\n") }).eq("id", job.id);
               }
 
-              await new Promise(r => setTimeout(r, 300));
+              await new Promise(r => setTimeout(r, 500)); // slightly slower to avoid rate limits on PDF generation
             }
 
-            if (soapResults.length > 0) {
-              csvContent = "Patient,Details\n" + soapResults.map(r => `"${r.replace(/"/g, '""')}"`).join("\n");
-              rowCount = soapResults.length;
-              logParts.push(`✅ SOAP Notes: ${rowCount} patient records`);
-            } else {
-              logParts.push(`⚠️ SOAP Notes: No data retrieved.`);
-            }
+            // Don't set csvContent - PDFs are uploaded individually per patient
+            logParts.push(`✅ Medical Files complete: ${pdfCount} PDFs from ${processedCount} patients`);
+            hasAnyData = pdfCount > 0;
             break;
           }
 
