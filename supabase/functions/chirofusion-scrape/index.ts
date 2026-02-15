@@ -437,36 +437,76 @@ Deno.serve(async (req) => {
               return opts;
             }
 
-            // ===== Attempt 1: ExportPatientList from the Patient List page =====
-            // This endpoint lives on /Patient/Patient, so we need THAT page's CSRF token
-            logParts.push(`Step 1: Loading Patient List page for ExportPatientList...`);
+            // ===== Attempt 1: Load Scheduler, extract JS bundles, find function bodies =====
+            logParts.push(`Step 1: Loading Scheduler page...`);
+            const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
+            const schedToken = extractVerifToken(schedHtml);
+            logParts.push(`Scheduler: ${schedHtml.length} chars, token: ${schedToken ? "YES" : "NONE"}`);
+
+            // Find external JS file URLs
+            const scriptSrcRegex = /<script[^>]*src\s*=\s*["']([^"']+)["']/gi;
+            let scriptMatch;
+            const jsFiles: string[] = [];
+            while ((scriptMatch = scriptSrcRegex.exec(schedHtml)) !== null) {
+              const src = scriptMatch[1];
+              if (!src.includes("jquery") && !src.includes("kendo") && !src.includes("bootstrap") && !src.includes("signalr") && !src.includes("moment")) {
+                jsFiles.push(src.startsWith("http") ? src : `${BASE_URL}${src}`);
+              }
+            }
+            logParts.push(`Custom JS files: ${jsFiles.length} → ${jsFiles.map(f => f.split("/").pop()).join(", ")}`);
+
+            // Fetch each custom JS file and look for RunPatientReport/ExportPatientReport functions
+            for (const jsUrl of jsFiles.slice(0, 5)) {
+              if (isTimingOut()) break;
+              try {
+                const { body: jsBody } = await fetchWithCookies(jsUrl);
+                // Search for function definitions
+                const fnNames = ["RunPatientReport", "ExportPatientReport", "ExportPatientList", "GetPatientReport"];
+                for (const fnName of fnNames) {
+                  const idx = jsBody.indexOf(`function ${fnName}`);
+                  if (idx >= 0) {
+                    // Extract ~600 chars of function body
+                    logParts.push(`FOUND ${fnName} in ${jsUrl.split("/").pop()}: ${jsBody.substring(idx, idx + 600).replace(/\s+/g, " ")}`);
+                  }
+                  // Also check for property-style: fnName: function or fnName = function
+                  const propIdx = jsBody.indexOf(`${fnName} =`);
+                  if (propIdx >= 0 && propIdx !== idx) {
+                    logParts.push(`FOUND ${fnName}= in ${jsUrl.split("/").pop()}: ${jsBody.substring(propIdx, propIdx + 600).replace(/\s+/g, " ")}`);
+                  }
+                }
+                // Also look for any URL containing "PatientReport" or "GetPatient"
+                const urlInJs = /["']([^"']*(?:PatientReport|GetPatient|ExportPatient)[^"']*)["']/gi;
+                let urlMatch;
+                while ((urlMatch = urlInJs.exec(jsBody)) !== null) {
+                  logParts.push(`URL in ${jsUrl.split("/").pop()}: ${urlMatch[1]}`);
+                }
+              } catch (e: any) {
+                logParts.push(`JS fetch error ${jsUrl.split("/").pop()}: ${e.message}`);
+              }
+            }
+
+            // ===== Attempt 1b: Try ExportPatientList using Scheduler page token =====
+            // The exportPatientListCsv form is ON the Scheduler page, so use Scheduler token
+            logParts.push(`Step 1b: ExportPatientList with Scheduler token...`);
             try {
-              const { body: patientPageHtml } = await fetchWithCookies(`${BASE_URL}/Patient/Patient`);
-              const patientPageToken = extractVerifToken(patientPageHtml);
-              logParts.push(`Patient page loaded: ${patientPageHtml.length} chars, token: ${patientPageToken ? patientPageToken.substring(0, 20) + "..." : "NONE"}`);
-
-              if (patientPageToken) {
-                // POST with the Patient page's own verification token
-                const { response: expRes, body: expBody } = await fetchWithCookies(
-                  `${BASE_URL}/Patient/Patient/ExportPatientList`,
-                  {
-                    method: "POST",
-                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                    body: `__RequestVerificationToken=${encodeURIComponent(patientPageToken)}`,
-                  }
-                );
-                const ct = expRes.headers.get("content-type") || "unknown";
-                const cd = expRes.headers.get("content-disposition") || "";
-                logParts.push(`ExportPatientList: status=${expRes.status} length=${expBody.length} type=${ct} disposition=${cd}`);
-
-                if (expBody.length > 50) {
-                  logParts.push(`Preview: ${expBody.substring(0, 500)}`);
-                  if (!expBody.includes("<!DOCTYPE") && !expBody.includes("<html")) {
-                    csvContent = expBody;
-                    rowCount = csvContent.split("\n").filter(l => l.trim()).length - 1;
-                    logParts.push(`✅ Demographics (ExportPatientList CSV): ${rowCount} rows`);
-                    found = true;
-                  }
+              const { response: expRes, body: expBody } = await fetchWithCookies(
+                `${BASE_URL}/Patient/Patient/ExportPatientList`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                  body: `__RequestVerificationToken=${encodeURIComponent(schedToken)}`,
+                }
+              );
+              const ct = expRes.headers.get("content-type") || "unknown";
+              const cd = expRes.headers.get("content-disposition") || "";
+              logParts.push(`ExportPatientList: status=${expRes.status} length=${expBody.length} type=${ct} disposition=${cd}`);
+              if (expBody.length > 50) {
+                logParts.push(`Preview: ${expBody.substring(0, 500)}`);
+                if (!expBody.includes("<!DOCTYPE") && !expBody.includes("<html")) {
+                  csvContent = expBody;
+                  rowCount = csvContent.split("\n").filter(l => l.trim()).length - 1;
+                  logParts.push(`✅ Demographics (ExportPatientList): ${rowCount} rows`);
+                  found = true;
                 }
               }
             } catch (err: any) {
@@ -475,109 +515,13 @@ Deno.serve(async (req) => {
 
             // ===== Attempt 2: Run Report first, wait, then Export from Scheduler =====
             if (!found) {
-              logParts.push(`Step 2: Loading Scheduler page for Run Report → Export flow...`);
+              logParts.push(`Step 2: Run Report → Export flow...`);
               try {
-                const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
-                const schedToken = extractVerifToken(schedHtml);
-                logParts.push(`Scheduler page: ${schedHtml.length} chars, token: ${schedToken ? schedToken.substring(0, 20) + "..." : "NONE"}`);
+                // Reuse schedHtml and schedToken from Attempt 1
 
-                // === DIAGNOSTIC: Extract form structure and JS patterns from page ===
-                // Find ALL forms and their actions
-                const formActionRegex = /<form[^>]*(?:id|action)\s*=\s*["']([^"']+)["'][^>]*/gi;
-                let formMatch;
-                while ((formMatch = formActionRegex.exec(schedHtml)) !== null) {
-                  if (formMatch[0].toLowerCase().includes("patient") || formMatch[0].toLowerCase().includes("report") || formMatch[0].toLowerCase().includes("export")) {
-                    logParts.push(`FORM: ${formMatch[0].substring(0, 300)}`);
-                  }
-                }
-
-                // Find the "Run Report" / "Export" button and surrounding context
-                const btnRegex = /(?:btnRunReport|btnExport|RunReport|ExportToExcel|exportPatient)[^"']*["'][^>]*>/gi;
-                let btnMatch;
-                while ((btnMatch = btnRegex.exec(schedHtml)) !== null) {
-                  // Get surrounding context (200 chars before and after)
-                  const start = Math.max(0, btnMatch.index - 200);
-                  const end = Math.min(schedHtml.length, btnMatch.index + btnMatch[0].length + 200);
-                  logParts.push(`BUTTON CONTEXT: ${schedHtml.substring(start, end).replace(/\s+/g, " ").substring(0, 500)}`);
-                }
-
-                // Find ALL $.ajax and $.post calls (not just patient/report ones)
-                const allAjaxRegex = /\$\.(?:ajax|post|get)\s*\(\s*(?:["']([^"']+)["']|\{[^}]*url\s*:\s*["']([^"']+)["'])/gi;
-                const allAjaxUrls: string[] = [];
-                let ajaxMatch;
-                while ((ajaxMatch = allAjaxRegex.exec(schedHtml)) !== null) {
-                  allAjaxUrls.push(ajaxMatch[1] || ajaxMatch[2]);
-                }
-                const uniqueAjax = [...new Set(allAjaxUrls)].filter(u => u && !u.includes(".css") && !u.includes(".js")).sort();
-                logParts.push(`ALL AJAX URLs (${uniqueAjax.length}): ${JSON.stringify(uniqueAjax.slice(0, 30))}`);
-
-                // Find URLs that contain "Patient" or "Report" or "Export" specifically
-                const relevantAjax = uniqueAjax.filter(u => /patient|report|export/i.test(u));
-                logParts.push(`RELEVANT AJAX URLs: ${JSON.stringify(relevantAjax)}`);
-                const uniqueDiscovered = relevantAjax;
-
-                // Find Kendo grid/datasource configurations
-                const kendoReadRegex = /\.kendoGrid\s*\(\s*\{[\s\S]{0,2000}?read\s*:\s*(?:["']([^"']+)["']|\{[^}]*url\s*:\s*["']([^"']+)["'])/gi;
-                let kendoMatch;
-                while ((kendoMatch = kendoReadRegex.exec(schedHtml)) !== null) {
-                  logParts.push(`KENDO GRID READ URL: ${kendoMatch[1] || kendoMatch[2]}`);
-                }
-
-                // Find function definitions that handle Run Report click
-                const fnRunRegex = /function\s+(\w*(?:Run|Export|Patient|Report)\w*)\s*\([^)]*\)\s*\{([^}]{0,500})/gi;
-                let fnMatch;
-                while ((fnMatch = fnRunRegex.exec(schedHtml)) !== null) {
-                  logParts.push(`FN ${fnMatch[1]}: ${fnMatch[2].replace(/\s+/g, " ").substring(0, 300)}`);
-                }
-
-                // Look for the exact click binding on "Run Report" button
-                const clickBindRegex = /(?:click|on)\s*[:=]\s*(?:function\s*\([^)]*\)\s*\{|["']?)(\w*(?:Run|Export|Patient|Report)\w*)/gi;
-                let clickMatch;
-                while ((clickMatch = clickBindRegex.exec(schedHtml)) !== null) {
-                  logParts.push(`CLICK BINDING: ${clickMatch[0].substring(0, 200)}`);
-                }
-
-                // Extract select/input elements with id containing Report or Patient
-                const inputRegex = /<(?:select|input)[^>]*id\s*=\s*["']([^"']*(?:Report|Patient|Status|Provider)[^"']*)["'][^>]*/gi;
-                let inputMatch;
-                while ((inputMatch = inputRegex.exec(schedHtml)) !== null) {
-                  logParts.push(`INPUT: ${inputMatch[0].substring(0, 300)}`);
-                }
-
-                // Extract RunPatientReport and ExportPatientReport function bodies
-                const fnBodyRegex = /function\s+(RunPatientReport|ExportPatientReport|ExportPatientList)\s*\([^)]*\)\s*\{([\s\S]{0,1500}?)\n\s*\}/g;
-                let fnBodyMatch;
-                while ((fnBodyMatch = fnBodyRegex.exec(schedHtml)) !== null) {
-                  logParts.push(`FN BODY ${fnBodyMatch[1]}: ${fnBodyMatch[2].replace(/\s+/g, " ").substring(0, 500)}`);
-                }
-
-                // Find the Kendo grid datasource for patient reports
-                const gridDsRegex = /patientReportGrid[\s\S]{0,500}?read\s*:\s*(?:["']([^"']+)["']|\{[^}]*url\s*:\s*["']([^"']+)["'])/gi;
-                let gridMatch;
-                while ((gridMatch = gridDsRegex.exec(schedHtml)) !== null) {
-                  logParts.push(`PATIENT REPORT GRID READ URL: ${gridMatch[1] || gridMatch[2]}`);
-                }
-
-                // Also search for GetPatientReports in any context
-                const getPRRegex = /GetPatientReport[^"'\s]*/gi;
-                const prEndpoints = new Set<string>();
-                let prMatch;
-                while ((prMatch = getPRRegex.exec(schedHtml)) !== null) {
-                  prEndpoints.add(prMatch[0]);
-                }
-                logParts.push(`GetPatientReport* variants: ${JSON.stringify([...prEndpoints])}`);
-
-                // Find AdditionalRunReportData function (used in Kendo transport)
-                const additionalDataRegex = /function\s+AdditionalRunReportData\s*\([^)]*\)\s*\{([\s\S]{0,500}?)\}/g;
-                const addMatch = additionalDataRegex.exec(schedHtml);
-                if (addMatch) {
-                  logParts.push(`AdditionalRunReportData: ${addMatch[1].replace(/\s+/g, " ").substring(0, 300)}`);
-                }
-
-                // Build report parameters using CORRECT field names from the actual form
-                // The visible form uses PatientReportType, the hidden export form uses ReportType
+                // Build report parameters
                 const reportParams: Record<string, string> = {
-                  PatientReportType: "1",  // Patient List
+                  PatientReportType: "1",
                   ReportType: "1",
                   PatientStatus: "Active",
                   PatientStatusString: "Active",
