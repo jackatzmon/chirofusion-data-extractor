@@ -412,16 +412,16 @@ Deno.serve(async (req) => {
         let csvContent = "";
         let rowCount = 0;
 
+    // Helper: extract __RequestVerificationToken from page HTML
+    function extractVerifToken(html: string): string {
+      const m = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
+      return m ? m[1] : "";
+    }
+
         switch (dataType) {
           // ==================== DEMOGRAPHICS ====================
           case "demographics": {
             let found = false;
-
-            // Helper: extract __RequestVerificationToken from page HTML
-            function extractVerifToken(html: string): string {
-              const m = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
-              return m ? m[1] : "";
-            }
 
             // Helper: extract select option values from HTML
             function extractSelectOptions(html: string, selectId: string): { value: string; text: string }[] {
@@ -499,79 +499,43 @@ Deno.serve(async (req) => {
               }
             }
 
-            // ===== Attempt 1b: Try ExportPatientList (simple form submit, no params) =====
-            // The form has NO hidden fields - just <input type="submit" />
-            logParts.push(`Step 1b: ExportPatientList (no params, like browser form submit)...`);
+            // ===== Step 2: Trigger report, then poll export with retries =====
+            // Flow: POST GetPatientReports (triggers server-side generation) → wait → retry ExportPatientReports
+            logParts.push(`Step 2: Trigger GetPatientReports then poll export...`);
+
+            const reportData = {
+              ReportType: "1",  // PatientReportType.PatientList = 1
+              BirthMonths: "",
+              PatientStatus: "",
+              PatientInsurance: "",
+            };
+
             try {
-              const { response: expRes, body: expBody } = await fetchWithCookies(
-                `${BASE_URL}/Patient/Patient/ExportPatientList`,
-                {
-                  method: "POST",
-                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                  body: "",
-                }
-              );
-              const ct = expRes.headers.get("content-type") || "unknown";
-              const cd = expRes.headers.get("content-disposition") || "";
-              logParts.push(`ExportPatientList: status=${expRes.status} length=${expBody.length} type=${ct} disposition=${cd}`);
-              if (expBody.length > 50) {
-                logParts.push(`Preview: ${expBody.substring(0, 500)}`);
-                if (!expBody.includes("<!DOCTYPE") && !expBody.includes("<html")) {
-                  csvContent = expBody;
-                  rowCount = csvContent.split("\n").filter(l => l.trim()).length - 1;
-                  logParts.push(`✅ Demographics (ExportPatientList): ${rowCount} rows`);
-                  found = true;
-                }
-              }
-            } catch (err: any) {
-              logParts.push(`ExportPatientList error: ${err.message}`);
-            }
+              // Step 2a: Trigger the report (this starts server-side generation)
+              const triggerRes = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                  "RequestVerificationToken": schedToken,
+                },
+                body: new URLSearchParams(reportData).toString(),
+              });
+              logParts.push(`Trigger: status=${triggerRes.status} len=${triggerRes.body.length} type=${triggerRes.contentType}`);
 
-            // ===== Attempt 2: Use CORRECT endpoint /Scheduler/Scheduler/GetPatientReports =====
-            // (discovered from AppointmentReport.js: RunPatientReport posts to /Scheduler/Scheduler/GetPatientReports)
-            if (!found) {
-              logParts.push(`Step 2: Correct endpoint /Scheduler/Scheduler/GetPatientReports...`);
-              
-              // Match exactly what RunPatientReport sends:
-              // {ReportType: value, BirthMonths: "", PatientStatus: "", PatientInsurance: ""}
-              const reportData = {
-                ReportType: "1",  // PatientReportType.PatientList = 1
-                BirthMonths: "",
-                PatientStatus: "",
-                PatientInsurance: "",
-              };
+              // Step 2b: Poll ExportPatientReports with retries
+              // DO NOT dismiss the dialog / press OK — let the report finish generating
+              const MAX_RETRIES = 8;
+              const RETRY_INTERVAL_MS = 4000; // 4 seconds between retries
 
-              try {
-                const res = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "RequestVerificationToken": schedToken,
-                  },
-                  body: new URLSearchParams(reportData).toString(),
-                });
-                logParts.push(`GetPatientReports: status=${res.status} len=${res.body.length} type=${res.contentType}`);
-                if (res.body.length > 10) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
-                if (res.body.length > 50 && res.contentType.includes("json")) {
-                  try {
-                    const data = JSON.parse(res.body);
-                    const items = data.Data || data.data || (Array.isArray(data) ? data : null);
-                    if (items && Array.isArray(items) && items.length > 0) {
-                      csvContent = jsonToCsv(items);
-                      rowCount = items.length;
-                      logParts.push(`✅ Demographics: ${rowCount} patients`);
-                      found = true;
-                    } else {
-                      logParts.push(`  Keys: ${Object.keys(data).join(",")}, Total: ${data.Total || "N/A"}`);
-                      // Log first item sample if exists
-                      if (items && items[0]) logParts.push(`  Sample: ${JSON.stringify(items[0]).substring(0, 300)}`);
-                    }
-                  } catch (e: any) { logParts.push(`  Parse error: ${e.message}`); }
+              for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                if (isTimingOut()) {
+                  logParts.push(`⏱️ Export poll: timeout safety at attempt ${attempt}`);
+                  break;
                 }
-              } catch (e: any) { logParts.push(`GetPatientReports error: ${e.message}`); }
 
-              // 2b: Also try ExportPatientReports with correct prefix
-              if (!found) {
+                logParts.push(`Export attempt ${attempt}/${MAX_RETRIES} (waiting ${RETRY_INTERVAL_MS / 1000}s)...`);
+                await new Promise(r => setTimeout(r, RETRY_INTERVAL_MS));
+
                 try {
                   const expRes = await ajaxFetch("/Scheduler/Scheduler/ExportPatientReports", {
                     method: "POST",
@@ -584,22 +548,49 @@ Deno.serve(async (req) => {
                       __RequestVerificationToken: schedToken,
                     }).toString(),
                   });
-                  logParts.push(`ExportPatientReports (correct path): status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
-                  if (expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE")) {
-                    logParts.push(`  Preview: ${expRes.body.substring(0, 300)}`);
-                    // Check if it's CSV/Excel data
-                    if (expRes.body.includes(",") && expRes.body.includes("\n") && !expRes.body.includes("<html")) {
-                      csvContent = expRes.body;
-                      rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
-                      logParts.push(`✅ Demographics CSV: ${rowCount} rows`);
-                      found = true;
-                    }
+                  logParts.push(`  status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
+
+                  // Success: got non-HTML content with substantial size
+                  if (expRes.status === 200 && expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE") && !expRes.body.includes("<html")) {
+                    csvContent = expRes.body;
+                    rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
+                    logParts.push(`✅ Demographics export: ${rowCount} rows (attempt ${attempt})`);
+                    found = true;
+                    break;
                   }
-                } catch (e: any) { logParts.push(`Export error: ${e.message}`); }
+
+                  // If we got JSON data from the trigger, try parsing it
+                  if (expRes.status === 200 && expRes.contentType.includes("json") && expRes.body.length > 10) {
+                    try {
+                      const data = JSON.parse(expRes.body);
+                      const items = data.Data || data.data || (Array.isArray(data) ? data : null);
+                      if (items && Array.isArray(items) && items.length > 0) {
+                        csvContent = jsonToCsv(items);
+                        rowCount = items.length;
+                        logParts.push(`✅ Demographics JSON: ${rowCount} patients (attempt ${attempt})`);
+                        found = true;
+                        break;
+                      }
+                    } catch { /* not JSON, continue retrying */ }
+                  }
+
+                  // 500/404 = report not ready yet, keep retrying
+                  if (expRes.status >= 400) {
+                    logParts.push(`  Not ready yet (${expRes.status}), retrying...`);
+                  }
+                } catch (e: any) {
+                  logParts.push(`  Attempt ${attempt} error: ${e.message}`);
+                }
               }
+
+              if (!found) {
+                logParts.push(`⚠️ Export polling exhausted after ${MAX_RETRIES} attempts`);
+              }
+            } catch (e: any) {
+              logParts.push(`GetPatientReports trigger error: ${e.message}`);
             }
 
-            // ===== Attempt 3: JSON endpoint (partial data but reliable) =====
+            // ===== Fallback: JSON endpoint (partial data but reliable) =====
             if (!found) {
               logParts.push(`Step 3: JSON fallback /Patient/Patient/GetAllPatientForLocalStorage...`);
               try {
@@ -670,8 +661,11 @@ Deno.serve(async (req) => {
               }
             } catch { /* ignore */ }
 
-            // Attempt 1: POST form to ExportAppointmentReport (matching the discovered form)
-            const formParams = new URLSearchParams({
+            // Step 1: Trigger the appointment report via GetAppointmentReport
+            const { body: schedHtmlAppt } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
+            const apptToken = extractVerifToken(schedHtmlAppt);
+
+            const apptFormData = new URLSearchParams({
               ReportType: "CompletedVisits",
               DateFrom: fromDate,
               DateTo: toDate,
@@ -680,47 +674,65 @@ Deno.serve(async (req) => {
               LocationId: "",
             });
 
-            logParts.push(`Attempt 1: POST /User/Scheduler/ExportAppointmentReport (form submit)...`);
+            logParts.push(`Step 1: Trigger GetAppointmentReport...`);
             try {
-              const { response: expRes, body: expBody } = await fetchWithCookies(
-                `${BASE_URL}/User/Scheduler/ExportAppointmentReport`,
-                {
-                  method: "POST",
-                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                  body: formParams.toString(),
-                }
-              );
-              logParts.push(`Form POST: status=${expRes.status} length=${expBody.length} type=${expRes.headers.get("content-type") || "unknown"}`);
-
-              if (expBody.length > 50 && !expBody.includes("<!DOCTYPE") && !expBody.includes("<html")) {
-                csvContent = expBody;
-                rowCount = csvContent.split("\n").length - 1;
-                logParts.push(`✅ Appointments: ${rowCount} rows`);
-              } else {
-                logParts.push(`Preview: ${expBody.substring(0, 500)}`);
-              }
-            } catch (err: any) {
-              logParts.push(`Form POST error: ${err.message}`);
+              const triggerRes = await ajaxFetch("/Scheduler/Scheduler/GetAppointmentReport", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                  "RequestVerificationToken": apptToken,
+                },
+                body: apptFormData.toString(),
+              });
+              logParts.push(`Trigger: status=${triggerRes.status} len=${triggerRes.body.length}`);
+            } catch (e: any) {
+              logParts.push(`Trigger error: ${e.message}`);
             }
 
-            // Attempt 2: AJAX version
-            if (!csvContent) {
-              logParts.push(`Attempt 2: AJAX /User/Scheduler/ExportAppointmentReport...`);
-              const ajaxRes = await ajaxFetch("/User/Scheduler/ExportAppointmentReport", {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: formParams.toString(),
-              });
-              logParts.push(`AJAX: status=${ajaxRes.status} type=${ajaxRes.contentType} length=${ajaxRes.body.length}`);
+            // Step 2: Poll ExportAppointmentReport with retries (don't press OK)
+            const MAX_APPT_RETRIES = 8;
+            const APPT_RETRY_MS = 4000;
 
-              if (ajaxRes.body.length > 50 && !ajaxRes.body.includes("<!DOCTYPE")) {
-                csvContent = ajaxRes.body;
-                rowCount = csvContent.split("\n").length - 1;
-                logParts.push(`✅ Appointments (AJAX): ${rowCount} rows`);
-              } else {
-                logParts.push(`Preview: ${ajaxRes.body.substring(0, 500)}`);
-                logParts.push(`⚠️ Appointments: Could not get export data.`);
+            for (let attempt = 1; attempt <= MAX_APPT_RETRIES; attempt++) {
+              if (isTimingOut()) {
+                logParts.push(`⏱️ Appt export: timeout at attempt ${attempt}`);
+                break;
               }
+
+              logParts.push(`Export attempt ${attempt}/${MAX_APPT_RETRIES} (waiting ${APPT_RETRY_MS / 1000}s)...`);
+              await new Promise(r => setTimeout(r, APPT_RETRY_MS));
+
+              try {
+                const expRes = await ajaxFetch("/Scheduler/Scheduler/ExportAppointmentReport", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "RequestVerificationToken": apptToken,
+                  },
+                  body: new URLSearchParams({
+                    ...Object.fromEntries(apptFormData),
+                    __RequestVerificationToken: apptToken,
+                  }).toString(),
+                });
+                logParts.push(`  status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
+
+                if (expRes.status === 200 && expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE") && !expRes.body.includes("<html")) {
+                  csvContent = expRes.body;
+                  rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
+                  logParts.push(`✅ Appointments export: ${rowCount} rows (attempt ${attempt})`);
+                  break;
+                }
+
+                if (expRes.status >= 400) {
+                  logParts.push(`  Not ready yet (${expRes.status}), retrying...`);
+                }
+              } catch (e: any) {
+                logParts.push(`  Attempt ${attempt} error: ${e.message}`);
+              }
+            }
+
+            if (!csvContent) {
+              logParts.push(`⚠️ Appointments: Export polling exhausted after ${MAX_APPT_RETRIES} attempts`);
             }
             break;
           }
