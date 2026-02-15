@@ -1233,7 +1233,20 @@ Deno.serve(async (req) => {
                 const by2 = birthYear2(info.dob);
                 const fileName = `${patient.lastName}${by2}`.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 
-                // 2. Get file list directly via GetFilesFromBlob (no patient page navigation needed)
+                // 2. Navigate to patient page to set server-side session context
+                const { body: ptBody, finalUrl: ptUrl } = await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patientId}`);
+                if (processedCount < 3) {
+                  logParts.push(`Patient page (id=${patientId}): bodyLen=${ptBody.length} finalUrl=${ptUrl}`);
+                  logParts.push(`Patient page body: ${ptBody.substring(0, 200)}`);
+                }
+
+                // 2b. Also try loading the patient via the Patient controller directly
+                const { body: ptBody2, finalUrl: ptUrl2 } = await fetchWithCookies(`${BASE_URL}/Patient/Patient?patientId=${patientId}`);
+                if (processedCount < 3) {
+                  logParts.push(`Patient/Patient page: bodyLen=${ptBody2.length} finalUrl=${ptUrl2}`);
+                }
+
+                // 3. Get file list via GetFilesFromBlob
                 const filesRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
                   method: "POST",
                   headers: {
