@@ -2090,6 +2090,18 @@ Deno.serve(async (req) => {
 
                 if (ledgerRows.length === 0) {
                   ledgerEmpty++;
+                  // Add a status row so every patient appears in the output
+                  allLedgerRows.push({
+                    PatientName: patientName,
+                    Date: "",
+                    Description: "",
+                    CPTCode: "",
+                    Charges: "",
+                    Payments: "",
+                    Adjustments: "",
+                    Balance: "",
+                    Status: "No transactions",
+                  });
                   if (isDebug) logParts.push(`  No ledger rows parsed for ${patientName}`);
                   processedCount = i + 1;
                   continue;
