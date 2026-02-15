@@ -627,13 +627,13 @@ Deno.serve(async (req) => {
 
     // Shared: get full patient list with IDs for per-patient scraping
     // Caches result so it's only fetched once even if multiple data types need it
-    let _cachedPatients: { id: number; firstName: string; lastName: string }[] | null = null;
-    async function getAllPatientIds(): Promise<{ id: number; firstName: string; lastName: string }[]> {
-      if (_cachedPatients) return _cachedPatients;
+    // Get patient names from GetPatientReports (no IDs needed)
+    let _cachedPatientNames: { firstName: string; lastName: string }[] | null = null;
+    async function getAllPatientNames(): Promise<{ firstName: string; lastName: string }[]> {
+      if (_cachedPatientNames) return _cachedPatientNames;
 
-      // Step 1: Load Scheduler page and run report to prime the session
+      // Load Scheduler page and run report
       const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
-      const token = schedHtml.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/)?.[1] || "";
       setPracticeId(schedHtml);
 
       const statusSelectMatch = schedHtml.match(/<select[^>]*id="patientReportPatientStatusMultiSelect"[^>]*>([\s\S]*?)<\/select>/i);
@@ -647,8 +647,6 @@ Deno.serve(async (req) => {
       }
       const allStatusValues = statusOpts.join("^") || "1^2^3";
 
-      // Step 2: Run GetPatientReports to get names (no IDs) and prime session
-      let nameList: { firstName: string; lastName: string }[] = [];
       const reportRes = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
@@ -665,87 +663,81 @@ Deno.serve(async (req) => {
           const reportData = JSON.parse(reportRes.body);
           const items = reportData.Data || reportData.data || (Array.isArray(reportData) ? reportData : null);
           if (items && Array.isArray(items)) {
-            nameList = items.map((p: any) => ({
+            _cachedPatientNames = items.map((p: any) => ({
               firstName: p.FirstName || "",
               lastName: p.LastName || "",
             }));
-            logParts.push(`Report primed: ${nameList.length} patient names retrieved`);
+            logParts.push(`✅ Patient names: ${_cachedPatientNames.length} from GetPatientReports`);
+            return _cachedPatientNames;
           }
         } catch { /* not JSON */ }
       }
 
-      // Step 3: Try GetAllPatientForLocalStorage for IDs
-      const { body: lsBody, contentType: lsCt } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
-      if (lsCt.includes("application/json")) {
+      _cachedPatientNames = [];
+      logParts.push(`⚠️ Could not retrieve patient names`);
+      return _cachedPatientNames;
+    }
+
+    // Search for a patient by name and navigate to their file
+    // Returns true if we successfully landed on their patient page
+    async function navigateToPatient(firstName: string, lastName: string): Promise<boolean> {
+      const searchTerm = `${lastName}, ${firstName}`.trim();
+      
+      // Try multiple search endpoint patterns
+      const searchEndpoints = [
+        { url: `/Patient/Patient/SearchPatient`, param: "searchText" },
+        { url: `/Patient/Patient/GetPatientBySearchText`, param: "searchText" },
+        { url: `/Patient/Patient/AutoCompletePatient`, param: "term" },
+        { url: `/Home/Home/SearchPatient`, param: "searchText" },
+        { url: `/Home/Home/GetPatientBySearchText`, param: "searchText" },
+        { url: `/Patient/Patient/SearchPatientByName`, param: "name" },
+      ];
+
+      for (const ep of searchEndpoints) {
         try {
-          const parsed = JSON.parse(lsBody);
-          const patients = parsed.PatientData || parsed;
-          if (Array.isArray(patients) && patients.length > 0) {
-            logParts.push(`GetAllPatientForLocalStorage: ${patients.length} patients, sample: ${JSON.stringify(patients[0]).substring(0, 300)}`);
-            _cachedPatients = patients.map((p: any) => ({
-              id: p.I || p.Id || p.PatientId || p.PkPatientId,
-              firstName: p.F || p.FirstName || "",
-              lastName: p.L || p.LastName || "",
-            }));
-            const withId = _cachedPatients!.filter(p => p.id);
-            logParts.push(`✅ Patient list from LocalStorage: ${_cachedPatients!.length} total, ${withId.length} with valid IDs`);
-            if (withId.length > 0) return _cachedPatients!;
-          }
-        } catch { /* ignore */ }
-      }
-
-      // Step 4: If LocalStorage returned too few/no IDs, use name-based search
-      // Try autocomplete/search endpoints to resolve names → IDs
-      if (nameList.length > 0) {
-        logParts.push(`Attempting name-based ID lookup for ${nameList.length} patients...`);
-        
-        // Try a few search endpoint patterns to find the right one
-        const testName = nameList[0].lastName;
-        const searchEndpoints = [
-          `/Patient/Patient/SearchPatient?searchText=${encodeURIComponent(testName)}`,
-          `/Patient/Patient/GetPatientBySearchText?searchText=${encodeURIComponent(testName)}`,
-          `/api/Patient/Search?query=${encodeURIComponent(testName)}`,
-          `/Patient/Patient/AutoCompletePatient?term=${encodeURIComponent(testName)}`,
-          `/Home/Home/SearchPatient?searchText=${encodeURIComponent(testName)}`,
-          `/Home/Home/GetPatientBySearchText?searchText=${encodeURIComponent(testName)}`,
-        ];
-
-        let workingEndpoint: string | null = null;
-        for (const ep of searchEndpoints) {
-          try {
-            const res = await ajaxFetch(ep);
-            logParts.push(`Search test ${ep.split("?")[0]}: status=${res.status} len=${res.body.length} preview=${res.body.substring(0, 300)}`);
-            if (res.status === 200 && res.body.length > 10) {
-              try {
-                const data = JSON.parse(res.body);
-                const arr = Array.isArray(data) ? data : (data.Data || data.data || data.Results || []);
-                if (Array.isArray(arr) && arr.length > 0) {
-                  logParts.push(`✅ Working search endpoint: ${ep.split("?")[0]}, keys: ${Object.keys(arr[0]).join(", ")}`);
-                  workingEndpoint = ep.split("?")[0].replace(encodeURIComponent(testName), "");
-                  
-                  // Check what ID field the search results use
-                  const sample = arr[0];
-                  const idField = sample.PatientId || sample.Id || sample.I || sample.PkPatientId || sample.ClientPatientId;
-                  logParts.push(`Search result ID field value: ${idField}, sample: ${JSON.stringify(sample).substring(0, 300)}`);
-                  break;
+          const res = await ajaxFetch(`${ep.url}?${ep.param}=${encodeURIComponent(searchTerm)}`);
+          if (res.status === 200 && res.body.length > 10) {
+            try {
+              const data = JSON.parse(res.body);
+              const arr = Array.isArray(data) ? data : (data.Data || data.data || data.Results || []);
+              if (Array.isArray(arr) && arr.length > 0) {
+                // Found results - get patient ID from search result and navigate
+                const match = arr[0];
+                const patientId = match.PatientId || match.Id || match.I || match.PkPatientId || match.ClientPatientId || match.id;
+                if (patientId) {
+                  // Navigate to patient page using the ID from search
+                  await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patientId}`);
+                  return true;
                 }
-              } catch { /* not JSON array */ }
-            }
-          } catch { /* endpoint doesn't exist */ }
-          if (isTimingOut()) break;
-        }
-
-        if (!workingEndpoint) {
-          logParts.push(`⚠️ No working search endpoint found. Tried ${searchEndpoints.length} patterns.`);
-        }
+                // If no ID field, try clicking/navigating by URL in the result
+                const url = match.Url || match.url || match.Link || match.link;
+                if (url) {
+                  await fetchWithCookies(`${BASE_URL}${url}`);
+                  return true;
+                }
+                return false;
+              }
+            } catch { /* not JSON */ }
+          }
+        } catch { /* endpoint doesn't exist */ }
       }
 
-      // If we still have no IDs, return empty
-      if (!_cachedPatients || _cachedPatients.filter(p => p.id).length === 0) {
-        logParts.push(`⚠️ Could not resolve patient IDs. Per-patient operations will be skipped.`);
-        _cachedPatients = [];
-      }
-      return _cachedPatients;
+      // Fallback: try the home page search (form-based)
+      try {
+        const homeRes = await ajaxFetch("/Home/Home/Index", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+          body: new URLSearchParams({ searchText: searchTerm }).toString(),
+        });
+        if (homeRes.status === 200 && homeRes.body.length > 100) {
+          // Check if we landed on a patient page
+          if (homeRes.body.includes("patientFile") || homeRes.body.includes("MedicalFile")) {
+            return true;
+          }
+        }
+      } catch { /* ignore */ }
+
+      return false;
     }
 
     for (const dataType of dataTypes) {
