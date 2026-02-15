@@ -71,10 +71,10 @@ const Dashboard = () => {
   useEffect(() => {
     const hasRunning = jobs.some((j) => j.status === "running");
     if (!hasRunning) return;
-    // Stop polling after 5 minutes to avoid infinite polling on stale jobs
+    // Keep polling for up to 30 minutes (batch processing can take a while)
     const startedAt = Date.now();
     const interval = setInterval(() => {
-      if (Date.now() - startedAt > 5 * 60 * 1000) {
+      if (Date.now() - startedAt > 30 * 60 * 1000) {
         clearInterval(interval);
         return;
       }

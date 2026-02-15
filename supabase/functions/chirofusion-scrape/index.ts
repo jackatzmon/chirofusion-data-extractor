@@ -57,11 +57,11 @@ function extractPageStructure(html: string): string {
 
 // Mark stale running jobs as failed (in case previous runs were killed by CPU timeout)
 async function cleanupStaleJobs(supabase: any) {
-  const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   await supabase.from("scrape_jobs")
-    .update({ status: "failed", error_message: "Job timed out (CPU limit exceeded). Try selecting fewer data types per run." })
+    .update({ status: "failed", error_message: "Job timed out. Please retry." })
     .eq("status", "running")
-    .lt("created_at", tenMinutesAgo);
+    .lt("created_at", oneHourAgo);
 }
 
 /** Convert JSON array to CSV string */
@@ -113,7 +113,10 @@ Deno.serve(async (req) => {
     await cleanupStaleJobs(supabase);
 
     const body = await req.json();
-    const { dataTypes = [], mode = "scrape", dateFrom, dateTo } = body;
+    const { dataTypes = [], mode = "scrape", dateFrom, dateTo,
+      // Batch continuation fields (set automatically by self-invocation)
+      _batchJobId, _batchState, _batchLogParts
+    } = body;
 
     const { data: creds, error: credsError } = await supabase
       .from("chirofusion_credentials")
@@ -125,15 +128,25 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ error: "ChiroFusion credentials not found." }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    const jobDataTypes = mode === "discover" ? ["discovery"] : dataTypes;
-    const { data: job, error: jobError } = await supabase
-      .from("scrape_jobs")
-      .insert({ user_id: userId, data_types: jobDataTypes, status: "running", mode })
-      .select()
-      .single();
-
-    if (jobError) {
-      return new Response(JSON.stringify({ error: jobError.message }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    // If continuing a batch, reuse existing job; otherwise create new one
+    let job: any;
+    if (_batchJobId) {
+      const { data: existingJob } = await serviceClient.from("scrape_jobs").select("*").eq("id", _batchJobId).single();
+      if (!existingJob || existingJob.status !== "running") {
+        return new Response(JSON.stringify({ error: "Batch job not found or already finished." }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      job = existingJob;
+    } else {
+      const jobDataTypes = mode === "discover" ? ["discovery"] : dataTypes;
+      const { data: newJob, error: jobError } = await supabase
+        .from("scrape_jobs")
+        .insert({ user_id: userId, data_types: jobDataTypes, status: "running", mode })
+        .select()
+        .single();
+      if (jobError) {
+        return new Response(JSON.stringify({ error: jobError.message }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      job = newJob;
     }
 
     const serviceClient = createClient(
@@ -142,12 +155,39 @@ Deno.serve(async (req) => {
     );
 
     let sessionCookies = "";
-    const logParts: string[] = [];
+    const logParts: string[] = _batchLogParts ? [..._batchLogParts] : [];
     const startTime = Date.now();
-    const MAX_RUNTIME_MS = 120_000; // 120s safety margin (Supabase CPU limit)
+    const MAX_RUNTIME_MS = 100_000; // 100s to leave room for cleanup + self-invoke
 
     function isTimingOut(): boolean {
       return (Date.now() - startTime) > MAX_RUNTIME_MS;
+    }
+
+    // Self-invoke to continue processing in a new batch
+    async function selfInvoke(batchState: any) {
+      logParts.push(`🔄 Batch timeout — continuing from patient ${batchState.resumeIndex}...`);
+      // Save current log to job
+      await serviceClient.from("scrape_jobs").update({
+        log_output: logParts.join("\n"),
+        batch_state: batchState,
+      }).eq("id", job.id);
+
+      const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+      const fnUrl = `${supabaseUrl}/functions/v1/chirofusion-scrape`;
+      // Fire and forget — we don't await the full response
+      fetch(fnUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": authHeader!,
+        },
+        body: JSON.stringify({
+          dataTypes, mode, dateFrom, dateTo,
+          _batchJobId: job.id,
+          _batchState: batchState,
+          _batchLogParts: logParts,
+        }),
+      }).catch(err => console.error("Self-invoke error:", err));
     }
 
     // Helper: follow redirects manually preserving cookies
@@ -1196,19 +1236,25 @@ Deno.serve(async (req) => {
               break;
             }
 
-            logParts.push(`Processing ${patients.length} patients for medical file PDFs`);
-
             // Load Scheduler page to ensure practiceId is set
             if (!_practiceId) {
               const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
               setPracticeId(schedHtml);
             }
 
-            let processedCount = 0;
-            let pdfCount = 0;
-            let searchFailed = 0;
-            let withFiles = 0;
-            let skippedDefaultCase = 0;
+            // Restore batch state if continuing
+            const bs = _batchState || {};
+            let processedCount = bs.resumeIndex || 0;
+            let pdfCount = bs.pdfCount || 0;
+            let searchFailed = bs.searchFailed || 0;
+            let withFiles = bs.withFiles || 0;
+            let skippedDefaultCase = bs.skippedDefaultCase || 0;
+
+            if (processedCount > 0) {
+              logParts.push(`🔄 Resuming from patient ${processedCount}/${patients.length}`);
+            } else {
+              logParts.push(`Processing ${patients.length} patients for medical file PDFs`);
+            }
 
             // Helper: extract 2-digit birth year from DOB string like "10/04/1938"
             function birthYear2(dob: string): string {
@@ -1217,10 +1263,18 @@ Deno.serve(async (req) => {
               return "";
             }
 
-            for (const patient of patients) {
+            for (let i = processedCount; i < patients.length; i++) {
+              const patient = patients[i];
               if (isTimingOut()) {
-                logParts.push(`⏱️ Medical Files: Stopped at ${processedCount}/${patients.length} (timeout safety)`);
-                break;
+                // Self-invoke to continue in a new batch
+                await selfInvoke({
+                  resumeIndex: i,
+                  pdfCount, searchFailed, withFiles, skippedDefaultCase,
+                  dataTypeIndex: dataTypes.indexOf(dataType),
+                });
+                return new Response(JSON.stringify({ success: true, jobId: job.id, batching: true }), {
+                  headers: { ...corsHeaders, "Content-Type": "application/json" },
+                });
               }
 
               try {
@@ -1391,7 +1445,7 @@ Deno.serve(async (req) => {
                 logParts.push(`❌ ${patient.firstName} ${patient.lastName}: ${err.message}`);
               }
 
-              processedCount++;
+              processedCount = i + 1;
               if (processedCount % 50 === 0) {
                 logParts.push(`Progress: ${processedCount}/${patients.length} (${skippedDefaultCase} default-case skipped, ${withFiles} with files, ${pdfCount} PDFs)`);
                 const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
