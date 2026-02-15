@@ -1213,82 +1213,74 @@ Deno.serve(async (req) => {
             // Test with a known-good patient (from user's curl) to verify GetFilesFromBlob works
             logParts.push(`\n--- Testing GetFilesFromBlob with known patient 2568509 ---`);
 
-            // Strategy A: GetFileCategory context + GetFilesFromBlob
-            await setPatientContext("2568509");
+            // Step 1: Log GetFileCategory response to understand required params
+            const catRes = await ajaxFetch("/Patient/Patient/GetFileCategory", {
+              method: "GET",
+              headers: {
+                "Referer": `${BASE_URL}/Patient`,
+                "ClientPatientId": "2568509",
+                ...(_practiceId ? { "practiceId": _practiceId } : {}),
+              },
+            });
+            logParts.push(`GetFileCategory: status=${catRes.status} len=${catRes.body.length}`);
+            logParts.push(`GetFileCategory response: ${catRes.body.substring(0, 500)}`);
+
+            // Step 2: Try GetFilesFromBlob with different param combos
+            // 2a: Exact match to user's curl (with RequestVerificationToken cookie header)
             const testResA = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
               method: "POST",
               headers: {
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                 "Referer": `${BASE_URL}/Patient`,
                 "ClientPatientId": "2568509",
-                ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                "practiceId": _practiceId || "3265",
               },
-              body: new URLSearchParams({
-                sort: "", group: "", filter: "",
-                patientId: "2568509", practiceId: _practiceId,
-              }).toString(),
+              body: "sort=&group=&filter=&patientId=2568509&practiceId=" + (_practiceId || "3265"),
             });
-            logParts.push(`Strategy A (GetFileCategory+GetFilesFromBlob): status=${testResA.status} len=${testResA.body.length}`);
-            logParts.push(`Response A: ${testResA.body.substring(0, 300)}`);
+            logParts.push(`Test A (raw body): status=${testResA.status} len=${testResA.body.length} body=${testResA.body.substring(0, 200)}`);
 
-            // Strategy B: Try navigating to patient detail page first
-            try {
-              const { body: detailHtml } = await fetchWithCookies(`${BASE_URL}/Patient?patientId=2568509`);
-              logParts.push(`Patient detail page: ${detailHtml.length} chars, contains "permission"=${detailHtml.toLowerCase().includes("permission")}`);
-            } catch (e: any) {
-              logParts.push(`Patient detail page failed: ${e.message}`);
-            }
+            // 2b: Try with take/skip params (Kendo grid pattern)
             const testResB = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
               method: "POST",
               headers: {
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                 "Referer": `${BASE_URL}/Patient`,
                 "ClientPatientId": "2568509",
-                ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                "practiceId": _practiceId || "3265",
               },
-              body: new URLSearchParams({
-                sort: "", group: "", filter: "",
-                patientId: "2568509", practiceId: _practiceId,
-              }).toString(),
+              body: "sort=&group=&filter=&take=100&skip=0&page=1&pageSize=100&patientId=2568509&practiceId=" + (_practiceId || "3265"),
             });
-            logParts.push(`Strategy B (detail page+GetFilesFromBlob): status=${testResB.status} len=${testResB.body.length}`);
-            logParts.push(`Response B: ${testResB.body.substring(0, 300)}`);
+            logParts.push(`Test B (with take/skip): status=${testResB.status} len=${testResB.body.length} body=${testResB.body.substring(0, 200)}`);
 
-            // Strategy C: Try GetMedicalFileList endpoint instead
+            // 2c: Try without the default ClientPatientId=0 override (use fetchWithCookies instead of ajaxFetch)
             try {
-              const testResC = await ajaxFetch(`/Patient/Patient/GetMedicalFileList?patientId=2568509`, {
-                method: "GET",
+              const { body: testBodyC, response: testRespC } = await fetchWithCookies(`${BASE_URL}/Patient/Patient/GetFilesFromBlob`, {
+                method: "POST",
                 headers: {
+                  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                  "X-Requested-With": "XMLHttpRequest",
+                  "Accept": "*/*",
+                  "Origin": BASE_URL,
                   "Referer": `${BASE_URL}/Patient`,
                   "ClientPatientId": "2568509",
-                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                  "practiceId": _practiceId || "3265",
                 },
+                body: "sort=&group=&filter=&patientId=2568509&practiceId=" + (_practiceId || "3265"),
               });
-              logParts.push(`Strategy C (GetMedicalFileList): status=${testResC.status} len=${testResC.body.length}`);
-              logParts.push(`Response C: ${testResC.body.substring(0, 300)}`);
+              logParts.push(`Test C (fetchWithCookies): status=${testRespC.status} len=${testBodyC.length} body=${testBodyC.substring(0, 200)}`);
             } catch (e: any) {
-              logParts.push(`Strategy C failed: ${e.message}`);
+              logParts.push(`Test C error: ${e.message}`);
             }
 
-            // Strategy D: Try GetPatientMedicalFile endpoint
+            // Log Patient page content (the 58-char permission denied)
             try {
-              const testResD = await ajaxFetch(`/Patient/Patient/GetPatientMedicalFile?patientId=2568509`, {
-                method: "GET",
-                headers: {
-                  "Referer": `${BASE_URL}/Patient`,
-                  "ClientPatientId": "2568509",
-                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
-                },
-              });
-              logParts.push(`Strategy D (GetPatientMedicalFile): status=${testResD.status} len=${testResD.body.length}`);
-              logParts.push(`Response D: ${testResD.body.substring(0, 300)}`);
+              const { body: patPage } = await fetchWithCookies(`${BASE_URL}/Patient`);
+              logParts.push(`Patient page (${patPage.length} chars): "${patPage}"`);
             } catch (e: any) {
-              logParts.push(`Strategy D failed: ${e.message}`);
+              logParts.push(`Patient page error: ${e.message}`);
             }
 
-            // Use best working strategy result for known test
-            const knownTestRes = testResB.body.length > testResA.body.length ? testResB : testResA;
-            logParts.push(`Best result: len=${knownTestRes.body.length}`);
+            const knownTestRes = testResA;
 
             // Test search with first patient
             logParts.push(`\n--- Testing search with "${patients[0].lastName}, ${patients[0].firstName}" ---`);
