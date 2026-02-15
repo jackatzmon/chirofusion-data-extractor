@@ -711,7 +711,7 @@ Deno.serve(async (req) => {
               logParts.push(`  Sample: ${JSON.stringify(arr[0]).substring(0, 400)}`);
             }
             const match = arr[0];
-            const patientId = match.PatientId || match.Id || match.I || match.PkPatientId ||
+            const patientId = match.File_Number || match.PatientId || match.Id || match.I || match.PkPatientId ||
                              match.ClientPatientId || match.id || match.Value || match.value;
             if (patientId) return Number(patientId);
           }
