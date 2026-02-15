@@ -1254,13 +1254,71 @@ Deno.serve(async (req) => {
               logParts.push(`🔄 Resuming from patient ${processedCount}/${patients.length}`);
             } else {
               logParts.push(`Processing ${patients.length} patients for medical file PDFs`);
-            }
 
-            // Helper: extract 2-digit birth year from DOB string like "10/04/1938"
-            function birthYear2(dob: string): string {
-              const parts = dob.split("/");
-              if (parts.length === 3) return parts[2].slice(-2);
-              return "";
+              // === TARGETED TEST: known patient 2568509 that should have files ===
+              logParts.push(`🧪 TESTING known patient ID 2568509...`);
+              // Prime context
+              const testCatRes = await ajaxFetch("/Patient/Patient/GetFileCategory", {
+                method: "GET",
+                headers: {
+                  "Referer": `${BASE_URL}/Patient`,
+                  "ClientPatientId": "2568509",
+                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                },
+              });
+              logParts.push(`  GetFileCategory: status=${testCatRes.status} body=${testCatRes.body.substring(0, 300)}`);
+              
+              // Try multiple approaches for GetFilesFromBlob
+              for (const catId of ["0", "908", "909", "912", "914", "915"]) {
+                const testRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Referer": `${BASE_URL}/Patient`,
+                    "ClientPatientId": "2568509",
+                    ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                  },
+                  body: new URLSearchParams({
+                    sort: "", group: "", filter: "",
+                    patientId: "2568509",
+                    practiceId: _practiceId,
+                    fileCategoryId: catId,
+                  }).toString(),
+                });
+                const parsed = JSON.parse(testRes.body);
+                logParts.push(`  catId=${catId}: Total=${parsed.Total}, Data.length=${(parsed.Data||[]).length}`);
+                if ((parsed.Data||[]).length > 0) {
+                  logParts.push(`  FOUND FILES! Keys: ${Object.keys(parsed.Data[0]).join(", ")}`);
+                  logParts.push(`  Sample: ${JSON.stringify(parsed.Data[0]).substring(0, 500)}`);
+                  break;
+                }
+              }
+              
+              // Also try navigating to patient page first
+              const navRes = await fetchWithCookies(`${BASE_URL}/Patient/Patient/SelectPatient?patientId=2568509`);
+              logParts.push(`  SelectPatient: status=${navRes.status}`);
+              const testRes2 = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                  "Referer": `${BASE_URL}/Patient`,
+                  "ClientPatientId": "2568509",
+                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                },
+                body: new URLSearchParams({
+                  sort: "", group: "", filter: "",
+                  patientId: "2568509",
+                  practiceId: _practiceId,
+                  fileCategoryId: "0",
+                }).toString(),
+              });
+              const parsed2 = JSON.parse(testRes2.body);
+              logParts.push(`  After SelectPatient: Total=${parsed2.Total}, Data.length=${(parsed2.Data||[]).length}`);
+              if ((parsed2.Data||[]).length > 0) {
+                logParts.push(`  FOUND FILES after nav! Keys: ${Object.keys(parsed2.Data[0]).join(", ")}`);
+                logParts.push(`  Sample: ${JSON.stringify(parsed2.Data[0]).substring(0, 500)}`);
+              }
+              logParts.push(`🧪 END TEST`);
             }
 
             for (let i = processedCount; i < patients.length; i++) {
