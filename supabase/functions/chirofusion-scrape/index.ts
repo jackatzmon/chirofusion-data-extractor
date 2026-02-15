@@ -481,40 +481,67 @@ Deno.serve(async (req) => {
                 const schedToken = extractVerifToken(schedHtml);
                 logParts.push(`Scheduler page: ${schedHtml.length} chars, token: ${schedToken ? schedToken.substring(0, 20) + "..." : "NONE"}`);
 
-                // Extract Kendo datasource URLs from JavaScript in the page
-                const dataSourceUrlRegex = /(?:dataSource|transport|read)\s*[:=]\s*\{[^}]*url\s*:\s*["']([^"']+)["']/gi;
-                const discoveredUrls: string[] = [];
-                let dsMatch;
-                while ((dsMatch = dataSourceUrlRegex.exec(schedHtml)) !== null) {
-                  if (dsMatch[1].toLowerCase().includes("patient") || dsMatch[1].toLowerCase().includes("report")) {
-                    discoveredUrls.push(dsMatch[1]);
+                // === DIAGNOSTIC: Extract form structure and JS patterns from page ===
+                // Find ALL forms and their actions
+                const formActionRegex = /<form[^>]*(?:id|action)\s*=\s*["']([^"']+)["'][^>]*/gi;
+                let formMatch;
+                while ((formMatch = formActionRegex.exec(schedHtml)) !== null) {
+                  if (formMatch[0].toLowerCase().includes("patient") || formMatch[0].toLowerCase().includes("report") || formMatch[0].toLowerCase().includes("export")) {
+                    logParts.push(`FORM: ${formMatch[0].substring(0, 300)}`);
                   }
                 }
-                // Also look for function calls that reveal endpoints
-                const ajaxUrlRegex = /\$\.(?:ajax|post|get)\s*\(\s*["']([^"']*(?:[Pp]atient|[Rr]eport)[^"']*)["']/gi;
-                while ((dsMatch = ajaxUrlRegex.exec(schedHtml)) !== null) {
-                  discoveredUrls.push(dsMatch[1]);
-                }
-                // Also look for URL patterns in onclick/data attributes
-                const dataUrlRegex = /data-url\s*=\s*["']([^"']*(?:[Pp]atient|[Rr]eport)[^"']*)["']/gi;
-                while ((dsMatch = dataUrlRegex.exec(schedHtml)) !== null) {
-                  discoveredUrls.push(dsMatch[1]);
-                }
-                const uniqueDiscovered = [...new Set(discoveredUrls)];
-                logParts.push(`Discovered patient/report URLs in page JS: ${JSON.stringify(uniqueDiscovered)}`);
 
-                // Extract Kendo widget configs for dropdowns (they use data-role="dropdownlist")
-                const kdRegex = /id\s*=\s*["'](ReportType|PatientStatus)["'][^>]*data-(?:source|bind)\s*=\s*["']([^"']*)["']/gi;
-                let kdMatch;
-                while ((kdMatch = kdRegex.exec(schedHtml)) !== null) {
-                  logParts.push(`Kendo widget ${kdMatch[1]}: ${kdMatch[2].substring(0, 200)}`);
+                // Find the "Run Report" / "Export" button and surrounding context
+                const btnRegex = /(?:btnRunReport|btnExport|RunReport|ExportToExcel|exportPatient)[^"']*["'][^>]*>/gi;
+                let btnMatch;
+                while ((btnMatch = btnRegex.exec(schedHtml)) !== null) {
+                  // Get surrounding context (200 chars before and after)
+                  const start = Math.max(0, btnMatch.index - 200);
+                  const end = Math.min(schedHtml.length, btnMatch.index + btnMatch[0].length + 200);
+                  logParts.push(`BUTTON CONTEXT: ${schedHtml.substring(start, end).replace(/\s+/g, " ").substring(0, 500)}`);
                 }
 
-                // Also try to find option values from inline JSON arrays
-                const optJsonRegex = /(?:ReportType|reportType)\s*(?:Data|Options|Items)?\s*[:=]\s*(\[[^\]]+\])/gi;
-                let optMatch;
-                while ((optMatch = optJsonRegex.exec(schedHtml)) !== null) {
-                  logParts.push(`ReportType options data: ${optMatch[1].substring(0, 300)}`);
+                // Find ALL $.ajax and $.post calls (not just patient/report ones)
+                const allAjaxRegex = /\$\.(?:ajax|post|get)\s*\(\s*(?:["']([^"']+)["']|\{[^}]*url\s*:\s*["']([^"']+)["'])/gi;
+                const allAjaxUrls: string[] = [];
+                let ajaxMatch;
+                while ((ajaxMatch = allAjaxRegex.exec(schedHtml)) !== null) {
+                  allAjaxUrls.push(ajaxMatch[1] || ajaxMatch[2]);
+                }
+                const uniqueAjax = [...new Set(allAjaxUrls)].filter(u => u && !u.includes(".css") && !u.includes(".js")).sort();
+                logParts.push(`ALL AJAX URLs (${uniqueAjax.length}): ${JSON.stringify(uniqueAjax.slice(0, 30))}`);
+
+                // Find URLs that contain "Patient" or "Report" or "Export" specifically
+                const relevantAjax = uniqueAjax.filter(u => /patient|report|export/i.test(u));
+                logParts.push(`RELEVANT AJAX URLs: ${JSON.stringify(relevantAjax)}`);
+                const uniqueDiscovered = relevantAjax;
+
+                // Find Kendo grid/datasource configurations
+                const kendoReadRegex = /\.kendoGrid\s*\(\s*\{[\s\S]{0,2000}?read\s*:\s*(?:["']([^"']+)["']|\{[^}]*url\s*:\s*["']([^"']+)["'])/gi;
+                let kendoMatch;
+                while ((kendoMatch = kendoReadRegex.exec(schedHtml)) !== null) {
+                  logParts.push(`KENDO GRID READ URL: ${kendoMatch[1] || kendoMatch[2]}`);
+                }
+
+                // Find function definitions that handle Run Report click
+                const fnRunRegex = /function\s+(\w*(?:Run|Export|Patient|Report)\w*)\s*\([^)]*\)\s*\{([^}]{0,500})/gi;
+                let fnMatch;
+                while ((fnMatch = fnRunRegex.exec(schedHtml)) !== null) {
+                  logParts.push(`FN ${fnMatch[1]}: ${fnMatch[2].replace(/\s+/g, " ").substring(0, 300)}`);
+                }
+
+                // Look for the exact click binding on "Run Report" button
+                const clickBindRegex = /(?:click|on)\s*[:=]\s*(?:function\s*\([^)]*\)\s*\{|["']?)(\w*(?:Run|Export|Patient|Report)\w*)/gi;
+                let clickMatch;
+                while ((clickMatch = clickBindRegex.exec(schedHtml)) !== null) {
+                  logParts.push(`CLICK BINDING: ${clickMatch[0].substring(0, 200)}`);
+                }
+
+                // Extract select/input elements with id containing Report or Patient
+                const inputRegex = /<(?:select|input)[^>]*id\s*=\s*["']([^"']*(?:Report|Patient|Status|Provider)[^"']*)["'][^>]*/gi;
+                let inputMatch;
+                while ((inputMatch = inputRegex.exec(schedHtml)) !== null) {
+                  logParts.push(`INPUT: ${inputMatch[0].substring(0, 300)}`);
                 }
 
                 // Try standard HTML select extraction too
