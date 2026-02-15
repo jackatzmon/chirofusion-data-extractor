@@ -400,98 +400,78 @@ Deno.serve(async (req) => {
         switch (dataType) {
           // ==================== DEMOGRAPHICS ====================
           case "demographics": {
-            // ChiroFusion requires: 1) Load Patient Reports page, 2) Run Report, 3) Export
-            // This mimics clicking Schedule > Patient Reports > Run Report > Export To Excel
+            // From discovery: two export forms exist in the Scheduler page:
+            // 1) form#exportPatientReport → POST /User/Scheduler/ExportPatientReports (ReportType=1 for Patient List)
+            // 2) form#exportPatientListCsv → POST /Patient/Patient/ExportPatientList
+            // Both are regular form POSTs (not AJAX). Must load Scheduler page first.
 
-            // Step 1: Navigate to Patient Reports page to establish session context
-            logParts.push(`Step 1: Loading Patient Reports page...`);
-            const { body: reportPageHtml, finalUrl } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
-            logParts.push(`Scheduler page loaded: ${finalUrl} length=${reportPageHtml.length}`);
+            // Step 1: Load Scheduler page to establish session
+            logParts.push(`Step 1: Loading Scheduler page...`);
+            const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
+            logParts.push(`Scheduler loaded: ${schedHtml.length} chars`);
 
-            // Step 2: Try running the Patient Report (this populates server-side data)
-            logParts.push(`Step 2: Running Patient Report...`);
-            
-            // Try the AJAX endpoint that "Run Report" button calls
-            const runReportRes = await ajaxFetch("/User/Scheduler/GetPatientReportData", {
+            // Step 2: Try form#exportPatientReport (ExportPatientReports with ReportType=1)
+            // This is a regular form POST, NOT AJAX - so we use fetchWithCookies
+            logParts.push(`Step 2: Submitting exportPatientReport form (ReportType=1, PatientStatus=All)...`);
+            const { response: exportRes1, body: export1Body } = await fetchWithCookies(`${BASE_URL}/User/Scheduler/ExportPatientReports`, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                reportType: "PatientList",
-                patientStatus: "All",
-                page: 1,
-                pageSize: 5000,
-              }),
-            });
-            logParts.push(`GetPatientReportData (JSON POST): status=${runReportRes.status} type=${runReportRes.contentType} length=${runReportRes.body.length}`);
-            logParts.push(`Preview: ${runReportRes.body.substring(0, 500)}`);
-
-            // Check if we got data directly from the report endpoint
-            if (runReportRes.status === 200 && runReportRes.contentType.includes("json") && runReportRes.body.length > 100) {
-              try {
-                const reportData = JSON.parse(runReportRes.body);
-                const items = reportData.Data || reportData.data || reportData.Items || reportData;
-                if (Array.isArray(items) && items.length > 0) {
-                  csvContent = jsonToCsv(items);
-                  rowCount = items.length;
-                  logParts.push(`✅ Demographics (report JSON): ${rowCount} patients`);
-                  break;
-                }
-              } catch { /* continue to other methods */ }
-            }
-
-            // Try form-encoded POST variant
-            const runReport2 = await ajaxFetch("/User/Scheduler/GetPatientReportData", {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              headers: { 
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": `${BASE_URL}/User/Scheduler`,
+                "Origin": BASE_URL,
+              },
               body: new URLSearchParams({
-                reportType: "PatientList",
-                patientStatus: "All",
-                page: "1",
-                pageSize: "5000",
+                ReportType: "1",
+                PatientStatus: "All",
               }).toString(),
             });
-            logParts.push(`GetPatientReportData (form POST): status=${runReport2.status} type=${runReport2.contentType} length=${runReport2.body.length}`);
-            logParts.push(`Preview: ${runReport2.body.substring(0, 500)}`);
+            const export1CT = exportRes1.headers.get("content-type") || "";
+            logParts.push(`ExportPatientReports: status=${exportRes1.status} type=${export1CT} length=${export1Body.length}`);
+            logParts.push(`Preview: ${export1Body.substring(0, 500)}`);
 
-            if (runReport2.status === 200 && runReport2.body.length > 100 && !runReport2.body.includes("<!DOCTYPE")) {
-              try {
-                const reportData = JSON.parse(runReport2.body);
-                const items = reportData.Data || reportData.data || reportData;
-                if (Array.isArray(items) && items.length > 0) {
-                  csvContent = jsonToCsv(items);
-                  rowCount = items.length;
-                  logParts.push(`✅ Demographics (report form): ${rowCount} patients`);
-                  break;
-                }
-              } catch { /* continue */ }
+            if (export1Body.length > 200 && !export1Body.includes("<!DOCTYPE") && !export1Body.includes("<html") && !export1Body.includes("<head>")) {
+              csvContent = export1Body;
+              rowCount = csvContent.split("\n").length - 1;
+              logParts.push(`✅ Demographics (ExportPatientReports form): ${rowCount} rows`);
+              break;
             }
 
-            // Step 3: Now try the Export after the report was run (session should have data)
-            logParts.push(`Step 3: Trying export after report run...`);
-            const exportRes = await ajaxFetch("/User/Scheduler/ExportPatientReports");
-            logParts.push(`ExportPatientReports: status=${exportRes.status} type=${exportRes.contentType} length=${exportRes.body.length}`);
-            logParts.push(`Preview: ${exportRes.body.substring(0, 300)}`);
+            // Step 3: Try form#exportPatientListCsv (ExportPatientList)
+            logParts.push(`Step 3: Submitting exportPatientListCsv form...`);
+            const { response: exportRes2, body: export2Body } = await fetchWithCookies(`${BASE_URL}/Patient/Patient/ExportPatientList`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": `${BASE_URL}/User/Scheduler`,
+                "Origin": BASE_URL,
+              },
+              body: "",
+            });
+            const export2CT = exportRes2.headers.get("content-type") || "";
+            logParts.push(`ExportPatientList: status=${exportRes2.status} type=${export2CT} length=${export2Body.length}`);
+            logParts.push(`Preview: ${export2Body.substring(0, 500)}`);
 
-            if (exportRes.body.length > 200 && !exportRes.body.includes("<!DOCTYPE") && !exportRes.body.includes("<html")) {
-              csvContent = exportRes.body;
+            if (export2Body.length > 200 && !export2Body.includes("<!DOCTYPE") && !export2Body.includes("<html") && !export2Body.includes("<head>")) {
+              csvContent = export2Body;
               rowCount = csvContent.split("\n").length - 1;
-              logParts.push(`✅ Demographics (export): ${rowCount} rows`);
-            } else {
-              // Final fallback: JSON endpoint (partial)
-              logParts.push(`Export still failing. Falling back to JSON endpoint...`);
-              const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
-              if (contentType.includes("application/json")) {
-                const patients = (JSON.parse(body)).PatientData || JSON.parse(body);
-                if (Array.isArray(patients) && patients.length > 0) {
-                  const expanded = patients.map((p: any) => ({
-                    PatientID: p.I || "", FirstName: p.F || "", LastName: p.L || "",
-                    DateOfBirth: p.DOB || "", HomePhone: p.HP || "", MobilePhone: p.MP || "",
-                    Email: p.E || "",
-                  }));
-                  csvContent = jsonToCsv(expanded);
-                  rowCount = expanded.length;
-                  logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients (partial)`);
-                }
+              logParts.push(`✅ Demographics (ExportPatientList form): ${rowCount} rows`);
+              break;
+            }
+
+            // Step 4: Final fallback - JSON endpoint (partial)
+            logParts.push(`Step 4: Falling back to JSON endpoint (partial)...`);
+            const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
+            if (contentType.includes("application/json")) {
+              const patients = (JSON.parse(body)).PatientData || JSON.parse(body);
+              if (Array.isArray(patients) && patients.length > 0) {
+                const expanded = patients.map((p: any) => ({
+                  PatientID: p.I || "", FirstName: p.F || "", LastName: p.L || "",
+                  DateOfBirth: p.DOB || "", HomePhone: p.HP || "", MobilePhone: p.MP || "",
+                  Email: p.E || "",
+                }));
+                csvContent = jsonToCsv(expanded);
+                rowCount = expanded.length;
+                logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients (partial)`);
               }
             }
             break;
