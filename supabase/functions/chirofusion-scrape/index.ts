@@ -400,66 +400,68 @@ Deno.serve(async (req) => {
         switch (dataType) {
           // ==================== DEMOGRAPHICS ====================
           case "demographics": {
-            // From discovery: two export forms exist in the Scheduler page:
-            // 1) form#exportPatientReport → POST /User/Scheduler/ExportPatientReports (ReportType=1 for Patient List)
-            // 2) form#exportPatientListCsv → POST /Patient/Patient/ExportPatientList
-            // Both are regular form POSTs (not AJAX). Must load Scheduler page first.
-
-            // Step 1: Load Scheduler page to establish session
+            // Step 1: Load Scheduler page and find the JS bundle URL
             logParts.push(`Step 1: Loading Scheduler page...`);
             const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
             logParts.push(`Scheduler loaded: ${schedHtml.length} chars`);
 
-            // Step 2: Try form#exportPatientReport (ExportPatientReports with ReportType=1)
-            // This is a regular form POST, NOT AJAX - so we use fetchWithCookies
-            logParts.push(`Step 2: Submitting exportPatientReport form (ReportType=1, PatientStatus=All)...`);
-            const { response: exportRes1, body: export1Body } = await fetchWithCookies(`${BASE_URL}/User/Scheduler/ExportPatientReports`, {
-              method: "POST",
-              headers: { 
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": `${BASE_URL}/User/Scheduler`,
-                "Origin": BASE_URL,
-              },
-              body: new URLSearchParams({
-                ReportType: "1",
-                PatientStatus: "All",
-              }).toString(),
-            });
-            const export1CT = exportRes1.headers.get("content-type") || "";
-            logParts.push(`ExportPatientReports: status=${exportRes1.status} type=${export1CT} length=${export1Body.length}`);
-            logParts.push(`Preview: ${export1Body.substring(0, 500)}`);
+            // Step 2: Find and fetch the AppointmentReport JS bundle to discover real endpoints
+            const bundleMatch = schedHtml.match(/src="(\/bundles\/AppointmentReport[^"]+)"/i);
+            const patientDashMatch = schedHtml.match(/src="(\/bundles\/patientdashboard[^"]+)"/i);
+            const commonMatch = schedHtml.match(/src="(\/bundles\/common[^"]+)"/i);
 
-            if (export1Body.length > 200 && !export1Body.includes("<!DOCTYPE") && !export1Body.includes("<html") && !export1Body.includes("<head>")) {
-              csvContent = export1Body;
-              rowCount = csvContent.split("\n").length - 1;
-              logParts.push(`✅ Demographics (ExportPatientReports form): ${rowCount} rows`);
-              break;
+            const bundleUrls = [bundleMatch, patientDashMatch, commonMatch]
+              .filter(Boolean)
+              .map(m => m![1]);
+
+            logParts.push(`Found ${bundleUrls.length} JS bundles to scan`);
+
+            for (const bundleUrl of bundleUrls) {
+              try {
+                const { body: jsBody } = await fetchWithCookies(`${BASE_URL}${bundleUrl}`);
+                logParts.push(`\n===== BUNDLE: ${bundleUrl} (${jsBody.length} chars) =====`);
+
+                // Find RunPatientReport function
+                const runPatIdx = jsBody.indexOf("RunPatientReport");
+                if (runPatIdx >= 0) {
+                  logParts.push(`RunPatientReport found at char ${runPatIdx}:`);
+                  logParts.push(jsBody.substring(Math.max(0, runPatIdx - 50), runPatIdx + 500));
+                }
+
+                // Find ExportPatientReport function
+                const exportPatIdx = jsBody.indexOf("ExportPatientReport");
+                if (exportPatIdx >= 0) {
+                  logParts.push(`ExportPatientReport found at char ${exportPatIdx}:`);
+                  logParts.push(jsBody.substring(Math.max(0, exportPatIdx - 50), exportPatIdx + 500));
+                }
+
+                // Find ExportPatientList function
+                const exportListIdx = jsBody.indexOf("ExportPatientList");
+                if (exportListIdx >= 0) {
+                  logParts.push(`ExportPatientList found at char ${exportListIdx}:`);
+                  logParts.push(jsBody.substring(Math.max(0, exportListIdx - 50), exportListIdx + 500));
+                }
+
+                // Find any URL patterns with "patient" and "report" or "export"
+                const patReportRegex = /["']([^"']*(?:patient|Patient)[^"']*(?:report|Report|export|Export)[^"']*?)["']/gi;
+                let prMatch;
+                const foundUrls: string[] = [];
+                while ((prMatch = patReportRegex.exec(jsBody)) !== null) {
+                  if (!foundUrls.includes(prMatch[1]) && prMatch[1].startsWith("/")) {
+                    foundUrls.push(prMatch[1]);
+                  }
+                }
+                if (foundUrls.length > 0) {
+                  logParts.push(`\nPatient+Report/Export URLs in bundle:`);
+                  for (const u of foundUrls) logParts.push(`  ${u}`);
+                }
+              } catch (err: any) {
+                logParts.push(`Bundle ${bundleUrl} error: ${err.message}`);
+              }
             }
 
-            // Step 3: Try form#exportPatientListCsv (ExportPatientList)
-            logParts.push(`Step 3: Submitting exportPatientListCsv form...`);
-            const { response: exportRes2, body: export2Body } = await fetchWithCookies(`${BASE_URL}/Patient/Patient/ExportPatientList`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": `${BASE_URL}/User/Scheduler`,
-                "Origin": BASE_URL,
-              },
-              body: "",
-            });
-            const export2CT = exportRes2.headers.get("content-type") || "";
-            logParts.push(`ExportPatientList: status=${exportRes2.status} type=${export2CT} length=${export2Body.length}`);
-            logParts.push(`Preview: ${export2Body.substring(0, 500)}`);
-
-            if (export2Body.length > 200 && !export2Body.includes("<!DOCTYPE") && !export2Body.includes("<html") && !export2Body.includes("<head>")) {
-              csvContent = export2Body;
-              rowCount = csvContent.split("\n").length - 1;
-              logParts.push(`✅ Demographics (ExportPatientList form): ${rowCount} rows`);
-              break;
-            }
-
-            // Step 4: Final fallback - JSON endpoint (partial)
-            logParts.push(`Step 4: Falling back to JSON endpoint (partial)...`);
+            // For now, still fall back to JSON endpoint
+            logParts.push(`\nUsing JSON fallback while we discover endpoints...`);
             const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
             if (contentType.includes("application/json")) {
               const patients = (JSON.parse(body)).PatientData || JSON.parse(body);
