@@ -370,7 +370,7 @@ Deno.serve(async (req) => {
             "RequestVerificationToken": schedToken.value,
           },
           body: new URLSearchParams({
-            ReportType: "1", BirthMonths: "", PatientStatus: "", PatientInsurance: "",
+            ReportType: "1", BirthMonths: "", PatientStatus: "All", PatientInsurance: "",
             __RequestVerificationToken: schedToken.value,
           }).toString(),
         });
@@ -392,7 +392,7 @@ Deno.serve(async (req) => {
               "RequestVerificationToken": schedToken.value,
             },
             body: new URLSearchParams({
-              ReportType: "1", BirthMonths: "", PatientStatus: "", PatientInsurance: "",
+              ReportType: "1", BirthMonths: "", PatientStatus: "All", PatientInsurance: "",
             }).toString(),
           }
         );
@@ -795,7 +795,7 @@ Deno.serve(async (req) => {
             const reportData = {
               ReportType: "1",  // PatientReportType.PatientList = 1
               BirthMonths: "",
-              PatientStatus: "",
+              PatientStatus: "All",
               PatientInsurance: "",
             };
 
