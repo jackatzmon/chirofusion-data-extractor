@@ -87,17 +87,26 @@ const Dashboard = () => {
 
   const saveCredentials = async () => {
     setSavingCreds(true);
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return;
-    const { error } = hasCreds
-      ? await supabase.from("chirofusion_credentials").update({ cf_username: cfUsername, cf_password: cfPassword }).eq("user_id", user.id)
-      : await supabase.from("chirofusion_credentials").insert({ user_id: user.id, cf_username: cfUsername, cf_password: cfPassword });
-    setSavingCreds(false);
-    if (error) {
-      toast({ title: "Error", description: error.message, variant: "destructive" });
-    } else {
-      setHasCreds(true); setCfPassword("");
-      toast({ title: "Saved", description: "ChiroFusion credentials saved." });
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) {
+        toast({ title: "Error", description: "Not authenticated. Please sign in again.", variant: "destructive" });
+        navigate("/auth");
+        return;
+      }
+      const { error } = hasCreds
+        ? await supabase.from("chirofusion_credentials").update({ cf_username: cfUsername, cf_password: cfPassword }).eq("user_id", user.id)
+        : await supabase.from("chirofusion_credentials").insert({ user_id: user.id, cf_username: cfUsername, cf_password: cfPassword });
+      if (error) {
+        toast({ title: "Error", description: error.message, variant: "destructive" });
+      } else {
+        setHasCreds(true); setCfPassword("");
+        toast({ title: "Saved", description: "ChiroFusion credentials saved." });
+      }
+    } catch (error: any) {
+      toast({ title: "Error", description: error.message || "Failed to save credentials.", variant: "destructive" });
+    } finally {
+      setSavingCreds(false);
     }
   };
 
@@ -242,7 +251,7 @@ const Dashboard = () => {
                     </div>
                     <span className="text-xs text-muted-foreground">{new Date(job.created_at).toLocaleString()}</span>
                   </div>
-                  <div className="text-xs text-muted-foreground">{job.data_types.join(", ")}</div>
+                  <div className="text-xs text-muted-foreground">{(job.data_types || []).join(", ")}</div>
                   {job.status === "running" && <Progress value={job.progress} />}
                   {job.error_message && <p className="text-xs text-destructive">{job.error_message}</p>}
                   {job.log_output && (

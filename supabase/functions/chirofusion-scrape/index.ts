@@ -14,7 +14,16 @@ const browserHeaders = {
 };
 
 function mergeCookies(existing: string, response: Response): string {
-  const newCookies = response.headers.getSetCookie?.() || [];
+  // Try getSetCookie() first (Deno 1.34+), fall back to parsing set-cookie header
+  let newCookies: string[] = [];
+  try {
+    newCookies = response.headers.getSetCookie?.() || [];
+  } catch {
+    // Fallback: manually get set-cookie header(s)
+    const raw = response.headers.get("set-cookie");
+    if (raw) newCookies = [raw];
+  }
+
   const cookieMap = new Map<string, string>();
   if (existing) {
     for (const part of existing.split("; ")) {
@@ -84,12 +93,12 @@ Deno.serve(async (req) => {
       { global: { headers: { Authorization: authHeader } } }
     );
 
-    const { data: claimsData, error: claimsError } = await supabase.auth.getClaims(authHeader.replace("Bearer ", ""));
-    if (claimsError || !claimsData?.claims) {
+    const { data: { user }, error: userError } = await supabase.auth.getUser();
+    if (userError || !user) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    const userId = claimsData.claims.sub as string;
+    const userId = user.id;
     const body = await req.json();
     const { dataTypes = [], mode = "scrape", dateFrom, dateTo } = body;
 
@@ -121,6 +130,12 @@ Deno.serve(async (req) => {
 
     let sessionCookies = "";
     const logParts: string[] = [];
+    const startTime = Date.now();
+    const MAX_RUNTIME_MS = 140_000; // 140s safety margin (Supabase limit ~150s)
+
+    function isTimingOut(): boolean {
+      return (Date.now() - startTime) > MAX_RUNTIME_MS;
+    }
 
     // Helper: follow redirects manually preserving cookies
     async function fetchWithCookies(url: string, opts: RequestInit = {}): Promise<{ response: Response; body: string; finalUrl: string }> {
@@ -400,173 +415,106 @@ Deno.serve(async (req) => {
         switch (dataType) {
           // ==================== DEMOGRAPHICS ====================
           case "demographics": {
-            // Step 1: Load Scheduler page and extract CSRF token
-            logParts.push(`Step 1: Loading Scheduler page...`);
-            const { body: schedulerHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
-
-            // Extract __RequestVerificationToken
-            let verificationToken = "";
-            const tokenMatch = schedulerHtml.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
-            if (tokenMatch) {
-              verificationToken = tokenMatch[1];
-              logParts.push(`Found verification token: ${verificationToken.substring(0, 20)}...`);
-            } else {
-              // Try alternate patterns
-              const tokenMatch2 = schedulerHtml.match(/value="([^"]+)"[^>]*name="__RequestVerificationToken"/);
-              if (tokenMatch2) verificationToken = tokenMatch2[1];
-              logParts.push(`Verification token: ${verificationToken ? "found (alt)" : "NOT FOUND"}`);
-            }
-
-            // Extract any other hidden fields from forms
-            const hiddenFields: Record<string, string> = {};
-            const hiddenRegex = /<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>/gi;
-            let hiddenMatch;
-            while ((hiddenMatch = hiddenRegex.exec(schedulerHtml)) !== null) {
-              hiddenFields[hiddenMatch[1]] = hiddenMatch[2];
-            }
-            // Also try reversed attribute order
-            const hiddenRegex2 = /<input[^>]*value="([^"]*)"[^>]*name="([^"]+)"[^>]*type="hidden"[^>]*>/gi;
-            while ((hiddenMatch = hiddenRegex2.exec(schedulerHtml)) !== null) {
-              hiddenFields[hiddenMatch[2]] = hiddenMatch[1];
-            }
-            logParts.push(`Hidden fields: ${JSON.stringify(Object.keys(hiddenFields))}`);
-
-            // Step 2: Try GetPatientReports with token as HEADER (ASP.NET MVC AJAX anti-forgery)
-            const endpoint = "/Scheduler/Scheduler/GetPatientReports";
+            // Discovery found these real endpoints:
+            //   1. /Patient/Patient/ExportPatientList (form #exportPatientListCsv - direct CSV)
+            //   2. /User/Scheduler/ExportPatientReports (form #exportPatientReport - report export)
+            //   3. /Patient/Patient/GetAllPatientForLocalStorage (JSON fallback)
             let found = false;
 
-            // ASP.NET sends CSRF token as header for AJAX, not in body
-            const csrfHeaders: Record<string, string> = {};
-            if (verificationToken) {
-              csrfHeaders["RequestVerificationToken"] = verificationToken;
-              csrfHeaders["__RequestVerificationToken"] = verificationToken;
-            }
-
-            // Build form body from ALL hidden fields + report params
-            const baseParams = new URLSearchParams();
-            // Include all hidden fields from the form
-            for (const [key, val] of Object.entries(hiddenFields)) {
-              if (key !== "__RequestVerificationToken") {
-                baseParams.set(key, val);
-              }
-            }
-            // Override with report-specific values
-            baseParams.set("ReportType", "1");
-            baseParams.set("PatientStatus", "1,2,3");
-            baseParams.set("PatientStatusString", "1,2,3");
-            baseParams.set("BirthMonths", "");
-            baseParams.set("BirthMonthString", "");
-            baseParams.set("PatientInsurance", "");
-            baseParams.set("PatientInsuranceString", "");
-            baseParams.set("IsAllPatientValue", "true");
-
-            // Kendo grid params
-            const kendoParams = new URLSearchParams(baseParams);
-            kendoParams.set("sort", "");
-            kendoParams.set("page", "1");
-            kendoParams.set("pageSize", "10000");
-            kendoParams.set("take", "10000");
-            kendoParams.set("skip", "0");
-            kendoParams.set("group", "");
-            kendoParams.set("filter", "");
-
-            const attempts: { label: string; url: string; opts: RequestInit }[] = [
-              {
-                label: "all-fields+csrf-header+kendo",
-                url: endpoint,
-                opts: {
-                  method: "POST",
-                  headers: { "Content-Type": "application/x-www-form-urlencoded", ...csrfHeaders },
-                  body: kendoParams.toString(),
-                },
-              },
-              {
-                label: "all-fields+csrf-header (no kendo)",
-                url: endpoint,
-                opts: {
-                  method: "POST",
-                  headers: { "Content-Type": "application/x-www-form-urlencoded", ...csrfHeaders },
-                  body: baseParams.toString(),
-                },
-              },
-              {
-                label: "all-fields+token-in-body+kendo",
-                url: endpoint,
-                opts: {
-                  method: "POST",
-                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                  body: kendoParams.toString() + (verificationToken ? `&__RequestVerificationToken=${encodeURIComponent(verificationToken)}` : ""),
-                },
-              },
-              {
-                label: "ExportPatientReport with all fields",
-                url: "/Scheduler/Scheduler/ExportPatientReport",
-                opts: {
-                  method: "POST",
-                  headers: { "Content-Type": "application/x-www-form-urlencoded", ...csrfHeaders },
-                  body: kendoParams.toString(),
-                },
-              },
-              {
-                label: "PrintPatientReport with all fields",
-                url: "/Scheduler/Scheduler/PrintPatientReport",
-                opts: {
-                  method: "POST",
-                  headers: { "Content-Type": "application/x-www-form-urlencoded", ...csrfHeaders },
-                  body: kendoParams.toString(),
-                },
-              },
-            ];
-
-            for (const attempt of attempts) {
-              const res = await ajaxFetch(attempt.url, attempt.opts);
-              logParts.push(`${attempt.label}: status=${res.status} type=${res.contentType} length=${res.body.length}`);
-              if (res.body.length > 10) {
-                logParts.push(`Preview: ${res.body.substring(0, 800)}`);
-              }
-
-              if (res.status === 200 && res.body.length > 100) {
-                try {
-                  const data = JSON.parse(res.body);
-                  const items = data.Data || data.data || data.Items || (Array.isArray(data) ? data : null);
-                  if (items && Array.isArray(items) && items.length > 0) {
-                    csvContent = jsonToCsv(items);
-                    rowCount = items.length;
-                    logParts.push(`✅ Demographics: ${rowCount} patients from ${attempt.label}`);
-                    found = true;
-                    break;
-                  } else {
-                    logParts.push(`Keys: ${Object.keys(data).join(", ")}`);
-                  }
-                } catch {
-                  // Could be CSV/Excel
-                  if (res.body.includes(",") && res.body.includes("\n")) {
-                    csvContent = res.body;
-                    rowCount = res.body.split("\n").length - 1;
-                    logParts.push(`✅ Demographics (CSV): ${rowCount} rows from ${attempt.label}`);
-                    found = true;
-                    break;
-                  }
+            // Attempt 1: Direct patient list CSV export (from discovery: ExportPatientList onclick)
+            logParts.push(`Attempt 1: /Patient/Patient/ExportPatientList (direct CSV)...`);
+            try {
+              const { response: expRes, body: expBody } = await fetchWithCookies(
+                `${BASE_URL}/Patient/Patient/ExportPatientList`,
+                { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+              );
+              logParts.push(`ExportPatientList: status=${expRes.status} length=${expBody.length} type=${expRes.headers.get("content-type") || "unknown"}`);
+              if (expBody.length > 100) {
+                logParts.push(`Preview: ${expBody.substring(0, 500)}`);
+                // Check if it's CSV/Excel content
+                if (expBody.includes(",") && expBody.includes("\n") && !expBody.includes("<!DOCTYPE")) {
+                  csvContent = expBody;
+                  rowCount = expBody.split("\n").length - 1;
+                  logParts.push(`✅ Demographics (CSV export): ${rowCount} rows`);
+                  found = true;
                 }
               }
+            } catch (err: any) {
+              logParts.push(`ExportPatientList error: ${err.message}`);
             }
 
+            // Attempt 2: Patient Report export (ReportType=1 = Patient List)
             if (!found) {
-              // Fallback: JSON endpoint (partial)
-              logParts.push(`All attempts failed. Using JSON fallback...`);
-              const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
-              if (contentType.includes("application/json")) {
-                const patients = (JSON.parse(body)).PatientData || JSON.parse(body);
-                if (Array.isArray(patients) && patients.length > 0) {
-                  const expanded = patients.map((p: any) => ({
-                    PatientID: p.I || "", FirstName: p.F || "", LastName: p.L || "",
-                    DateOfBirth: p.DOB || "", HomePhone: p.HP || "", MobilePhone: p.MP || "",
-                    Email: p.E || "",
-                  }));
-                  csvContent = jsonToCsv(expanded);
-                  rowCount = expanded.length;
-                  logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients (partial)`);
+              logParts.push(`Attempt 2: /User/Scheduler/ExportPatientReports (report)...`);
+              try {
+                const reportParams = new URLSearchParams({
+                  ReportType: "1",
+                  BirthMonths: "",
+                  PatientStatus: "1,2,3",
+                  PatientStatusString: "1,2,3",
+                  PatientInsurance: "",
+                  PatientInsuranceString: "",
+                  IsAllPatientValue: "true",
+                });
+
+                const { response: rptRes, body: rptBody } = await fetchWithCookies(
+                  `${BASE_URL}/User/Scheduler/ExportPatientReports`,
+                  {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: reportParams.toString(),
+                  }
+                );
+                logParts.push(`ExportPatientReports: status=${rptRes.status} length=${rptBody.length} type=${rptRes.headers.get("content-type") || "unknown"}`);
+                if (rptBody.length > 100) {
+                  logParts.push(`Preview: ${rptBody.substring(0, 500)}`);
+                  try {
+                    const data = JSON.parse(rptBody);
+                    const items = data.Data || data.data || data.Items || (Array.isArray(data) ? data : null);
+                    if (items && Array.isArray(items) && items.length > 0) {
+                      csvContent = jsonToCsv(items);
+                      rowCount = items.length;
+                      logParts.push(`✅ Demographics: ${rowCount} patients from report`);
+                      found = true;
+                    } else {
+                      logParts.push(`Response keys: ${Object.keys(data).join(", ")}`);
+                    }
+                  } catch {
+                    if (rptBody.includes(",") && rptBody.includes("\n") && !rptBody.includes("<!DOCTYPE")) {
+                      csvContent = rptBody;
+                      rowCount = rptBody.split("\n").length - 1;
+                      logParts.push(`✅ Demographics (CSV from report): ${rowCount} rows`);
+                      found = true;
+                    }
+                  }
                 }
+              } catch (err: any) {
+                logParts.push(`ExportPatientReports error: ${err.message}`);
+              }
+            }
+
+            // Attempt 3: JSON endpoint (partial data but reliable)
+            if (!found) {
+              logParts.push(`Attempt 3: JSON fallback /Patient/Patient/GetAllPatientForLocalStorage...`);
+              try {
+                const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
+                logParts.push(`JSON endpoint: type=${contentType} length=${body.length}`);
+                if (contentType.includes("application/json") && body.length > 10) {
+                  const parsed = JSON.parse(body);
+                  const patients = parsed.PatientData || parsed;
+                  if (Array.isArray(patients) && patients.length > 0) {
+                    const expanded = patients.map((p: any) => ({
+                      PatientID: p.I || "", FirstName: p.F || "", LastName: p.L || "",
+                      DateOfBirth: p.DOB || "", HomePhone: p.HP || "", MobilePhone: p.MP || "",
+                      Email: p.E || "",
+                    }));
+                    csvContent = jsonToCsv(expanded);
+                    rowCount = expanded.length;
+                    logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients (partial fields)`);
+                  }
+                }
+              } catch (err: any) {
+                logParts.push(`JSON fallback error: ${err.message}`);
               }
             }
             break;
@@ -574,54 +522,84 @@ Deno.serve(async (req) => {
 
           // ==================== APPOINTMENTS ====================
           case "appointments": {
-            // Use the export endpoint with date range
+            // Discovery found: form #exportPatientAppntList POSTs to /User/Scheduler/ExportAppointmentReport
+            // Hidden fields: ReportType, DateFrom, DateTo, PhysicianId, AppointmentTypeId, LocationId
             const fromDate = dateFrom || "08/10/2021";
             const toDate = dateTo || new Date().toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
 
             logParts.push(`Date range: ${fromDate} to ${toDate}`);
 
-            // First get physicians for the report
-            const { body: physBody } = await ajaxFetch("/User/Scheduler/GetPhysiciansForRunReport");
+            // Get physicians list to include all providers
             let physicianId = "";
             try {
+              const { body: physBody } = await ajaxFetch("/User/Scheduler/GetPhysiciansForRunReport");
               const physicians = JSON.parse(physBody);
               if (Array.isArray(physicians) && physicians.length > 0) {
-                physicianId = physicians[0].Value || physicians[0].Id || physicians[0].value || "";
-                logParts.push(`Using physician: ${JSON.stringify(physicians[0])}`);
+                physicianId = physicians.map((p: any) => p.Value || p.Id || "").filter(Boolean).join(",");
+                logParts.push(`Physicians found: ${physicians.length} (IDs: ${physicianId})`);
               }
-            } catch { /* ignore parse errors */ }
+            } catch { /* ignore */ }
 
-            // Try ExportAppointmentReport
-            const params = new URLSearchParams({
-              fromDate,
-              toDate,
-              physicianId: physicianId || "0",
-              reportType: "CompletedVisits",
+            // Get appointment types
+            let appointmentTypeId = "";
+            try {
+              const { body: atBody } = await ajaxFetch("/User/Scheduler/GetAppointmentTypes");
+              const types = JSON.parse(atBody);
+              if (Array.isArray(types) && types.length > 0) {
+                logParts.push(`Appointment types: ${types.length}`);
+              }
+            } catch { /* ignore */ }
+
+            // Attempt 1: POST form to ExportAppointmentReport (matching the discovered form)
+            const formParams = new URLSearchParams({
+              ReportType: "CompletedVisits",
+              DateFrom: fromDate,
+              DateTo: toDate,
+              PhysicianId: physicianId || "0",
+              AppointmentTypeId: appointmentTypeId,
+              LocationId: "",
             });
 
-            const exportRes = await ajaxFetch(`/User/Scheduler/ExportAppointmentReport?${params.toString()}`);
-            logParts.push(`ExportAppointmentReport: status=${exportRes.status} type=${exportRes.contentType} length=${exportRes.body.length}`);
+            logParts.push(`Attempt 1: POST /User/Scheduler/ExportAppointmentReport (form submit)...`);
+            try {
+              const { response: expRes, body: expBody } = await fetchWithCookies(
+                `${BASE_URL}/User/Scheduler/ExportAppointmentReport`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                  body: formParams.toString(),
+                }
+              );
+              logParts.push(`Form POST: status=${expRes.status} length=${expBody.length} type=${expRes.headers.get("content-type") || "unknown"}`);
 
-            if (exportRes.body.length > 50 && !exportRes.body.includes("<!DOCTYPE") && !exportRes.body.includes("<html")) {
-              csvContent = exportRes.body;
-              rowCount = csvContent.split("\n").length - 1;
-              logParts.push(`✅ Appointments: ${rowCount} rows`);
-            } else {
-              // Try POST with form data
-              const postRes = await ajaxFetch("/User/Scheduler/ExportAppointmentReport", {
+              if (expBody.length > 50 && !expBody.includes("<!DOCTYPE") && !expBody.includes("<html")) {
+                csvContent = expBody;
+                rowCount = csvContent.split("\n").length - 1;
+                logParts.push(`✅ Appointments: ${rowCount} rows`);
+              } else {
+                logParts.push(`Preview: ${expBody.substring(0, 500)}`);
+              }
+            } catch (err: any) {
+              logParts.push(`Form POST error: ${err.message}`);
+            }
+
+            // Attempt 2: AJAX version
+            if (!csvContent) {
+              logParts.push(`Attempt 2: AJAX /User/Scheduler/ExportAppointmentReport...`);
+              const ajaxRes = await ajaxFetch("/User/Scheduler/ExportAppointmentReport", {
                 method: "POST",
                 headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: params.toString(),
+                body: formParams.toString(),
               });
-              logParts.push(`ExportAppointmentReport (POST): status=${postRes.status} type=${postRes.contentType} length=${postRes.body.length}`);
-              logParts.push(`Response preview: ${postRes.body.substring(0, 500)}`);
+              logParts.push(`AJAX: status=${ajaxRes.status} type=${ajaxRes.contentType} length=${ajaxRes.body.length}`);
 
-              if (postRes.body.length > 50 && !postRes.body.includes("<!DOCTYPE")) {
-                csvContent = postRes.body;
+              if (ajaxRes.body.length > 50 && !ajaxRes.body.includes("<!DOCTYPE")) {
+                csvContent = ajaxRes.body;
                 rowCount = csvContent.split("\n").length - 1;
-                logParts.push(`✅ Appointments (POST): ${rowCount} rows`);
+                logParts.push(`✅ Appointments (AJAX): ${rowCount} rows`);
               } else {
-                logParts.push(`⚠️ Appointments: Could not get export data. Response logged for debugging.`);
+                logParts.push(`Preview: ${ajaxRes.body.substring(0, 500)}`);
+                logParts.push(`⚠️ Appointments: Could not get export data.`);
               }
             }
             break;
@@ -643,6 +621,10 @@ Deno.serve(async (req) => {
 
             for (const patient of patients) {
               if (!patient.id) continue;
+              if (isTimingOut()) {
+                logParts.push(`⏱️ SOAP Notes: Stopped at ${processedCount}/${patients.length} (timeout safety)`);
+                break;
+              }
 
               try {
                 const { status, body: soapBody } = await ajaxFetch(
@@ -658,9 +640,9 @@ Deno.serve(async (req) => {
               }
 
               processedCount++;
-              if (processedCount % 50 === 0) {
+              if (processedCount % 20 === 0) {
                 const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
-                await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + newProgress, 99) }).eq("id", job.id);
+                await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + newProgress, 99), log_output: logParts.join("\n") }).eq("id", job.id);
               }
 
               await new Promise(r => setTimeout(r, 300));
@@ -692,6 +674,10 @@ Deno.serve(async (req) => {
 
             for (const patient of patients) {
               if (!patient.id) continue;
+              if (isTimingOut()) {
+                logParts.push(`⏱️ Financials: Stopped at ${processedCount}/${patients.length} (timeout safety)`);
+                break;
+              }
 
               try {
                 await ajaxFetch(`/Patient/Patient/SetVisitIdInSession?patientId=${patient.id}`, { method: "POST" });
@@ -729,9 +715,9 @@ Deno.serve(async (req) => {
               }
 
               processedCount++;
-              if (processedCount % 50 === 0) {
+              if (processedCount % 20 === 0) {
                 const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
-                await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + newProgress, 99) }).eq("id", job.id);
+                await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + newProgress, 99), log_output: logParts.join("\n") }).eq("id", job.id);
               }
 
               await new Promise(r => setTimeout(r, 300));
