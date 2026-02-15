@@ -631,7 +631,53 @@ Deno.serve(async (req) => {
     async function getAllPatientIds(): Promise<{ id: number; firstName: string; lastName: string }[]> {
       if (_cachedPatients) return _cachedPatients;
 
-      // Method 1: JSON endpoint (fast, but may return subset)
+      // Step 1: Load Scheduler page to get tokens and multiselect values
+      const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
+      const token = schedHtml.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/)?.[1] || "";
+      setPracticeId(schedHtml);
+
+      // Extract PatientStatus multiselect options
+      const statusSelectMatch = schedHtml.match(/<select[^>]*id="patientReportPatientStatusMultiSelect"[^>]*>([\s\S]*?)<\/select>/i);
+      const statusOpts: string[] = [];
+      if (statusSelectMatch) {
+        const optRegex = /<option[^>]*value="([^"]*)"[^>]*>/gi;
+        let om;
+        while ((om = optRegex.exec(statusSelectMatch[1])) !== null) {
+          if (om[1]) statusOpts.push(om[1]);
+        }
+      }
+      const allStatusValues = statusOpts.join("^") || "1^2^3";
+
+      // Step 2: Call GetPatientReports (same approach that got 2321 demographics)
+      const reportRes = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+        body: new URLSearchParams({
+          ReportType: "1",
+          BirthMonths: "",
+          PatientStatus: allStatusValues,
+          PatientInsurance: "",
+        }).toString(),
+      });
+
+      if (reportRes.status === 200 && reportRes.body.length > 100) {
+        try {
+          const reportData = JSON.parse(reportRes.body);
+          const items = reportData.Data || reportData.data || (Array.isArray(reportData) ? reportData : null);
+          if (items && Array.isArray(items) && items.length > 0) {
+            _cachedPatients = items.map((p: any) => ({
+              id: p.PkPatientId || p.PatientId || p.Id || p.I,
+              firstName: p.FirstName || p.F || "",
+              lastName: p.LastName || p.L || "",
+            }));
+            logParts.push(`✅ Patient list: ${_cachedPatients!.length} patients from GetPatientReports`);
+            return _cachedPatients!;
+          }
+        } catch { /* not JSON */ }
+      }
+
+      // Fallback: JSON endpoint (returns limited set)
+      logParts.push(`GetPatientReports failed (status=${reportRes.status} len=${reportRes.body.length}), falling back to JSON endpoint`);
       const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
       if (contentType.includes("application/json")) {
         try {
@@ -643,69 +689,7 @@ Deno.serve(async (req) => {
               firstName: p.F || "",
               lastName: p.L || "",
             }));
-            logParts.push(`Patient list: ${_cachedPatients!.length} patients from JSON endpoint`);
-
-            // Method 2: If JSON only returned a few, try paginating the Patient Report HTML
-            if (_cachedPatients!.length < 50) {
-              logParts.push(`Only ${_cachedPatients!.length} from JSON, trying Patient Report pagination...`);
-              const allFromReport: { id: number; firstName: string; lastName: string }[] = [];
-              let page = 1;
-              let hasMore = true;
-
-              while (hasMore && page <= 200) {
-                const { body: reportHtml, status } = await ajaxFetch(
-                  `/User/Scheduler/GetPatientReportData?reportType=PatientList&patientStatus=All&page=${page}&pageSize=100`,
-                );
-                logParts.push(`Report page ${page}: status=${status} length=${reportHtml.length}`);
-
-                if (status !== 200 || reportHtml.length < 50) {
-                  hasMore = false;
-                  break;
-                }
-
-                // Try to parse as JSON (may return patient array with IDs)
-                try {
-                  const reportData = JSON.parse(reportHtml);
-                  const items = reportData.Data || reportData.data || reportData;
-                  if (Array.isArray(items) && items.length > 0) {
-                    for (const item of items) {
-                      const pid = item.PatientId || item.PkPatientId || item.Id || item.I;
-                      if (pid) {
-                        allFromReport.push({
-                          id: pid,
-                          firstName: item.FirstName || item.F || "",
-                          lastName: item.LastName || item.L || "",
-                        });
-                      }
-                    }
-                    if (items.length < 100) hasMore = false;
-                  } else {
-                    hasMore = false;
-                  }
-                } catch {
-                  // If HTML, try extracting patient IDs from links
-                  const linkRegex = /patientId[=:](\d+)/gi;
-                  let linkMatch;
-                  const foundIds = new Set<number>();
-                  while ((linkMatch = linkRegex.exec(reportHtml)) !== null) {
-                    const pid = parseInt(linkMatch[1]);
-                    if (pid && !foundIds.has(pid)) {
-                      foundIds.add(pid);
-                      allFromReport.push({ id: pid, firstName: "", lastName: "" });
-                    }
-                  }
-                  if (foundIds.size === 0) hasMore = false;
-                }
-                page++;
-                await new Promise(r => setTimeout(r, 300));
-              }
-
-              if (allFromReport.length > _cachedPatients!.length) {
-                _cachedPatients = allFromReport;
-                logParts.push(`✅ Patient list expanded to ${_cachedPatients!.length} via report pagination`);
-              }
-            }
-
+            logParts.push(`Patient list (fallback): ${_cachedPatients!.length} patients from JSON`);
             return _cachedPatients!;
           }
         } catch { /* ignore */ }
@@ -1176,7 +1160,8 @@ Deno.serve(async (req) => {
               }
 
               try {
-                // 1. Set patient in session
+                // 1. Navigate to patient page to set them in session
+                await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patient.id}`);
                 await ajaxFetch(`/Patient/Patient/SetVisitIdInSession?patientId=${patient.id}`, { method: "POST" });
 
                 // 2. Get file list from blob storage
