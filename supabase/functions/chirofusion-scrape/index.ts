@@ -1343,7 +1343,7 @@ Deno.serve(async (req) => {
                 const fileName = `${patient.lastName}${by2}`.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 
                 // 2. Set patient context then get file list
-                await ajaxFetch("/Patient/Patient/GetFileCategory", {
+                const catRes = await ajaxFetch("/Patient/Patient/GetFileCategory", {
                   method: "GET",
                   headers: {
                     "Referer": `${BASE_URL}/Patient`,
@@ -1352,6 +1352,21 @@ Deno.serve(async (req) => {
                   },
                 });
 
+                // Debug: log first 5 non-default patients fully
+                const isDebugPatient = processedCount < 5 && !allDefault;
+                if (isDebugPatient) {
+                  logParts.push(`🔍 DEBUG ${patient.firstName} ${patient.lastName} (id=${patientId}):`);
+                  logParts.push(`  GetFileCategory status=${catRes.status} body=${catRes.body.substring(0, 500)}`);
+                }
+
+                // Parse categories to get IDs
+                let categories: any[] = [];
+                try {
+                  const catParsed = JSON.parse(catRes.body);
+                  categories = Array.isArray(catParsed) ? catParsed : (catParsed.Data || catParsed.data || []);
+                } catch { /* ignore */ }
+
+                // Try with fileCategoryId=0 (all categories) first
                 const filesRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
                   method: "POST",
                   headers: {
@@ -1364,16 +1379,46 @@ Deno.serve(async (req) => {
                     sort: "", group: "", filter: "",
                     patientId: String(patientId),
                     practiceId: _practiceId,
+                    fileCategoryId: "0",
                   }).toString(),
                 });
 
-                // Debug: log first 10 non-default patients' GetFilesFromBlob responses
-                const isDebugPatient = (withFiles + searchFailed) < 10 && !allDefault;
                 if (isDebugPatient) {
-                  logParts.push(`🔍 ${patient.firstName} ${patient.lastName} (id=${patientId}): GetFilesFromBlob status=${filesRes.status} len=${filesRes.body.length}`);
-                  if (filesRes.body.length > 0 && filesRes.body.length < 2000) {
-                    logParts.push(`  Response: ${filesRes.body.substring(0, 1000)}`);
-                  }
+                  logParts.push(`  GetFilesFromBlob(catId=0) status=${filesRes.status} body=${filesRes.body.substring(0, 500)}`);
+                  // Also try without fileCategoryId to compare
+                  const filesRes2 = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json; charset=UTF-8",
+                      "Referer": `${BASE_URL}/Patient`,
+                      "ClientPatientId": String(patientId),
+                      ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                    },
+                    body: JSON.stringify({
+                      sort: "", group: "", filter: "",
+                      patientId: Number(patientId),
+                      practiceId: Number(_practiceId),
+                      fileCategoryId: 0,
+                    }),
+                  });
+                  logParts.push(`  GetFilesFromBlob(JSON) status=${filesRes2.status} body=${filesRes2.body.substring(0, 500)}`);
+                  // Try the Kendo grid format
+                  const filesRes3 = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                      "Referer": `${BASE_URL}/Patient`,
+                      "ClientPatientId": String(patientId),
+                      ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                    },
+                    body: new URLSearchParams({
+                      take: "100", skip: "0", page: "1", pageSize: "100",
+                      sort: "", group: "", filter: "",
+                      patientId: String(patientId),
+                      practiceId: _practiceId,
+                    }).toString(),
+                  });
+                  logParts.push(`  GetFilesFromBlob(Kendo) status=${filesRes3.status} body=${filesRes3.body.substring(0, 500)}`);
                 }
 
                 if (filesRes.status !== 200 || filesRes.body.length < 10) {
