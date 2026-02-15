@@ -177,6 +177,126 @@ function parseLedgerHtml(html: string): Record<string, string>[] {
   return rows;
 }
 
+/** Generate a simple text-based PDF from lines of text. Returns raw PDF bytes. */
+function generateTextPdf(title: string, lines: string[]): Uint8Array {
+  const escPdf = (s: string) => s.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+  const LINES_PER_PAGE = 48;
+  const LINE_HEIGHT = 13;
+  const TITLE_HEIGHT = 18;
+  const PAGE_WIDTH = 612;
+  const PAGE_HEIGHT = 792;
+  const MARGIN_LEFT = 50;
+  const MARGIN_TOP = 740;
+
+  // Split into pages
+  const allLines = [title, "", ...lines];
+  const pageGroups: string[][] = [];
+  for (let i = 0; i < allLines.length; i += LINES_PER_PAGE) {
+    pageGroups.push(allLines.slice(i, i + LINES_PER_PAGE));
+  }
+  if (pageGroups.length === 0) pageGroups.push([title]);
+
+  // Build PDF content
+  const parts: string[] = [];
+  const offsets: number[] = [0]; // 0-index unused (PDF objects are 1-based)
+  let pos = 0;
+
+  function write(s: string) { parts.push(s); pos += s.length; }
+  function startObj(n: number) { offsets[n] = pos; write(`${n} 0 obj\n`); }
+  function endObj() { write("endobj\n\n"); }
+
+  write("%PDF-1.4\n");
+
+  // Obj 1: Catalog
+  startObj(1);
+  write("<< /Type /Catalog /Pages 2 0 R >>\n");
+  endObj();
+
+  // Obj 2: Pages (placeholder — we'll reference page objects)
+  const numPages = pageGroups.length;
+  // Font objects: 3 = Helvetica, 4 = Helvetica-Bold
+  // Page objects start at 5, content objects interleaved
+  // Page i -> obj (5 + i*2), Content i -> obj (5 + i*2 + 1) ... wait, let me just pre-compute
+
+  // Reserve obj 2 for pages, obj 3 for font, obj 4 for bold font
+  // Then pages at 5,7,9,... and contents at 6,8,10,...
+  const pageObjNums: number[] = [];
+  const contentObjNums: number[] = [];
+  for (let p = 0; p < numPages; p++) {
+    pageObjNums.push(5 + p * 2);
+    contentObjNums.push(6 + p * 2);
+  }
+  const totalObjs = 5 + numPages * 2;
+
+  // Obj 2: Pages
+  startObj(2);
+  const kids = pageObjNums.map(n => `${n} 0 R`).join(" ");
+  write(`<< /Type /Pages /Kids [${kids}] /Count ${numPages} >>\n`);
+  endObj();
+
+  // Obj 3: Font (Helvetica)
+  startObj(3);
+  write("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\n");
+  endObj();
+
+  // Obj 4: Font (Helvetica-Bold)
+  startObj(4);
+  write("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\n");
+  endObj();
+
+  // Pages and content streams
+  for (let p = 0; p < numPages; p++) {
+    const pageLines = pageGroups[p];
+
+    // Build content stream
+    let stream = "BT\n";
+    let y = MARGIN_TOP;
+    for (let l = 0; l < pageLines.length; l++) {
+      const line = pageLines[l];
+      const isTitle = (p === 0 && l === 0);
+      if (isTitle) {
+        stream += `/F2 14 Tf\n`;
+        stream += `${MARGIN_LEFT} ${y} Td\n`;
+        stream += `(${escPdf(line)}) Tj\n`;
+        y -= TITLE_HEIGHT;
+      } else {
+        stream += `/F1 9 Tf\n`;
+        stream += `${MARGIN_LEFT} ${y} Td\n`;
+        stream += `(${escPdf(line)}) Tj\n`;
+        y -= LINE_HEIGHT;
+      }
+    }
+    stream += "ET\n";
+
+    // Content object
+    startObj(contentObjNums[p]);
+    write(`<< /Length ${stream.length} >>\nstream\n${stream}endstream\n`);
+    endObj();
+
+    // Page object
+    startObj(pageObjNums[p]);
+    write(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PAGE_WIDTH} ${PAGE_HEIGHT}] /Contents ${contentObjNums[p]} 0 R /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> >>\n`);
+    endObj();
+  }
+
+  // Cross-reference table
+  const xrefPos = pos;
+  write("xref\n");
+  write(`0 ${totalObjs}\n`);
+  write("0000000000 65535 f \n");
+  for (let i = 1; i < totalObjs; i++) {
+    write(`${String(offsets[i] || 0).padStart(10, '0')} 00000 n \n`);
+  }
+
+  write("trailer\n");
+  write(`<< /Size ${totalObjs} /Root 1 0 R >>\n`);
+  write("startxref\n");
+  write(`${xrefPos}\n`);
+  write("%%EOF\n");
+
+  return new TextEncoder().encode(parts.join(""));
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
@@ -272,6 +392,7 @@ Deno.serve(async (req) => {
           soapIndex,
           collectedSheets,
           financialsLedgerRows: batchState.financialsLedgerRows || [],
+          appointmentsIndex: batchState.appointmentsIndex || [],
         },
       }).eq("id", job.id);
 
@@ -792,6 +913,7 @@ Deno.serve(async (req) => {
     const collectedSheets: { type: string; csv: string }[] = dbBatchState.collectedSheets || [];
     const soapIndex: { PatientName: string; Documents: number; PDFLink: string; Status: string }[] = dbBatchState.soapIndex || [];
     const financialsLedgerRows: Record<string, string>[] = dbBatchState.financialsLedgerRows || [];
+    const appointmentsIndex: { PatientName: string; Appointments: number; PDFLink: string; Status: string }[] = dbBatchState.appointmentsIndex || [];
 
     // Shared: get full patient list with IDs for per-patient scraping
     // Caches result so it's only fetched once even if multiple data types need it
@@ -1234,7 +1356,7 @@ Deno.serve(async (req) => {
           case "appointments": {
             // Based on browser cURL: POST to /Scheduler/Scheduler/GetAppointmentReport
             // ReportType=1204 (Appointment Hx), IsAllPatient=true, with __RequestVerificationToken
-            const fromDate = dateFrom || "08/10/2021";
+            const fromDate = dateFrom || "08/01/2021";
             const toDate = dateTo || new Date().toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
 
             logParts.push(`Date range: ${fromDate} to ${toDate}`);
@@ -1261,6 +1383,7 @@ Deno.serve(async (req) => {
 
             logParts.push(`Step 2: GetAppointmentReport (ReportType=1204, IsAllPatient=true)...`);
             let apptFound = false;
+            let apptItems: Record<string, unknown>[] = [];
 
             try {
               const triggerRes = await ajaxFetch("/Scheduler/Scheduler/GetAppointmentReport", {
@@ -1272,7 +1395,6 @@ Deno.serve(async (req) => {
               });
               logParts.push(`Trigger: status=${triggerRes.status} len=${triggerRes.body.length} type=${triggerRes.contentType}`);
 
-              // Check if the response itself contains the data (JSON array)
               if (triggerRes.status === 200 && triggerRes.body.length > 100) {
                 if (triggerRes.body.length < 2000) {
                   logParts.push(`  Body: ${triggerRes.body}`);
@@ -1284,9 +1406,8 @@ Deno.serve(async (req) => {
                   const triggerData = JSON.parse(triggerRes.body);
                   const items = triggerData.Data || triggerData.data || (Array.isArray(triggerData) ? triggerData : null);
                   if (items && Array.isArray(items) && items.length > 0) {
-                    csvContent = jsonToCsv(items);
-                    rowCount = items.length;
-                    logParts.push(`✅ Appointments from direct response: ${rowCount} rows`);
+                    apptItems = items;
+                    logParts.push(`✅ Appointments from direct response: ${apptItems.length} rows`);
                     apptFound = true;
                   }
                 } catch { /* not JSON, try export */ }
@@ -1320,11 +1441,14 @@ Deno.serve(async (req) => {
                   logParts.push(`  status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
 
                   if (expRes.status === 200 && expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE") && !expRes.body.includes("<html")) {
-                    csvContent = expRes.body;
-                    rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
-                    logParts.push(`✅ Appointments export: ${rowCount} rows (attempt ${attempt})`);
-                    apptFound = true;
-                    break;
+                    // Parse the CSV export into JSON items
+                    const exportItems = csvToJson(expRes.body);
+                    if (exportItems.length > 0) {
+                      apptItems = exportItems;
+                      logParts.push(`✅ Appointments export: ${apptItems.length} rows (attempt ${attempt})`);
+                      apptFound = true;
+                      break;
+                    }
                   }
 
                   if (expRes.body.length > 0 && expRes.body.length < 1000) {
@@ -1336,9 +1460,182 @@ Deno.serve(async (req) => {
               }
             }
 
-            if (!apptFound) {
+            if (!apptFound || apptItems.length === 0) {
               logParts.push(`⚠️ Appointments: No data retrieved after all attempts`);
+              break;
             }
+
+            // Step 4: Clean .NET dates in all rows
+            for (const row of apptItems) {
+              for (const key of Object.keys(row)) {
+                if (typeof row[key] === "string" && (row[key] as string).includes("/Date(")) {
+                  row[key] = parseNetDate(row[key] as string);
+                }
+              }
+            }
+
+            // Step 5: Detect field names for sorting (handle various naming conventions)
+            const sampleKeys = Object.keys(apptItems[0]);
+            logParts.push(`Appointment fields: ${sampleKeys.join(", ")}`);
+
+            // Find patient name field(s)
+            const patientNameKey = sampleKeys.find(k => /^(PatientName|Patient_Name|Patient|FullName|Name)$/i.test(k));
+            const lastNameKey = sampleKeys.find(k => /^(LastName|Last_Name|PatientLastName)$/i.test(k));
+            const firstNameKey = sampleKeys.find(k => /^(FirstName|First_Name|PatientFirstName)$/i.test(k));
+            // Date field
+            const dateKey = sampleKeys.find(k => /^(AppointmentDate|Date|ApptDate|VisitDate|Appointment_Date|ServiceDate)$/i.test(k));
+            // Appt type field
+            const typeKey = sampleKeys.find(k => /^(AppointmentType|Appt_Type|ApptType|Type|AppointmentTypeName|VisitType)$/i.test(k));
+            // Check-in field
+            const checkinKey = sampleKeys.find(k => /^(CheckedIn|Checked_In|IsCheckedIn|CheckIn|Status|AppointmentStatus|Appt_Status)$/i.test(k));
+
+            logParts.push(`Field mapping: name=${patientNameKey || `${lastNameKey}+${firstNameKey}`} date=${dateKey} type=${typeKey} checkin=${checkinKey}`);
+
+            // Helper to get patient display name from a row
+            function getPatientName(row: Record<string, unknown>): string {
+              if (patientNameKey && row[patientNameKey]) return String(row[patientNameKey]);
+              const ln = lastNameKey ? String(row[lastNameKey] || "") : "";
+              const fn = firstNameKey ? String(row[firstNameKey] || "") : "";
+              if (ln || fn) return `${ln}, ${fn}`.replace(/^, |, $/g, "");
+              return "Unknown";
+            }
+
+            // Step 6: Sort by patient name → date → appointment type
+            apptItems.sort((a, b) => {
+              const nameA = getPatientName(a).toLowerCase();
+              const nameB = getPatientName(b).toLowerCase();
+              if (nameA !== nameB) return nameA < nameB ? -1 : 1;
+
+              // Sort by date chronologically
+              if (dateKey) {
+                const dA = new Date(String(a[dateKey] || "")).getTime() || 0;
+                const dB = new Date(String(b[dateKey] || "")).getTime() || 0;
+                if (dA !== dB) return dA - dB;
+              }
+
+              // Sort by appointment type
+              if (typeKey) {
+                const tA = String(a[typeKey] || "").toLowerCase();
+                const tB = String(b[typeKey] || "").toLowerCase();
+                if (tA !== tB) return tA < tB ? -1 : 1;
+              }
+
+              return 0;
+            });
+
+            logParts.push(`Sorted ${apptItems.length} appointments by patient name → date → type`);
+
+            // Step 7: Save sorted appointments as the main sheet CSV
+            csvContent = jsonToCsv(apptItems);
+            rowCount = apptItems.length;
+
+            // Step 8: Group by patient and generate per-patient PDF summaries
+            const patientGroups = new Map<string, Record<string, unknown>[]>();
+            for (const item of apptItems) {
+              const name = getPatientName(item);
+              if (!patientGroups.has(name)) patientGroups.set(name, []);
+              patientGroups.get(name)!.push(item);
+            }
+
+            logParts.push(`Generating PDF summaries for ${patientGroups.size} patients...`);
+
+            // Check if we're resuming PDF generation from a previous batch
+            const apptBs = _batchState || {};
+            let apptPdfIndex = apptBs.dataTypeIndex === dataTypes.indexOf(dataType) ? (apptBs.apptPdfResumeIndex || 0) : 0;
+            let apptPdfCount = apptBs.apptPdfCount || 0;
+            const patientNames = [...patientGroups.keys()];
+
+            if (apptPdfIndex > 0) {
+              logParts.push(`🔄 Resuming PDF generation from patient ${apptPdfIndex}/${patientNames.length}`);
+            }
+
+            for (let pi = apptPdfIndex; pi < patientNames.length; pi++) {
+              if (isTimingOut()) {
+                // Save state and self-invoke
+                await selfInvoke({
+                  resumeIndex: 0,
+                  dataTypeIndex: dataTypes.indexOf(dataType),
+                  apptPdfResumeIndex: pi,
+                  apptPdfCount,
+                  appointmentsIndex,
+                });
+                return new Response(JSON.stringify({ success: true, jobId: job.id, batching: true }), {
+                  headers: { ...corsHeaders, "Content-Type": "application/json" },
+                });
+              }
+
+              const pName = patientNames[pi];
+              const pAppts = patientGroups.get(pName)!;
+
+              try {
+                // Build PDF lines for this patient
+                const pdfLines: string[] = [];
+                pdfLines.push(`Total Appointments: ${pAppts.length}`);
+                pdfLines.push(`Date Range: ${fromDate} — ${toDate}`);
+                pdfLines.push("");
+                pdfLines.push("─".repeat(70));
+
+                for (const appt of pAppts) {
+                  const apptDate = dateKey ? String(appt[dateKey] || "") : "";
+                  const apptType = typeKey ? String(appt[typeKey] || "") : "";
+                  const checkedIn = checkinKey ? String(appt[checkinKey] || "") : "";
+                  
+                  let line = apptDate;
+                  if (apptType) line += `  |  ${apptType}`;
+                  if (checkedIn) line += `  |  Check-in: ${checkedIn}`;
+                  
+                  // Add any other visible fields
+                  const providerKey = sampleKeys.find(k => /^(Provider|Doctor|Physician|ProviderName)$/i.test(k));
+                  if (providerKey && appt[providerKey]) line += `  |  ${appt[providerKey]}`;
+                  
+                  const locationKey = sampleKeys.find(k => /^(Location|Office|LocationName)$/i.test(k));
+                  if (locationKey && appt[locationKey]) line += `  |  ${appt[locationKey]}`;
+
+                  pdfLines.push(line);
+                }
+
+                // Generate PDF
+                const safeName = pName.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
+                const pdfBytes = generateTextPdf(`Appointment Summary — ${pName}`, pdfLines);
+                const filePath = `${userId}/appointment_summaries/${safeName}_${Date.now()}.pdf`;
+
+                const pdfBlob = new Blob([pdfBytes], { type: "application/pdf" });
+                const { error: uploadError } = await serviceClient.storage
+                  .from("scraped-data")
+                  .upload(filePath, pdfBlob, { contentType: "application/pdf" });
+
+                if (uploadError) {
+                  logParts.push(`❌ PDF upload error ${pName}: ${uploadError.message}`);
+                  appointmentsIndex.push({ PatientName: pName, Appointments: pAppts.length, PDFLink: "", Status: "Upload error" });
+                } else {
+                  const { data: signedUrlData } = await serviceClient.storage
+                    .from("scraped-data")
+                    .createSignedUrl(filePath, 2592000); // 30 days
+                  appointmentsIndex.push({
+                    PatientName: pName,
+                    Appointments: pAppts.length,
+                    PDFLink: signedUrlData?.signedUrl || filePath,
+                    Status: "✅ Generated",
+                  });
+                  apptPdfCount++;
+                }
+              } catch (err: any) {
+                logParts.push(`❌ PDF ${pName}: ${err.message}`);
+                appointmentsIndex.push({ PatientName: pName, Appointments: pAppts.length, PDFLink: "", Status: "Error" });
+              }
+
+              if ((pi + 1) % 100 === 0) {
+                logParts.push(`Appt PDF progress: ${pi + 1}/${patientNames.length} (${apptPdfCount} PDFs)`);
+                await serviceClient.from("scrape_jobs").update({
+                  progress: Math.min(progress + Math.round(((pi + 1) / patientNames.length) * (100 / totalTypes)), 99),
+                  log_output: logParts.join("\n"),
+                }).eq("id", job.id);
+              }
+
+              await new Promise(r => setTimeout(r, 50));
+            }
+
+            logParts.push(`✅ Appointments complete: ${apptItems.length} rows sorted, ${apptPdfCount} PDF summaries from ${patientGroups.size} patients`);
             break;
           }
 
@@ -1891,6 +2188,37 @@ Deno.serve(async (req) => {
       ];
       
       XLSX.utils.book_append_sheet(wb, ws, "SOAP Notes Index");
+    }
+
+    // Add Appointments Index sheet with PDF summary links
+    if (appointmentsIndex.length > 0) {
+      const apptSheetData = appointmentsIndex.map(row => ({
+        PatientName: row.PatientName,
+        Appointments: row.Appointments,
+        Status: row.Status,
+        PDFLink: row.PDFLink || "",
+      }));
+      const apptWs = XLSX.utils.json_to_sheet(apptSheetData);
+      
+      for (let r = 0; r < appointmentsIndex.length; r++) {
+        const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: 3 });
+        if (appointmentsIndex[r].PDFLink) {
+          apptWs[cellRef] = {
+            t: "s",
+            v: "📎 Open PDF",
+            l: { Target: appointmentsIndex[r].PDFLink },
+          };
+        }
+      }
+      
+      apptWs["!cols"] = [
+        { wch: 30 },
+        { wch: 14 },
+        { wch: 18 },
+        { wch: 15 },
+      ];
+      
+      XLSX.utils.book_append_sheet(wb, apptWs, "Appointments Index");
     }
 
     if (wb.SheetNames.length > 0) {
