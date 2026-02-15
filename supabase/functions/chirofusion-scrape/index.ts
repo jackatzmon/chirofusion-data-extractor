@@ -544,71 +544,67 @@ Deno.serve(async (req) => {
                   isOverrideDate: "false",
                 };
 
-                // Step 2a: Try GetPatientReports with multiple content types
+                // Step 2a: TRIGGER report generation by calling GetPatientReports
+                // This endpoint returns empty (length=0) as acknowledgment that generation started
                 const endpoint = "/User/Scheduler/GetPatientReports";
+                logParts.push(`Step 2a: Triggering report generation...`);
                 
-                // Try 1: JSON body (Kendo DataSource commonly uses JSON)
+                // Fire the trigger with multiple param formats to maximize chances
+                // Format 1: URL-encoded with token in body
                 try {
-                  const jsonBody = JSON.stringify({
+                  const triggerParams = new URLSearchParams({
                     ...reportParams,
-                    take: 5000,
-                    skip: 0,
-                    page: 1,
-                    pageSize: 5000,
+                    __RequestVerificationToken: schedToken,
+                    take: "5000", skip: "0", page: "1", pageSize: "5000",
                   });
                   const runRes = await ajaxFetch(endpoint, {
                     method: "POST",
                     headers: {
-                      "Content-Type": "application/json",
+                      "Content-Type": "application/x-www-form-urlencoded",
                       "RequestVerificationToken": schedToken,
                     },
-                    body: jsonBody,
+                    body: triggerParams.toString(),
                   });
-                  logParts.push(`${endpoint} (JSON body): status=${runRes.status} length=${runRes.body.length}`);
+                  logParts.push(`Trigger (form): status=${runRes.status} length=${runRes.body.length}`);
                   if (runRes.body.length > 10) {
                     logParts.push(`  Preview: ${runRes.body.substring(0, 400)}`);
-                    if (runRes.status === 200 && runRes.contentType.includes("json")) {
-                      const data = JSON.parse(runRes.body);
-                      const items = data.Data || data.data || data.Items || data.Result || (Array.isArray(data) ? data : null);
-                      if (items && Array.isArray(items) && items.length > 0) {
-                        csvContent = jsonToCsv(items);
-                        rowCount = items.length;
-                        logParts.push(`  ✅ Demographics: ${rowCount} patients`);
-                        found = true;
-                      } else if (data.Total) {
-                        logParts.push(`  Total=${data.Total}, keys: ${Object.keys(data).join(",")}`);
-                      }
+                    // If it actually returned data directly, use it
+                    if (runRes.status === 200 && runRes.body.length > 50 && runRes.contentType.includes("json")) {
+                      try {
+                        const data = JSON.parse(runRes.body);
+                        const items = data.Data || data.data || data.Items || data.Result || (Array.isArray(data) ? data : null);
+                        if (items && Array.isArray(items) && items.length > 0) {
+                          csvContent = jsonToCsv(items);
+                          rowCount = items.length;
+                          logParts.push(`  ✅ Demographics direct: ${rowCount} patients`);
+                          found = true;
+                        }
+                      } catch { /* not JSON array */ }
                     }
                   }
-                } catch (e: any) { logParts.push(`JSON body error: ${e.message}`); }
+                } catch (e: any) { logParts.push(`Trigger error: ${e.message}`); }
 
-                // Try 2: URL-encoded with token in body + Kendo params
+                // Format 2: JSON body
                 if (!found) {
                   try {
-                    const formParams = new URLSearchParams({
+                    const jsonBody = JSON.stringify({
                       ...reportParams,
-                      __RequestVerificationToken: schedToken,
-                      take: "5000",
-                      skip: "0",
-                      page: "1",
-                      pageSize: "5000",
+                      take: 5000, skip: 0, page: 1, pageSize: 5000,
                     });
                     const runRes = await ajaxFetch(endpoint, {
                       method: "POST",
                       headers: {
-                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Content-Type": "application/json",
                         "RequestVerificationToken": schedToken,
                       },
-                      body: formParams.toString(),
+                      body: jsonBody,
                     });
-                    logParts.push(`${endpoint} (form+token): status=${runRes.status} length=${runRes.body.length}`);
-                    if (runRes.body.length > 10) {
-                      logParts.push(`  Preview: ${runRes.body.substring(0, 400)}`);
-                    }
-                  } catch (e: any) { logParts.push(`form+token error: ${e.message}`); }
+                    logParts.push(`Trigger (JSON): status=${runRes.status} length=${runRes.body.length}`);
+                    if (runRes.body.length > 10) logParts.push(`  Preview: ${runRes.body.substring(0, 400)}`);
+                  } catch (e: any) { logParts.push(`JSON trigger error: ${e.message}`); }
                 }
 
-                // Try 3: Any discovered URLs from the page JS
+                // Try any discovered URLs from page JS
                 for (const discUrl of uniqueDiscovered) {
                   if (found) break;
                   try {
@@ -641,22 +637,25 @@ Deno.serve(async (req) => {
                   } catch (e: any) { logParts.push(`${discUrl} error: ${e.message}`); }
                 }
 
-                // Step 2b: Wait for report generation (user says ~3 seconds)
+                // Step 2b: ALWAYS wait for report generation, even if trigger returned empty
                 if (!found) {
-                  logParts.push(`Waiting 4 seconds for report generation...`);
-                  await new Promise(r => setTimeout(r, 4000));
+                  logParts.push(`Step 2b: Waiting 8 seconds for server-side report generation...`);
+                  await new Promise(r => setTimeout(r, 8000));
 
-                  // Step 2c: Now try the Export endpoint (report should be ready)
-                  logParts.push(`Attempting ExportPatientReports after wait...`);
-                  const params = new URLSearchParams(reportParams);
+                  // Step 2c: Now try Export — the report should be ready
+                  logParts.push(`Step 2c: Attempting export after wait...`);
+                  const exportParams = new URLSearchParams({
+                    ...reportParams,
+                    __RequestVerificationToken: schedToken,
+                  });
 
-                  // Form POST (like browser form submit)
+                  // Try form POST (browser-style form submit)
                   const { response: rptRes, body: rptBody } = await fetchWithCookies(
                     `${BASE_URL}/User/Scheduler/ExportPatientReports`,
                     {
                       method: "POST",
                       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                      body: params.toString(),
+                      body: exportParams.toString(),
                     }
                   );
                   const rptCt = rptRes.headers.get("content-type") || "unknown";
@@ -686,7 +685,7 @@ Deno.serve(async (req) => {
                     }
                   }
 
-                  // Also try AJAX version after wait
+                  // Also try AJAX version
                   if (!found) {
                     const ajaxRes = await ajaxFetch("/User/Scheduler/ExportPatientReports", {
                       method: "POST",
@@ -694,9 +693,9 @@ Deno.serve(async (req) => {
                         "Content-Type": "application/x-www-form-urlencoded",
                         "RequestVerificationToken": schedToken,
                       },
-                      body: params.toString(),
+                      body: exportParams.toString(),
                     });
-                    logParts.push(`AJAX Export after wait: status=${ajaxRes.status} length=${ajaxRes.body.length} type=${ajaxRes.contentType}`);
+                    logParts.push(`AJAX Export: status=${ajaxRes.status} length=${ajaxRes.body.length} type=${ajaxRes.contentType}`);
                     if (ajaxRes.body.length > 50 && !ajaxRes.body.includes("<!DOCTYPE")) {
                       logParts.push(`AJAX Preview: ${ajaxRes.body.substring(0, 300)}`);
                       try {
