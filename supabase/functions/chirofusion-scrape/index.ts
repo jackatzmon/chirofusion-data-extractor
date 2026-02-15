@@ -738,23 +738,65 @@ Deno.serve(async (req) => {
       // Step 1: Load home page and scan for "load more" / archive button
       const { body: homeHtml } = await fetchWithCookies(`${BASE_URL}/`);
       if (debugLog) {
-        // Look for the "click here to load more" button/link
-        const loadMoreMatch = homeHtml.match(/click here to load more|load\s*more|LoadMore|loadMore|retrieveArchive|archived/gi);
+        // Look for the "click here to load more" button/link and search-related elements
+        const loadMoreMatch = homeHtml.match(/click here to load more|load\s*more|LoadMore|loadMore|retrieveArchive|archived|clickHereToLoadMore/gi);
         logParts.push(`Home page "load more" references: ${loadMoreMatch ? loadMoreMatch.join(", ") : "none found"}`);
         
-        // Find any onclick handlers or links near "load more"
-        const loadMoreContext = homeHtml.match(/.{0,200}(click here to load more|loadMore|LoadMore).{0,200}/gi);
-        if (loadMoreContext) {
-          for (const ctx of loadMoreContext.slice(0, 3)) {
-            logParts.push(`Load more context: ${ctx.replace(/\s+/g, " ").trim()}`);
+        // Find search input and its autocomplete source
+        const searchInputMatch = homeHtml.match(/<input[^>]*(search|patient|autocomplete)[^>]*>/gi);
+        if (searchInputMatch) {
+          for (const si of searchInputMatch.slice(0, 5)) {
+            logParts.push(`Search input: ${si}`);
           }
         }
-        
-        // Also scan for search-related JS functions
-        const searchFuncMatch = homeHtml.match(/.{0,100}(SearchPatient|searchPatient|patientSearch|GetPatient|getPatient).{0,100}/gi);
-        if (searchFuncMatch) {
-          for (const sf of searchFuncMatch.slice(0, 5)) {
-            logParts.push(`Search func: ${sf.replace(/\s+/g, " ").trim()}`);
+
+        // Find all script src tags to identify JS bundles
+        const scriptSrcs: string[] = [];
+        const scriptRegex = /<script[^>]*src="([^"]+)"[^>]*>/gi;
+        let sm;
+        while ((sm = scriptRegex.exec(homeHtml)) !== null) {
+          scriptSrcs.push(sm[1]);
+        }
+        logParts.push(`Script bundles on home page: ${scriptSrcs.length}`);
+        for (const src of scriptSrcs) {
+          logParts.push(`  Script: ${src}`);
+        }
+
+        // Find inline scripts that mention patient/search
+        const inlineScripts = homeHtml.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
+        for (const scr of inlineScripts) {
+          if (/patient|search|autocomplete|loadMore|ajax.*patient/i.test(scr)) {
+            const relevant = scr.match(/.{0,150}(patient|search|autocomplete|loadMore|ajax).{0,150}/gi);
+            if (relevant) {
+              for (const r of relevant.slice(0, 5)) {
+                logParts.push(`Inline JS: ${r.replace(/<\/?script[^>]*>/gi, "").replace(/\s+/g, " ").trim().substring(0, 300)}`);
+              }
+            }
+          }
+        }
+
+        // Scan app-related JS bundles for AJAX calls related to search/patient
+        const appScripts = scriptSrcs.filter(s => !s.includes("jquery") && !s.includes("kendo") && !s.includes("bootstrap") && !s.includes("signalr"));
+        for (const src of appScripts.slice(0, 3)) {
+          try {
+            const scriptUrl = src.startsWith("http") ? src : `${BASE_URL}${src.startsWith("/") ? "" : "/"}${src}`;
+            const { body: jsBody } = await fetchWithCookies(scriptUrl);
+            // Look for search/patient/loadMore related AJAX calls
+            const ajaxMatches = jsBody.match(/.{0,100}(\.ajax|\.post|\.get|fetch)\s*\([^)]*(?:patient|search|load\s*more|archive)[^)]{0,200}\)/gi);
+            if (ajaxMatches) {
+              logParts.push(`\nJS bundle ${src}:`);
+              for (const am of ajaxMatches.slice(0, 10)) {
+                logParts.push(`  AJAX: ${am.replace(/\s+/g, " ").trim().substring(0, 300)}`);
+              }
+            }
+            // Also look for URL patterns with Patient/Search/Load
+            const urlMatches = jsBody.match(/["']\/[A-Za-z]+\/[A-Za-z]+\/[A-Za-z]*(?:Patient|Search|Load|Archive)[A-Za-z]*["']/gi);
+            if (urlMatches) {
+              const unique = [...new Set(urlMatches)];
+              logParts.push(`  URL patterns: ${unique.slice(0, 15).join(", ")}`);
+            }
+          } catch (e: any) {
+            logParts.push(`  Failed to fetch ${src}: ${e.message}`);
           }
         }
       }
