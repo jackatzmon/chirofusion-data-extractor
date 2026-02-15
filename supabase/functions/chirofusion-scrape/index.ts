@@ -1207,77 +1207,109 @@ Deno.serve(async (req) => {
             break;
           }
 
-          // ==================== FINANCIALS ====================
+          // ==================== FINANCIALS (Patient Statements) ====================
           case "financials": {
-            const patients = await getAllPatientIds();
+            logParts.push(`Fetching patient statements via GetPatientStatementGridData...`);
 
-            if (patients.length === 0) {
-              logParts.push(`⚠️ Financials: No patients found`);
-              break;
-            }
+            // First, prime the billing session
+            await fetchWithCookies(`${BASE_URL}/Billing/`);
 
-            logParts.push(`Processing ${patients.length} patients for financials`);
+            const allStatementRows: Record<string, unknown>[] = [];
+            let page = 1;
+            const pageSize = 100;
+            let hasMore = true;
 
-            const financialRows: Record<string, unknown>[] = [];
-            let processedCount = 0;
-
-            for (const patient of patients) {
-              if (!patient.id) continue;
+            while (hasMore) {
               if (isTimingOut()) {
-                logParts.push(`⏱️ Financials: Stopped at ${processedCount}/${patients.length} (timeout safety)`);
+                logParts.push(`⏱️ Statements: Stopped at page ${page} (timeout safety)`);
                 break;
               }
 
               try {
-                await ajaxFetch(`/Patient/Patient/SetVisitIdInSession?patientId=${patient.id}`, { method: "POST" });
+                const res = await ajaxFetch("/Billing/Statements/GetPatientStatementGridData", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Referer": `${BASE_URL}/Billing/`,
+                  },
+                  body: new URLSearchParams({
+                    sort: "",
+                    page: String(page),
+                    pageSize: String(pageSize),
+                    group: "",
+                    filter: "",
+                    ProviderIds: "",
+                    AgingPeriod: "5",
+                    FilterPatientId: "0",
+                    IsActive: "1",
+                    FilterStmtPreference: "",
+                    "PatientStatementCriteriaViewModel.MinimumAmount": "1",
+                    "PatientStatementCriteriaViewModel.StatementsToInclude": "1",
+                    "PatientStatementCriteriaViewModel.HaventReceivedDays": "28",
+                    "PatientStatementCriteriaViewModel.ClosedClaimsOnly": "0",
+                    "PatientStatementCriteriaViewModel.IncludeCreditBalances": "0",
+                    PatientFileStatus: "0",
+                    IsExcludeUAC: "0",
+                  }).toString(),
+                });
 
-                const { status, body: billingBody } = await ajaxFetch(
-                  `/Billing/PatientAccounting?patientId=${patient.id}`
-                );
+                logParts.push(`Statements page ${page}: status=${res.status} len=${res.body.length}`);
 
-                if (status === 200 && billingBody.length > 100) {
-                  const tableRegex = /<table[^>]*>[\s\S]*?<\/table>/gi;
-                  const tables = billingBody.match(tableRegex) || [];
-                  const cellRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
-                  let cellMatch;
-                  const rowData: string[] = [];
+                if (res.status !== 200 || res.body.length < 10) {
+                  logParts.push(`⚠️ Unexpected response: ${res.body.substring(0, 500)}`);
+                  break;
+                }
 
-                  for (const table of tables) {
-                    while ((cellMatch = cellRegex.exec(table)) !== null) {
-                      const text = cellMatch[1].replace(/<[^>]+>/g, "").trim();
-                      if (text) rowData.push(text);
+                // Parse Kendo grid JSON response: { Data: [...], Total: N }
+                let parsed: { Data?: Record<string, unknown>[]; Total?: number };
+                try {
+                  parsed = JSON.parse(res.body);
+                } catch {
+                  logParts.push(`⚠️ Non-JSON response: ${res.body.substring(0, 500)}`);
+                  break;
+                }
+
+                const rows = parsed.Data || [];
+                if (rows.length === 0) {
+                  hasMore = false;
+                  break;
+                }
+
+                // Clean .NET dates in all rows
+                for (const row of rows) {
+                  for (const key of Object.keys(row)) {
+                    if (typeof row[key] === "string" && (row[key] as string).includes("/Date(")) {
+                      row[key] = parseNetDate(row[key] as string);
                     }
                   }
-
-                  if (rowData.length > 0) {
-                    financialRows.push({
-                      PatientID: patient.id,
-                      PatientName: `${patient.firstName} ${patient.lastName}`,
-                      RawData: rowData.join(" | "),
-                    });
-                  }
-
-                  logParts.push(`Financial ${patient.firstName} ${patient.lastName}: ${tables.length} tables, ${rowData.length} cells`);
                 }
+
+                allStatementRows.push(...rows);
+                logParts.push(`  Got ${rows.length} rows (total so far: ${allStatementRows.length}/${parsed.Total || "?"})`);
+
+                if (allStatementRows.length >= (parsed.Total || Infinity)) {
+                  hasMore = false;
+                } else {
+                  page++;
+                }
+
+                // Progress update
+                const pct = parsed.Total ? Math.round((allStatementRows.length / parsed.Total) * (100 / totalTypes)) : 0;
+                await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + pct, 99), log_output: logParts.join("\n") }).eq("id", job.id);
+
+                await new Promise(r => setTimeout(r, 300));
               } catch (err: any) {
-                logParts.push(`Financial ${patient.firstName} ${patient.lastName} error: ${err.message}`);
+                logParts.push(`❌ Statements page ${page} error: ${err.message}`);
+                break;
               }
-
-              processedCount++;
-              if (processedCount % 20 === 0) {
-                const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
-                await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + newProgress, 99), log_output: logParts.join("\n") }).eq("id", job.id);
-              }
-
-              await new Promise(r => setTimeout(r, 300));
             }
 
-            if (financialRows.length > 0) {
-              csvContent = jsonToCsv(financialRows);
-              rowCount = financialRows.length;
-              logParts.push(`✅ Financials: ${rowCount} patient records`);
+            if (allStatementRows.length > 0) {
+              csvContent = jsonToCsv(allStatementRows);
+              rowCount = allStatementRows.length;
+              logParts.push(`✅ Patient Statements: ${rowCount} records`);
             } else {
-              logParts.push(`⚠️ Financials: No billing data retrieved`);
+              logParts.push(`⚠️ Patient Statements: No data retrieved`);
             }
             break;
           }
