@@ -116,6 +116,67 @@ function parseNetDate(dateStr: string | null): string {
   return dateStr;
 }
 
+/** Parse ShowLedger HTML response to extract ledger table rows */
+function parseLedgerHtml(html: string): Record<string, string>[] {
+  const rows: Record<string, string>[] = [];
+
+  // Extract all <tr> rows from the ledger table
+  const trRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let trMatch;
+
+  // First, try to find headers from <th> elements
+  const headers: string[] = [];
+  const theadMatch = html.match(/<thead[^>]*>([\s\S]*?)<\/thead>/i);
+  if (theadMatch) {
+    const thRegex = /<th[^>]*>([\s\S]*?)<\/th>/gi;
+    let thMatch;
+    while ((thMatch = thRegex.exec(theadMatch[1])) !== null) {
+      // Strip HTML tags from header text
+      const text = thMatch[1].replace(/<[^>]*>/g, "").trim();
+      headers.push(text || `Column${headers.length}`);
+    }
+  }
+
+  // If no headers found, use default ledger columns
+  if (headers.length === 0) {
+    headers.push("Date", "Description", "CPTCode", "Charges", "Payments", "Adjustments", "Balance");
+  }
+
+  // Extract <tbody> content if present, otherwise use full HTML
+  const tbodyMatch = html.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i);
+  const bodyContent = tbodyMatch ? tbodyMatch[1] : html;
+
+  while ((trMatch = trRegex.exec(bodyContent)) !== null) {
+    const trContent = trMatch[1];
+    // Skip header rows (already parsed above)
+    if (trContent.includes("<th")) continue;
+
+    const cells: string[] = [];
+    const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+    let tdMatch;
+    while ((tdMatch = tdRegex.exec(trContent)) !== null) {
+      // Strip HTML tags and trim whitespace
+      const text = tdMatch[1].replace(/<[^>]*>/g, "").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").trim();
+      cells.push(text);
+    }
+
+    if (cells.length === 0) continue;
+
+    // Map cells to headers
+    const row: Record<string, string> = {};
+    for (let c = 0; c < Math.min(cells.length, headers.length); c++) {
+      row[headers[c]] = cells[c];
+    }
+    // If more cells than headers, append extras
+    for (let c = headers.length; c < cells.length; c++) {
+      row[`Extra${c}`] = cells[c];
+    }
+    rows.push(row);
+  }
+
+  return rows;
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
@@ -210,6 +271,7 @@ Deno.serve(async (req) => {
           ...batchState,
           soapIndex,
           collectedSheets,
+          financialsLedgerRows: batchState.financialsLedgerRows || [],
         },
       }).eq("id", job.id);
 
@@ -729,6 +791,7 @@ Deno.serve(async (req) => {
     const dbBatchState = _batchJobId && job.batch_state ? job.batch_state as any : {};
     const collectedSheets: { type: string; csv: string }[] = dbBatchState.collectedSheets || [];
     const soapIndex: { PatientName: string; Documents: number; PDFLink: string; Status: string }[] = dbBatchState.soapIndex || [];
+    const financialsLedgerRows: Record<string, string>[] = dbBatchState.financialsLedgerRows || [];
 
     // Shared: get full patient list with IDs for per-patient scraping
     // Caches result so it's only fetched once even if multiple data types need it
@@ -1550,58 +1613,165 @@ Deno.serve(async (req) => {
             break;
           }
 
-          // ==================== FINANCIALS (Patient Statements) ====================
+          // ==================== FINANCIALS (Per-Patient Account Ledger) ====================
           case "financials": {
-            logParts.push(`Fetching patient statements via GetPatientStatementGridData...`);
+            logParts.push(`Fetching per-patient account ledgers via ShowLedger...`);
 
-            // First, prime the billing session
-            await fetchWithCookies(`${BASE_URL}/Billing/`);
+            // Get all patient names from demographics report
+            const patients = await getAllPatientNames();
+            if (patients.length === 0) {
+              logParts.push(`⚠️ No patients found — cannot fetch ledgers`);
+              break;
+            }
 
-            const allStatementRows: Record<string, unknown>[] = [];
-            let page = 1;
-            const pageSize = 100;
-            let hasMore = true;
+            // Batch resume support
+            const bs = _batchState || {};
+            let processedCount = bs.dataTypeIndex === dataTypes.indexOf(dataType) ? (bs.resumeIndex || 0) : 0;
+            let ledgerFetched = bs.ledgerFetched || 0;
+            let ledgerEmpty = bs.ledgerEmpty || 0;
+            let ledgerSearchFailed = bs.ledgerSearchFailed || 0;
 
-            while (hasMore) {
+            // Restore previously collected rows from batch_state
+            const allLedgerRows: Record<string, string>[] = [...financialsLedgerRows];
+
+            if (processedCount > 0) {
+              logParts.push(`🔄 Resuming ledgers from patient ${processedCount}/${patients.length} (${allLedgerRows.length} rows collected)`);
+            } else {
+              logParts.push(`Processing ${patients.length} patients for account ledgers`);
+            }
+
+            for (let i = processedCount; i < patients.length; i++) {
+              const patient = patients[i];
               if (isTimingOut()) {
-                logParts.push(`⏱️ Statements: Stopped at page ${page} (timeout safety)`);
-                break;
+                // Save collected ledger rows to batch_state and self-invoke
+                await selfInvoke({
+                  resumeIndex: i,
+                  ledgerFetched, ledgerEmpty, ledgerSearchFailed,
+                  financialsLedgerRows: allLedgerRows,
+                  dataTypeIndex: dataTypes.indexOf(dataType),
+                });
+                return new Response(JSON.stringify({ success: true, jobId: job.id, batching: true }), {
+                  headers: { ...corsHeaders, "Content-Type": "application/json" },
+                });
               }
 
               try {
-                const res = await ajaxFetch("/Billing/Statements/GetPatientStatementGridData", {
+                const patientName = `${patient.lastName}, ${patient.firstName}`;
+                const isDebug = i < 3;
+
+                // 1. Search for patient to get patientId
+                const info = await findPatientInfo(patient.firstName, patient.lastName, isDebug);
+                if (!info) {
+                  ledgerSearchFailed++;
+                  if (isDebug) logParts.push(`⚠️ "${patientName}" — search failed`);
+                  processedCount = i + 1;
+                  continue;
+                }
+
+                // 2. Set patient context via SetVisitIdInSession
+                await ajaxFetch("/Patient/Patient/SetVisitIdInSession", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Referer": `${BASE_URL}/Patient`,
+                    "ClientPatientId": String(info.id),
+                    ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                  },
+                  body: new URLSearchParams({
+                    PatientId: String(info.id),
+                    CaseId: "0",
+                  }).toString(),
+                });
+
+                // 3. Set billing context to Patient Accounting
+                await ajaxFetch("/Billing/Billing/SetBillingDefaultPageInSession", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "Referer": `${BASE_URL}/Billing/`,
+                    "ClientPatientId": String(info.id),
+                    ...(_practiceId ? { "practiceId": _practiceId } : {}),
                   },
                   body: new URLSearchParams({
-                    sort: "",
-                    page: String(page),
-                    pageSize: String(pageSize),
-                    group: "",
-                    filter: "",
-                    ProviderIds: "",
-                    AgingPeriod: "5",
-                    FilterPatientId: "0",
-                    IsActive: "1",
-                    FilterStmtPreference: "",
-                    "PatientStatementCriteriaViewModel.MinimumAmount": "1",
-                    "PatientStatementCriteriaViewModel.StatementsToInclude": "1",
-                    "PatientStatementCriteriaViewModel.HaventReceivedDays": "28",
-                    "PatientStatementCriteriaViewModel.ClosedClaimsOnly": "0",
-                    "PatientStatementCriteriaViewModel.IncludeCreditBalances": "0",
-                    PatientFileStatus: "0",
-                    IsExcludeUAC: "0",
+                    billingDefaultPage: "PatientAccounting",
                   }).toString(),
                 });
 
-                logParts.push(`Statements page ${page}: status=${res.status} len=${res.body.length}`);
+                // 4. Fetch the account ledger HTML
+                const ledgerRes = await ajaxFetch("/Billing/PatientAccounting/ShowLedger", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Referer": `${BASE_URL}/Billing/`,
+                    "ClientPatientId": String(info.id),
+                    ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                  },
+                  body: new URLSearchParams({
+                    IsLedger: "1",
+                    ShowUac: "true",
+                  }).toString(),
+                });
 
-                if (res.status !== 200 || res.body.length < 10) {
-                  logParts.push(`⚠️ Unexpected response: ${res.body.substring(0, 500)}`);
-                  break;
+                if (isDebug) {
+                  logParts.push(`🔍 Ledger ${patientName} (id=${info.id}): status=${ledgerRes.status} len=${ledgerRes.body.length}`);
+                  logParts.push(`  Preview: ${ledgerRes.body.substring(0, 500)}`);
                 }
+
+                if (ledgerRes.status !== 200 || ledgerRes.body.length < 50) {
+                  ledgerEmpty++;
+                  processedCount = i + 1;
+                  continue;
+                }
+
+                // 5. Parse the HTML table for transaction rows
+                const ledgerRows = parseLedgerHtml(ledgerRes.body);
+
+                if (ledgerRows.length === 0) {
+                  ledgerEmpty++;
+                  if (isDebug) logParts.push(`  No ledger rows parsed for ${patientName}`);
+                  processedCount = i + 1;
+                  continue;
+                }
+
+                // Prepend patient name to each row
+                for (const row of ledgerRows) {
+                  row["PatientName"] = patientName;
+                }
+
+                allLedgerRows.push(...ledgerRows);
+                ledgerFetched++;
+                if (isDebug) logParts.push(`  ✅ ${ledgerRows.length} ledger rows for ${patientName}`);
+
+              } catch (err: any) {
+                logParts.push(`❌ Ledger ${patient.firstName} ${patient.lastName}: ${err.message}`);
+              }
+
+              processedCount = i + 1;
+              if (processedCount % 50 === 0) {
+                logParts.push(`Ledger progress: ${processedCount}/${patients.length} (${ledgerFetched} with data, ${ledgerEmpty} empty, ${ledgerSearchFailed} failed, ${allLedgerRows.length} total rows)`);
+                const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
+                await serviceClient.from("scrape_jobs").update({
+                  progress: Math.min(progress + newProgress, 99),
+                  log_output: logParts.join("\n"),
+                }).eq("id", job.id);
+              }
+
+              await new Promise(r => setTimeout(r, 150));
+            }
+
+            logParts.push(`✅ Patient Ledgers complete: ${allLedgerRows.length} rows from ${processedCount} patients (${ledgerFetched} with data, ${ledgerEmpty} empty, ${ledgerSearchFailed} search failures)`);
+
+            if (allLedgerRows.length > 0) {
+              // Reorder columns so PatientName is first
+              const reordered = allLedgerRows.map(row => {
+                const { PatientName, ...rest } = row;
+                return { PatientName, ...rest };
+              });
+              csvContent = jsonToCsv(reordered);
+              rowCount = reordered.length;
+            }
+            break;
+          }
 
                 // Parse Kendo grid JSON response: { Data: [...], Total: N }
                 let parsed: { Data?: Record<string, unknown>[]; Total?: number };
@@ -1678,7 +1848,7 @@ Deno.serve(async (req) => {
     const typeLabels: Record<string, string> = {
       demographics: "Demographics",
       appointments: "Appointments",
-      financials: "Financials",
+      financials: "Patient Ledgers",
     };
 
     for (const { type, csv } of collectedSheets) {
