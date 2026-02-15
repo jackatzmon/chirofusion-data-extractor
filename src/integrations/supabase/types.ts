@@ -43,6 +43,7 @@ export type Database = {
       }
       scrape_jobs: {
         Row: {
+          batch_state: Json | null
           created_at: string
           data_types: string[]
           error_message: string | null
@@ -55,6 +56,7 @@ export type Database = {
           user_id: string
         }
         Insert: {
+          batch_state?: Json | null
           created_at?: string
           data_types?: string[]
           error_message?: string | null
@@ -67,6 +69,7 @@ export type Database = {
           user_id: string
         }
         Update: {
+          batch_state?: Json | null
           created_at?: string
           data_types?: string[]
           error_message?: string | null
