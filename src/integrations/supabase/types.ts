@@ -47,6 +47,8 @@ export type Database = {
           data_types: string[]
           error_message: string | null
           id: string
+          log_output: string | null
+          mode: string
           progress: number
           status: string
           updated_at: string
@@ -57,6 +59,8 @@ export type Database = {
           data_types?: string[]
           error_message?: string | null
           id?: string
+          log_output?: string | null
+          mode?: string
           progress?: number
           status?: string
           updated_at?: string
@@ -67,6 +71,8 @@ export type Database = {
           data_types?: string[]
           error_message?: string | null
           id?: string
+          log_output?: string | null
+          mode?: string
           progress?: number
           status?: string
           updated_at?: string

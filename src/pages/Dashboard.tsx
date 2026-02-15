@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
@@ -7,7 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "@/hooks/use-toast";
 import { Progress } from "@/components/ui/progress";
-import { LogOut, Download, Play, Loader2 } from "lucide-react";
+import { LogOut, Download, Play, Loader2, Search, ChevronDown, ChevronUp } from "lucide-react";
 
 const DATA_TYPES = [
   { id: "demographics", label: "Patient Demographics" },
@@ -23,6 +23,8 @@ type ScrapeJob = {
   data_types: string[];
   error_message: string | null;
   created_at: string;
+  mode: string;
+  log_output: string | null;
 };
 
 type ScrapeResult = {
@@ -41,15 +43,39 @@ const Dashboard = () => {
   const [jobs, setJobs] = useState<ScrapeJob[]>([]);
   const [results, setResults] = useState<ScrapeResult[]>([]);
   const [loading, setLoading] = useState(false);
+  const [discovering, setDiscovering] = useState(false);
   const [savingCreds, setSavingCreds] = useState(false);
+  const [expandedJobLog, setExpandedJobLog] = useState<string | null>(null);
   const navigate = useNavigate();
   const { toast } = useToast();
+
+  const loadJobs = useCallback(async () => {
+    const { data } = await supabase
+      .from("scrape_jobs")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(10);
+    if (data) setJobs(data as ScrapeJob[]);
+  }, []);
 
   useEffect(() => {
     loadCredentials();
     loadJobs();
     loadResults();
-  }, []);
+  }, [loadJobs]);
+
+  // Poll for running jobs
+  useEffect(() => {
+    const hasRunning = jobs.some((j) => j.status === "running");
+    if (!hasRunning) return;
+
+    const interval = setInterval(() => {
+      loadJobs();
+      loadResults();
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [jobs, loadJobs]);
 
   const loadCredentials = async () => {
     const { data } = await supabase.from("chirofusion_credentials").select("*").maybeSingle();
@@ -57,11 +83,6 @@ const Dashboard = () => {
       setHasCreds(true);
       setCfUsername(data.cf_username);
     }
-  };
-
-  const loadJobs = async () => {
-    const { data } = await supabase.from("scrape_jobs").select("*").order("created_at", { ascending: false }).limit(10);
-    if (data) setJobs(data);
   };
 
   const loadResults = async () => {
@@ -88,6 +109,23 @@ const Dashboard = () => {
     }
   };
 
+  const startDiscover = async () => {
+    setDiscovering(true);
+    try {
+      const { data, error } = await supabase.functions.invoke("chirofusion-scrape", {
+        body: { mode: "discover" },
+      });
+
+      if (error) throw error;
+      toast({ title: "Discovery started", description: "Fetching ChiroFusion page structures..." });
+      loadJobs();
+    } catch (error: any) {
+      toast({ title: "Error", description: error.message, variant: "destructive" });
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
   const startScrape = async () => {
     if (selectedTypes.length === 0) {
       toast({ title: "Select data types", description: "Choose at least one data type to download.", variant: "destructive" });
@@ -97,7 +135,7 @@ const Dashboard = () => {
     setLoading(true);
     try {
       const { data, error } = await supabase.functions.invoke("chirofusion-scrape", {
-        body: { dataTypes: selectedTypes },
+        body: { dataTypes: selectedTypes, mode: "scrape" },
       });
 
       if (error) throw error;
@@ -157,11 +195,27 @@ const Dashboard = () => {
           </CardContent>
         </Card>
 
+        {/* Discovery Card */}
+        <Card>
+          <CardHeader>
+            <CardTitle>Phase 1: Discover Endpoints</CardTitle>
+            <CardDescription>
+              Fetch ChiroFusion pages to discover real form fields and AJAX endpoints. Run this first before scraping.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button onClick={startDiscover} disabled={discovering || !hasCreds} variant="secondary" className="w-full">
+              {discovering ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Discovering...</> : <><Search className="h-4 w-4 mr-2" /> Discover Endpoints</>}
+            </Button>
+            {!hasCreds && <p className="text-sm text-muted-foreground mt-2">Save your credentials first.</p>}
+          </CardContent>
+        </Card>
+
         {/* Data Selection Card */}
         <Card>
           <CardHeader>
-            <CardTitle>Download Data</CardTitle>
-            <CardDescription>Select which data types to download from ChiroFusion.</CardDescription>
+            <CardTitle>Phase 2: Download Data</CardTitle>
+            <CardDescription>Select which data types to download from ChiroFusion. (Requires discovery first)</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -189,12 +243,34 @@ const Dashboard = () => {
               {jobs.map((job) => (
                 <div key={job.id} className="rounded-md border border-border p-3 space-y-2">
                   <div className="flex items-center justify-between">
-                    <span className="text-sm font-medium capitalize text-foreground">{job.status}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium capitalize text-foreground">{job.status}</span>
+                      <span className="text-xs bg-muted text-muted-foreground px-2 py-0.5 rounded">{job.mode || "scrape"}</span>
+                    </div>
                     <span className="text-xs text-muted-foreground">{new Date(job.created_at).toLocaleString()}</span>
                   </div>
                   <div className="text-xs text-muted-foreground">{job.data_types.join(", ")}</div>
                   {job.status === "running" && <Progress value={job.progress} />}
                   {job.error_message && <p className="text-xs text-destructive">{job.error_message}</p>}
+                  {job.status === "completed" && !job.log_output && job.mode !== "discover" && (
+                    <p className="text-xs text-muted-foreground italic">No data found for this job.</p>
+                  )}
+                  {job.log_output && (
+                    <div>
+                      <button
+                        onClick={() => setExpandedJobLog(expandedJobLog === job.id ? null : job.id)}
+                        className="flex items-center gap-1 text-xs text-primary hover:underline"
+                      >
+                        {expandedJobLog === job.id ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+                        {expandedJobLog === job.id ? "Hide Log" : "View Log"}
+                      </button>
+                      {expandedJobLog === job.id && (
+                        <pre className="mt-2 p-3 bg-muted rounded text-xs text-muted-foreground overflow-x-auto max-h-96 overflow-y-auto whitespace-pre-wrap break-words">
+                          {job.log_output}
+                        </pre>
+                      )}
+                    </div>
+                  )}
                 </div>
               ))}
             </CardContent>
