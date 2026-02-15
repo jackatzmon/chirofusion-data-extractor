@@ -63,35 +63,25 @@ Deno.serve(async (req) => {
     let sessionCookies: string = "";
 
     try {
-      // Login to get session
-      const loginRes = await fetch("https://app.chirofusion.com/api/Account/Login", {
+      const loginRes = await fetch("https://www.chirofusionlive.com/Account/Login", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ Username: creds.cf_username, Password: creds.cf_password, RememberMe: false }),
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          txtLoginUserName: creds.cf_username,
+          txtLoginPassword: creds.cf_password,
+          chkEULA: "on",
+        }),
         redirect: "manual",
       });
 
-      // Collect cookies
       const cookies = loginRes.headers.getSetCookie?.() || [];
       sessionCookies = cookies.map((c: string) => c.split(";")[0]).join("; ");
-
-      if (!sessionCookies) {
-        // Try alternate login approach
-        const loginRes2 = await fetch("https://app.chirofusion.com/Account/Login", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({ Username: creds.cf_username, Password: creds.cf_password, RememberMe: "false" }),
-          redirect: "manual",
-        });
-        const cookies2 = loginRes2.headers.getSetCookie?.() || [];
-        sessionCookies = cookies2.map((c: string) => c.split(";")[0]).join("; ");
-      }
 
       if (!sessionCookies) {
         throw new Error("Failed to authenticate with ChiroFusion. Check your credentials.");
       }
 
-      console.log("Login successful");
+      console.log("Login successful, status:", loginRes.status);
     } catch (loginError: any) {
       await serviceClient.from("scrape_jobs").update({ status: "failed", error_message: loginError.message }).eq("id", job.id);
       return new Response(JSON.stringify({ error: loginError.message }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
@@ -108,7 +98,7 @@ Deno.serve(async (req) => {
 
         switch (dataType) {
           case "demographics": {
-            const res = await fetch("https://app.chirofusion.com/api/Patient/GetAll", {
+            const res = await fetch("https://www.chirofusionlive.com/api/Patient/GetAll", {
               headers: { Cookie: sessionCookies, Accept: "application/json" },
             });
             const patients = await res.json();
@@ -119,7 +109,7 @@ Deno.serve(async (req) => {
             break;
           }
           case "appointments": {
-            const res = await fetch("https://app.chirofusion.com/api/Appointment/GetAll", {
+            const res = await fetch("https://www.chirofusionlive.com/api/Appointment/GetAll", {
               headers: { Cookie: sessionCookies, Accept: "application/json" },
             });
             const appts = await res.json();
@@ -130,7 +120,7 @@ Deno.serve(async (req) => {
             break;
           }
           case "soap_notes": {
-            const res = await fetch("https://app.chirofusion.com/api/SoapNote/GetAll", {
+            const res = await fetch("https://www.chirofusionlive.com/api/SoapNote/GetAll", {
               headers: { Cookie: sessionCookies, Accept: "application/json" },
             });
             const notes = await res.json();
@@ -141,7 +131,7 @@ Deno.serve(async (req) => {
             break;
           }
           case "financials": {
-            const res = await fetch("https://app.chirofusion.com/api/Billing/GetAll", {
+            const res = await fetch("https://www.chirofusionlive.com/api/Billing/GetAll", {
               headers: { Cookie: sessionCookies, Accept: "application/json" },
             });
             const bills = await res.json();
