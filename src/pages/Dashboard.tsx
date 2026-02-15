@@ -294,7 +294,7 @@ const Dashboard = () => {
               {results.map((result) => (
                 <div key={result.id} className="flex items-center justify-between rounded-md border border-border p-3">
                   <div>
-                    <span className="text-sm font-medium capitalize text-foreground">{result.data_type.replace("_", " ")}</span>
+                    <span className="text-sm font-medium capitalize text-foreground">{result.data_type === "consolidated_export" ? "📊 Consolidated Workbook" : result.data_type.replace("_", " ")}</span>
                     {result.row_count != null && <span className="ml-2 text-xs text-muted-foreground">({result.row_count} rows)</span>}
                   </div>
                   <Button variant="outline" size="sm" onClick={() => downloadFile(result.file_path)}>
