@@ -400,91 +400,123 @@ Deno.serve(async (req) => {
         switch (dataType) {
           // ==================== DEMOGRAPHICS ====================
           case "demographics": {
-            // Real endpoint: /Scheduler/Scheduler/GetPatientReports
-            // RunPatientReport sends: ReportType, BirthMonths, PatientStatus, PatientInsurance
-            // Then Kendo Grid reads from the same endpoint
-
-            // Step 1: Load Scheduler page
+            // Step 1: Load Scheduler page and extract CSRF token
             logParts.push(`Step 1: Loading Scheduler page...`);
-            await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
+            const { body: schedulerHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
 
-            // Step 2: Try multiple request formats to GetPatientReports
+            // Extract __RequestVerificationToken
+            let verificationToken = "";
+            const tokenMatch = schedulerHtml.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
+            if (tokenMatch) {
+              verificationToken = tokenMatch[1];
+              logParts.push(`Found verification token: ${verificationToken.substring(0, 20)}...`);
+            } else {
+              // Try alternate patterns
+              const tokenMatch2 = schedulerHtml.match(/value="([^"]+)"[^>]*name="__RequestVerificationToken"/);
+              if (tokenMatch2) verificationToken = tokenMatch2[1];
+              logParts.push(`Verification token: ${verificationToken ? "found (alt)" : "NOT FOUND"}`);
+            }
+
+            // Extract any other hidden fields from forms
+            const hiddenFields: Record<string, string> = {};
+            const hiddenRegex = /<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>/gi;
+            let hiddenMatch;
+            while ((hiddenMatch = hiddenRegex.exec(schedulerHtml)) !== null) {
+              hiddenFields[hiddenMatch[1]] = hiddenMatch[2];
+            }
+            // Also try reversed attribute order
+            const hiddenRegex2 = /<input[^>]*value="([^"]*)"[^>]*name="([^"]+)"[^>]*type="hidden"[^>]*>/gi;
+            while ((hiddenMatch = hiddenRegex2.exec(schedulerHtml)) !== null) {
+              hiddenFields[hiddenMatch[2]] = hiddenMatch[1];
+            }
+            logParts.push(`Hidden fields: ${JSON.stringify(Object.keys(hiddenFields))}`);
+
+            // Step 2: Try GetPatientReports with token
             const endpoint = "/Scheduler/Scheduler/GetPatientReports";
+            let found = false;
+
+            const tokenParams = verificationToken ? `&__RequestVerificationToken=${encodeURIComponent(verificationToken)}` : "";
+
             const attempts: { label: string; opts: RequestInit }[] = [
-              // Kendo typically sends as form data with specific field names
               {
-                label: "form (ReportType=1,PatientStatus=1,2,3)",
+                label: "form+token (ReportType=1)",
                 opts: {
                   method: "POST",
                   headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                  body: "ReportType=1&PatientStatus=1%2C2%2C3&BirthMonths=&PatientInsurance=&page=1&pageSize=10000&take=10000&skip=0",
+                  body: `ReportType=1&PatientStatus=1%2C2%2C3&BirthMonths=&PatientInsurance=&page=1&pageSize=10000&take=10000&skip=0${tokenParams}`,
                 },
               },
               {
-                label: "form (reportType=1,patientStatus=Active,Inactive,Deceased)",
+                label: "form+token (sort+filter)",
                 opts: {
                   method: "POST",
                   headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                  body: "reportType=1&patientStatus=Active%2CInactive%2CDeceased&birthMonths=&patientInsurance=&page=1&pageSize=10000",
+                  body: `sort=&group=&filter=&ReportType=1&PatientStatus=1%2C2%2C3&BirthMonths=&PatientInsurance=&page=1&pageSize=10000&take=10000&skip=0${tokenParams}`,
                 },
               },
               {
-                label: "JSON payload",
+                label: "RunPatientReport endpoint",
                 opts: {
                   method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    ReportType: 1,
-                    PatientStatus: [1, 2, 3],
-                    BirthMonths: [],
-                    PatientInsurance: [],
-                  }),
-                },
-              },
-              {
-                label: "GET with query params",
-                opts: {
-                  method: "GET",
+                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                  body: `ReportType=1&BirthMonths=&PatientStatus=1%2C2%2C3&PatientInsurance=${tokenParams}`,
                 },
               },
             ];
 
-            let found = false;
-            for (const attempt of attempts) {
-              const url = attempt.label.includes("GET")
-                ? `${endpoint}?ReportType=1&PatientStatus=1,2,3&page=1&pageSize=10000`
-                : endpoint;
+            // Also try hitting RunPatientReport first (might set server-side state), then read grid
+            const runEndpoints = [
+              "/Scheduler/Scheduler/RunPatientReport",
+              "/User/Scheduler/RunPatientReport",
+              "/User/Scheduler/GetPatientReports",
+            ];
 
-              const res = await ajaxFetch(url, attempt.opts);
-              logParts.push(`${attempt.label}: status=${res.status} type=${res.contentType} length=${res.body.length}`);
-              if (res.body.length > 0) {
-                logParts.push(`Preview: ${res.body.substring(0, 800)}`);
+            for (const runUrl of runEndpoints) {
+              const runRes = await ajaxFetch(runUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: `ReportType=1&PatientStatus=1%2C2%2C3&BirthMonths=&PatientInsurance=${tokenParams}`,
+              });
+              logParts.push(`${runUrl}: status=${runRes.status} type=${runRes.contentType} length=${runRes.body.length}`);
+              if (runRes.body.length > 10) {
+                logParts.push(`Preview: ${runRes.body.substring(0, 500)}`);
               }
 
-              if (res.status === 200 && res.body.length > 100) {
+              if (runRes.status === 200 && runRes.body.length > 100) {
                 try {
-                  const data = JSON.parse(res.body);
+                  const data = JSON.parse(runRes.body);
                   const items = data.Data || data.data || data.Items || (Array.isArray(data) ? data : null);
                   if (items && Array.isArray(items) && items.length > 0) {
                     csvContent = jsonToCsv(items);
                     rowCount = items.length;
-                    logParts.push(`✅ Demographics: ${rowCount} patients`);
-                    found = true;
-                    break;
-                  } else {
-                    logParts.push(`Parsed but no array data. Keys: ${Object.keys(data).join(", ")}`);
-                    logParts.push(`Full response: ${res.body.substring(0, 2000)}`);
-                  }
-                } catch (e: any) {
-                  logParts.push(`Not JSON: ${e.message}`);
-                  // Maybe it's CSV/Excel directly
-                  if (res.body.includes(",") && res.body.includes("\n")) {
-                    csvContent = res.body;
-                    rowCount = res.body.split("\n").length - 1;
-                    logParts.push(`✅ Demographics (CSV): ${rowCount} rows`);
+                    logParts.push(`✅ Demographics: ${rowCount} patients from ${runUrl}`);
                     found = true;
                     break;
                   }
+                } catch { /* not JSON */ }
+              }
+            }
+
+            if (!found) {
+              for (const attempt of attempts) {
+                const res = await ajaxFetch(endpoint, attempt.opts);
+                logParts.push(`${attempt.label}: status=${res.status} type=${res.contentType} length=${res.body.length}`);
+                if (res.body.length > 10) {
+                  logParts.push(`Preview: ${res.body.substring(0, 500)}`);
+                }
+
+                if (res.status === 200 && res.body.length > 100) {
+                  try {
+                    const data = JSON.parse(res.body);
+                    const items = data.Data || data.data || data.Items || (Array.isArray(data) ? data : null);
+                    if (items && Array.isArray(items) && items.length > 0) {
+                      csvContent = jsonToCsv(items);
+                      rowCount = items.length;
+                      logParts.push(`✅ Demographics: ${rowCount} patients`);
+                      found = true;
+                      break;
+                    }
+                  } catch { /* not JSON */ }
                 }
               }
             }
