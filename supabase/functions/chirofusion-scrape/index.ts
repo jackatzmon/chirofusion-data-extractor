@@ -639,8 +639,8 @@ Deno.serve(async (req) => {
 
                 // Step 2b: ALWAYS wait for report generation, even if trigger returned empty
                 if (!found) {
-                  logParts.push(`Step 2b: Waiting 8 seconds for server-side report generation...`);
-                  await new Promise(r => setTimeout(r, 8000));
+                  logParts.push(`Step 2b: Waiting 20 seconds for server-side report generation...`);
+                  await new Promise(r => setTimeout(r, 20000));
 
                   // Step 2c: Now try Export — the report should be ready
                   logParts.push(`Step 2c: Attempting export after wait...`);
