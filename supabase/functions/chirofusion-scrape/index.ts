@@ -162,6 +162,13 @@ Deno.serve(async (req) => {
     }
 
     // Helper: AJAX request
+    // Extract practiceId from session page (cached)
+    let _practiceId = "";
+    function setPracticeId(html: string) {
+      const m = html.match(/SessionInfo\.practiceId\s*=\s*'(\d+)'/);
+      if (m) _practiceId = m[1];
+    }
+
     async function ajaxFetch(url: string, opts: RequestInit = {}): Promise<{ status: number; body: string; contentType: string }> {
       const res = await fetch(url.startsWith("http") ? url : `${BASE_URL}${url}`, {
         ...opts,
@@ -169,8 +176,11 @@ Deno.serve(async (req) => {
           ...browserHeaders,
           "Cookie": sessionCookies,
           "X-Requested-With": "XMLHttpRequest",
-          "Accept": "application/json, text/html, */*;q=0.01",
+          "Accept": "*/*",
+          "Origin": BASE_URL,
           "Referer": `${BASE_URL}/User/Scheduler`,
+          "ClientPatientId": "0",
+          ...(_practiceId ? { "practiceId": _practiceId } : {}),
           ...(opts.headers || {}),
         },
         redirect: "manual",
@@ -227,10 +237,11 @@ Deno.serve(async (req) => {
         const { body: html } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
         logParts.push(`===== SCHEDULER PAGE: ${html.length} chars =====`);
 
-        // Extract verification token
+        // Extract verification token and practiceId
         const tokenMatch = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
         schedToken.value = tokenMatch ? tokenMatch[1] : "";
-        logParts.push(`Token: ${schedToken.value ? "YES" : "NONE"}`);
+        setPracticeId(html);
+        logParts.push(`Token: ${schedToken.value ? "YES" : "NONE"}, practiceId: ${_practiceId}`);
 
         // Extract ALL <form> elements with their full HTML (action, method, hidden inputs)
         const formRegex = /<form[^>]*id="([^"]*)"[^>]*>([\s\S]*?)<\/form>/gi;
@@ -349,16 +360,14 @@ Deno.serve(async (req) => {
           logParts.push(`  PatientStatus option: value="${om2[1]}" text="${om2[2]}"`);
         }
       }
-      const allStatusJoined = statusOpts.filter(v => v).join(",");
-      logParts.push(`PatientStatus all values joined: "${allStatusJoined}"`);
+      const allStatusJoined = statusOpts.filter(v => v).join("^");
+      logParts.push(`PatientStatus all values joined (^): "${allStatusJoined}"`);
 
-      // 2a: GetPatientReports with different PatientStatus values
+      // 2a: GetPatientReports with ^-separated PatientStatus (matching real browser)
       const patientReportParams = [
         { ReportType: "1", BirthMonths: "", PatientStatus: allStatusJoined, PatientInsurance: "" },
-        { ReportType: "1", BirthMonths: "", PatientStatus: "1,2,3,4,5", PatientInsurance: "" },
-        { ReportType: "1", BirthMonths: "", PatientStatus: "1,2", PatientInsurance: "" },
+        { ReportType: "1", BirthMonths: "", PatientStatus: "1^2^3", PatientInsurance: "" },
         { ReportType: "1", BirthMonths: "", PatientStatus: "1", PatientInsurance: "" },
-        { ReportType: "1", BirthMonths: "", PatientStatus: "", PatientInsurance: "" },
       ];
 
       for (const params of patientReportParams) {
@@ -366,8 +375,7 @@ Deno.serve(async (req) => {
           const res = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
             method: "POST",
             headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-              "RequestVerificationToken": schedToken.value,
+              "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             },
             body: new URLSearchParams(params).toString(),
           });
@@ -384,12 +392,10 @@ Deno.serve(async (req) => {
         const res = await ajaxFetch("/Scheduler/Scheduler/ExportPatientReports", {
           method: "POST",
           headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "RequestVerificationToken": schedToken.value,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
           },
           body: new URLSearchParams({
-            ReportType: "1", BirthMonths: "", PatientStatus: "All", PatientInsurance: "",
-            __RequestVerificationToken: schedToken.value,
+            ReportType: "1", BirthMonths: "", PatientStatus: "1^2^3", PatientInsurance: "",
           }).toString(),
         });
         logParts.push(`ExportPatientReports: status=${res.status} len=${res.body.length} type=${res.contentType}`);
@@ -398,19 +404,21 @@ Deno.serve(async (req) => {
         logParts.push(`ExportPatientReports error: ${e.message}`);
       }
 
-      // 2c: Try the 500 error body from ExportPatientReports in detail
+      // 2c: Try ExportPatientReports with fetchWithCookies (non-AJAX, like browser form submit)
       try {
         const { response: rawRes, body: rawBody } = await fetchWithCookies(
           `${BASE_URL}/Scheduler/Scheduler/ExportPatientReports`,
           {
             method: "POST",
             headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
+              "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
               "X-Requested-With": "XMLHttpRequest",
-              "RequestVerificationToken": schedToken.value,
+              "Origin": BASE_URL,
+              "ClientPatientId": "0",
+              ...(_practiceId ? { "practiceId": _practiceId } : {}),
             },
             body: new URLSearchParams({
-              ReportType: "1", BirthMonths: "", PatientStatus: "All", PatientInsurance: "",
+              ReportType: "1", BirthMonths: "", PatientStatus: "1^2^3", PatientInsurance: "",
             }).toString(),
           }
         );
@@ -478,8 +486,7 @@ Deno.serve(async (req) => {
           const res = await ajaxFetch(path, {
             method: "POST",
             headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-              "RequestVerificationToken": schedToken.value,
+              "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             },
             body: new URLSearchParams(apptParams).toString(),
           });
@@ -501,8 +508,7 @@ Deno.serve(async (req) => {
           const res = await ajaxFetch(path, {
             method: "POST",
             headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-              "RequestVerificationToken": schedToken.value,
+              "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             },
             body: new URLSearchParams(apptParams).toString(),
           });
@@ -582,8 +588,7 @@ Deno.serve(async (req) => {
         const res = await ajaxFetch("/Scheduler/Scheduler/ExportPatientReports", {
           method: "POST",
           headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "RequestVerificationToken": schedToken.value,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
           },
           body: new URLSearchParams({
             ReportType: "1", BirthMonths: "", PatientStatus: "", PatientInsurance: "",
@@ -600,8 +605,7 @@ Deno.serve(async (req) => {
         const res = await ajaxFetch("/Scheduler/Scheduler/ExportAppointmentReport", {
           method: "POST",
           headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "RequestVerificationToken": schedToken.value,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
           },
           body: new URLSearchParams(apptParams).toString(),
         });
@@ -748,13 +752,19 @@ Deno.serve(async (req) => {
             logParts.push(`Step 1: Loading Scheduler page...`);
             const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
             const schedToken = extractVerifToken(schedHtml);
-            logParts.push(`Scheduler: ${schedHtml.length} chars, token: ${schedToken ? "YES" : "NONE"}`);
+            setPracticeId(schedHtml);
+            logParts.push(`Scheduler: ${schedHtml.length} chars, token: ${schedToken ? "YES" : "NONE"}, practiceId: ${_practiceId}`);
 
-            // Extract PatientStatus multiselect options from HTML
+            // Extract PatientStatus multiselect options from HTML (use ^ separator like the real browser)
             const patientStatusOpts = extractSelectOptions(schedHtml, "patientReportPatientStatusMultiSelect");
-            const allStatusValues = patientStatusOpts.map(o => o.value).filter(v => v).join(",");
+            const allStatusValues = patientStatusOpts.map(o => o.value).filter(v => v).join("^");
             logParts.push(`PatientStatus options: ${JSON.stringify(patientStatusOpts)}`);
-            logParts.push(`PatientStatus all values: "${allStatusValues}"`);
+            logParts.push(`PatientStatus all values (^-separated): "${allStatusValues}"`);
+
+            // Extract PatientInsurance multiselect options
+            const patientInsuranceOpts = extractSelectOptions(schedHtml, "patientReportPatientInsuranceMultiSelect");
+            const allInsuranceValues = patientInsuranceOpts.map(o => o.value).filter(v => v).join("^");
+            logParts.push(`PatientInsurance options: ${patientInsuranceOpts.length} values`);
 
             // Scan INLINE <script> blocks for RunPatientReport, ExportPatientReport, ExportPatientList
             const inlineScriptRegex = /<script(?:\s[^>]*)?>(?!.*src)([\s\S]*?)<\/script>/gi;
@@ -837,10 +847,9 @@ Deno.serve(async (req) => {
                 const formRes = await ajaxFetch(csvFormAction, {
                   method: "POST",
                   headers: {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "RequestVerificationToken": schedToken,
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                   },
-                  body: new URLSearchParams({ __RequestVerificationToken: schedToken }).toString(),
+                  body: new URLSearchParams({}).toString(),
                 });
                 logParts.push(`  Form POST: status=${formRes.status} len=${formRes.body.length} type=${formRes.contentType}`);
                 if (formRes.status === 200 && formRes.body.length > 100 && !formRes.body.includes("<!DOCTYPE")) {
@@ -856,16 +865,15 @@ Deno.serve(async (req) => {
               }
             }
 
-            // ===== Step 2b: Trigger GetPatientReports with EMPTY PatientStatus (= no filter = all) =====
+            // ===== Step 2b: Trigger GetPatientReports matching exact browser request =====
             if (!found) {
-              logParts.push(`Step 2b: Trigger GetPatientReports (empty PatientStatus = all)...`);
-              // Try multiple PatientStatus values: extracted multiselect values, then fallbacks
+              logParts.push(`Step 2b: Trigger GetPatientReports (browser-matched format)...`);
+              // Use ^-separated values matching real browser cURL
               const statusCandidates = [
-                allStatusValues,  // All multiselect values joined
-                "1,2,3,4,5",     // Common numeric pattern
-                "1,2",           // Active + Inactive
-                "1",             // Just Active
-                "",              // Empty (no filter)
+                allStatusValues,      // All multiselect values ^-separated
+                "1^2^3",              // Active statuses
+                "1^2^3^4^5",          // More statuses
+                "1",                  // Just Active
               ].filter((v, i, a) => a.indexOf(v) === i); // dedupe
 
               for (const statusVal of statusCandidates) {
@@ -874,16 +882,15 @@ Deno.serve(async (req) => {
                   ReportType: "1",
                   BirthMonths: "",
                   PatientStatus: statusVal,
-                  PatientInsurance: "",
+                  PatientInsurance: allInsuranceValues,
                 };
-                logParts.push(`  Trying PatientStatus="${statusVal}"...`);
+                logParts.push(`  Trying PatientStatus="${statusVal}" Insurance="${allInsuranceValues.substring(0, 80)}..."...`);
 
                 try {
                   const triggerRes = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
                     method: "POST",
                     headers: {
-                      "Content-Type": "application/x-www-form-urlencoded",
-                      "RequestVerificationToken": schedToken,
+                      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     },
                     body: new URLSearchParams(reportData).toString(),
                   });
@@ -906,20 +913,16 @@ Deno.serve(async (req) => {
                     } catch { /* not JSON */ }
                   }
 
-                  // If trigger returned data (len > 0), try export
+                  // If trigger returned data (len > 0), try export after waiting
                   if (!found && triggerRes.body.length > 0) {
                     logParts.push(`    Data returned, polling export...`);
                     await new Promise(r => setTimeout(r, 5000));
                     const expRes = await ajaxFetch("/Scheduler/Scheduler/ExportPatientReports", {
                       method: "POST",
                       headers: {
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "RequestVerificationToken": schedToken,
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                       },
-                      body: new URLSearchParams({
-                        ...reportData,
-                        __RequestVerificationToken: schedToken,
-                      }).toString(),
+                      body: new URLSearchParams(reportData).toString(),
                     });
                     logParts.push(`    Export: status=${expRes.status} len=${expRes.body.length}`);
                     if (expRes.status === 200 && expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE")) {
@@ -943,10 +946,9 @@ Deno.serve(async (req) => {
                 const formRes = await ajaxFetch(csvFormAction, {
                   method: "POST",
                   headers: {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "RequestVerificationToken": schedToken,
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                   },
-                  body: new URLSearchParams({ __RequestVerificationToken: schedToken }).toString(),
+                  body: new URLSearchParams({}).toString(),
                 });
                 logParts.push(`  Form POST: status=${formRes.status} len=${formRes.body.length} type=${formRes.contentType}`);
                 if (formRes.status === 200 && formRes.body.length > 100 && !formRes.body.includes("<!DOCTYPE")) {
@@ -975,8 +977,7 @@ Deno.serve(async (req) => {
                   const res = await ajaxFetch(kp, {
                     method: "POST",
                     headers: {
-                      "Content-Type": "application/x-www-form-urlencoded",
-                      "RequestVerificationToken": schedToken,
+                      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     },
                     body: new URLSearchParams({
                       take: "5000", skip: "0", page: "1", pageSize: "5000",
@@ -1089,8 +1090,7 @@ Deno.serve(async (req) => {
               const triggerRes = await ajaxFetch("/Scheduler/Scheduler/GetAppointmentReport", {
                 method: "POST",
                 headers: {
-                  "Content-Type": "application/x-www-form-urlencoded",
-                  "RequestVerificationToken": apptToken,
+                  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                 },
                 body: apptFormData.toString(),
               });
@@ -1116,13 +1116,11 @@ Deno.serve(async (req) => {
                 const expRes = await ajaxFetch("/Scheduler/Scheduler/ExportAppointmentReport", {
                   method: "POST",
                   headers: {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "RequestVerificationToken": apptToken,
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                   },
-                  body: new URLSearchParams({
-                    ...Object.fromEntries(apptFormData),
-                    __RequestVerificationToken: apptToken,
-                  }).toString(),
+                  body: new URLSearchParams(
+                    Object.fromEntries(apptFormData),
+                  ).toString(),
                 });
                 logParts.push(`  status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
 
