@@ -1257,47 +1257,9 @@ Deno.serve(async (req) => {
 
               // === TARGETED TEST: known patient 2568509 that should have files ===
               logParts.push(`🧪 TESTING known patient ID 2568509...`);
-              // Prime context
-              const testCatRes = await ajaxFetch("/Patient/Patient/GetFileCategory", {
-                method: "GET",
-                headers: {
-                  "Referer": `${BASE_URL}/Patient`,
-                  "ClientPatientId": "2568509",
-                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
-                },
-              });
-              logParts.push(`  GetFileCategory: status=${testCatRes.status} body=${testCatRes.body.substring(0, 300)}`);
-              
-              // Try multiple approaches for GetFilesFromBlob
-              for (const catId of ["0", "908", "909", "912", "914", "915"]) {
-                const testRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Referer": `${BASE_URL}/Patient`,
-                    "ClientPatientId": "2568509",
-                    ...(_practiceId ? { "practiceId": _practiceId } : {}),
-                  },
-                  body: new URLSearchParams({
-                    sort: "", group: "", filter: "",
-                    patientId: "2568509",
-                    practiceId: _practiceId,
-                    fileCategoryId: catId,
-                  }).toString(),
-                });
-                const parsed = JSON.parse(testRes.body);
-                logParts.push(`  catId=${catId}: Total=${parsed.Total}, Data.length=${(parsed.Data||[]).length}`);
-                if ((parsed.Data||[]).length > 0) {
-                  logParts.push(`  FOUND FILES! Keys: ${Object.keys(parsed.Data[0]).join(", ")}`);
-                  logParts.push(`  Sample: ${JSON.stringify(parsed.Data[0]).substring(0, 500)}`);
-                  break;
-                }
-              }
-              
-              // Also try navigating to patient page first
-              const navRes = await fetchWithCookies(`${BASE_URL}/Patient/Patient/SelectPatient?patientId=2568509`);
-              logParts.push(`  SelectPatient: status=${navRes.status}`);
-              const testRes2 = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+
+              // Approach 1: Direct ajaxFetch (current approach)
+              const t1 = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -1307,17 +1269,94 @@ Deno.serve(async (req) => {
                 },
                 body: new URLSearchParams({
                   sort: "", group: "", filter: "",
-                  patientId: "2568509",
-                  practiceId: _practiceId,
-                  fileCategoryId: "0",
+                  patientId: "2568509", practiceId: _practiceId, fileCategoryId: "0",
                 }).toString(),
               });
-              const parsed2 = JSON.parse(testRes2.body);
-              logParts.push(`  After SelectPatient: Total=${parsed2.Total}, Data.length=${(parsed2.Data||[]).length}`);
-              if ((parsed2.Data||[]).length > 0) {
-                logParts.push(`  FOUND FILES after nav! Keys: ${Object.keys(parsed2.Data[0]).join(", ")}`);
-                logParts.push(`  Sample: ${JSON.stringify(parsed2.Data[0]).substring(0, 500)}`);
-              }
+              logParts.push(`  A1 direct: ${t1.body.substring(0, 200)}`);
+
+              // Approach 2: Navigate to Patient page with patientId first (full page load)
+              const nav1 = await fetchWithCookies(`${BASE_URL}/Patient?patientId=2568509`);
+              logParts.push(`  Nav /Patient?patientId: status=${nav1.response.status}, finalUrl=${nav1.finalUrl}`);
+
+              const t2 = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                  "Referer": `${BASE_URL}/Patient`,
+                  "ClientPatientId": "2568509",
+                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                },
+                body: new URLSearchParams({
+                  sort: "", group: "", filter: "",
+                  patientId: "2568509", practiceId: _practiceId, fileCategoryId: "0",
+                }).toString(),
+              });
+              logParts.push(`  A2 after nav: ${t2.body.substring(0, 200)}`);
+
+              // Approach 3: Use SelectPatient via AJAX
+              const selRes = await ajaxFetch("/Patient/Patient/SelectPatient?patientId=2568509", {
+                method: "GET",
+                headers: { "ClientPatientId": "2568509" },
+              });
+              logParts.push(`  SelectPatient(AJAX): status=${selRes.status} body=${selRes.body.substring(0, 200)}`);
+
+              const t3 = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                  "Referer": `${BASE_URL}/Patient`,
+                  "ClientPatientId": "2568509",
+                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                },
+                body: new URLSearchParams({
+                  sort: "", group: "", filter: "",
+                  patientId: "2568509", practiceId: _practiceId, fileCategoryId: "0",
+                }).toString(),
+              });
+              logParts.push(`  A3 after select: ${t3.body.substring(0, 200)}`);
+
+              // Approach 4: Try SetPatientContext endpoint
+              const setCtx = await ajaxFetch("/Patient/Patient/SetPatientContext", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                  "ClientPatientId": "2568509",
+                },
+                body: new URLSearchParams({ patientId: "2568509" }).toString(),
+              });
+              logParts.push(`  SetPatientContext: status=${setCtx.status} body=${setCtx.body.substring(0, 200)}`);
+
+              const t4 = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                  "Referer": `${BASE_URL}/Patient`,
+                  "ClientPatientId": "2568509",
+                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                },
+                body: new URLSearchParams({
+                  sort: "", group: "", filter: "",
+                  patientId: "2568509", practiceId: _practiceId, fileCategoryId: "0",
+                }).toString(),
+              });
+              logParts.push(`  A4 after SetPatientContext: ${t4.body.substring(0, 200)}`);
+
+              // Approach 5: Try GetPatientFiles instead of GetFilesFromBlob
+              const t5 = await ajaxFetch("/Patient/Patient/GetPatientFiles", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                  "ClientPatientId": "2568509",
+                },
+                body: new URLSearchParams({
+                  patientId: "2568509", practiceId: _practiceId,
+                }).toString(),
+              });
+              logParts.push(`  A5 GetPatientFiles: status=${t5.status} body=${t5.body.substring(0, 300)}`);
+
+              // Approach 6: Log current session cookies to check auth state
+              logParts.push(`  Session cookies: ${sessionCookies.substring(0, 200)}`);
+
               logParts.push(`🧪 END TEST`);
             }
 
