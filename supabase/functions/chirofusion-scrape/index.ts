@@ -1186,6 +1186,27 @@ Deno.serve(async (req) => {
             logParts.push(`Processing ${patients.length} patients for medical file PDFs`);
             logParts.push(`DEBUG: isTimingOut=${isTimingOut()}, elapsed=${Date.now() - startTime}ms`);
 
+            // Test with a known-good patient (from user's curl) to verify GetFilesFromBlob works
+            logParts.push(`\n--- Testing GetFilesFromBlob with known patient 2568509 ---`);
+            const knownTestRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Referer": `${BASE_URL}/Patient`,
+                "ClientPatientId": "2568509",
+                ...(_practiceId ? { "practiceId": _practiceId } : {}),
+              },
+              body: new URLSearchParams({
+                sort: "",
+                group: "",
+                filter: "",
+                patientId: "2568509",
+                practiceId: _practiceId,
+              }).toString(),
+            });
+            logParts.push(`Known patient test: status=${knownTestRes.status} len=${knownTestRes.body.length}`);
+            logParts.push(`Known patient response: ${knownTestRes.body.substring(0, 500)}`);
+
             // Test search with first patient
             logParts.push(`\n--- Testing search with "${patients[0].lastName}, ${patients[0].firstName}" ---`);
             const testResult = await findPatientInfo(patients[0].firstName, patients[0].lastName, true);
@@ -1201,6 +1222,7 @@ Deno.serve(async (req) => {
             let processedCount = 0;
             let pdfCount = 0;
             let searchFailed = 0;
+            let withFiles = 0;
 
             // Helper: extract 2-digit birth year from DOB string like "10/04/1938"
             function birthYear2(dob: string): string {
@@ -1233,20 +1255,7 @@ Deno.serve(async (req) => {
                 const by2 = birthYear2(info.dob);
                 const fileName = `${patient.lastName}${by2}`.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 
-                // 2. Navigate to patient page to set server-side session context
-                const { body: ptBody, finalUrl: ptUrl } = await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patientId}`);
-                if (processedCount < 3) {
-                  logParts.push(`Patient page (id=${patientId}): bodyLen=${ptBody.length} finalUrl=${ptUrl}`);
-                  logParts.push(`Patient page body: ${ptBody.substring(0, 200)}`);
-                }
-
-                // 2b. Also try loading the patient via the Patient controller directly
-                const { body: ptBody2, finalUrl: ptUrl2 } = await fetchWithCookies(`${BASE_URL}/Patient/Patient?patientId=${patientId}`);
-                if (processedCount < 3) {
-                  logParts.push(`Patient/Patient page: bodyLen=${ptBody2.length} finalUrl=${ptUrl2}`);
-                }
-
-                // 3. Get file list via GetFilesFromBlob
+                // 2. Get file list via GetFilesFromBlob (no page navigation needed - API works directly)
                 const filesRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
                   method: "POST",
                   headers: {
@@ -1264,9 +1273,9 @@ Deno.serve(async (req) => {
                   }).toString(),
                 });
 
-                if (processedCount < 3) {
-                  logParts.push(`GetFilesFromBlob ${patient.firstName} ${patient.lastName} (id=${patientId}): status=${filesRes.status} len=${filesRes.body.length}`);
-                  logParts.push(`Response: ${filesRes.body.substring(0, 500)}`);
+                if (processedCount < 5 || (filesRes.body.length > 59)) {
+                  logParts.push(`GetFilesFromBlob ${patient.lastName} (id=${patientId}): status=${filesRes.status} len=${filesRes.body.length}`);
+                  if (filesRes.body.length > 59) logParts.push(`Response: ${filesRes.body.substring(0, 500)}`);
                 }
 
                 if (filesRes.status !== 200 || filesRes.body.length < 10) {
@@ -1311,6 +1320,7 @@ Deno.serve(async (req) => {
                 }
 
                 logParts.push(`${patient.firstName} ${patient.lastName}: ${blobNames.length} documents → ${fileName}`);
+                withFiles++;
 
                 // 5. Export as PDF (select all files, then export)
                 const exportBody = new URLSearchParams({
@@ -1371,10 +1381,10 @@ Deno.serve(async (req) => {
                 }).eq("id", job.id);
               }
 
-              await new Promise(r => setTimeout(r, 500));
+              await new Promise(r => setTimeout(r, 200));
             }
 
-            logParts.push(`✅ Medical Files complete: ${pdfCount} PDFs from ${processedCount} patients (${searchFailed} search failures)`);
+            logParts.push(`✅ Medical Files complete: ${pdfCount} PDFs from ${processedCount} patients (${withFiles} had files, ${searchFailed} search failures)`);
             hasAnyData = pdfCount > 0;
             break;
           }
