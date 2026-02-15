@@ -205,38 +205,88 @@ Deno.serve(async (req) => {
 
     // ==================== DISCOVER MODE ====================
     if (mode === "discover") {
-      const pages = [
-        { name: "Scheduler", url: `${BASE_URL}/User/Scheduler` },
-        { name: "Billing", url: `${BASE_URL}/Billing/` },
-      ];
+      // Load Scheduler page and extract ALL URLs, JS function calls, and AJAX patterns
+      try {
+        const { body: html, finalUrl } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
+        logParts.push(`===== SCHEDULER PAGE =====`);
+        logParts.push(`URL: ${finalUrl} | Length: ${html.length}`);
 
-      for (const page of pages) {
-        try {
-          const { body: html, finalUrl } = await fetchWithCookies(page.url);
-          const isLogin = html.includes("txtLoginUserName");
-          logParts.push(`\n===== ${page.name.toUpperCase()} =====`);
-          logParts.push(`Final URL: ${finalUrl} | Is Login: ${isLogin} | Length: ${html.length}`);
-          logParts.push(extractPageStructure(html));
-          logParts.push(`\n--- HTML (first 5000) ---\n${html.substring(0, 5000)}`);
-        } catch (err: any) {
-          logParts.push(`\n===== ${page.name.toUpperCase()} ERROR =====\n${err.message}`);
+        // Extract ALL URL patterns from JavaScript (ajax calls, fetch, $.get, $.post, etc.)
+        const urlPatterns: string[] = [];
+        const urlRegex = /(?:url|href|src|action|ajax|get|post|fetch)\s*[:(\s'"]+\s*['"]([^'"]+?)['"]/gi;
+        let urlMatch;
+        while ((urlMatch = urlRegex.exec(html)) !== null) {
+          const url = urlMatch[1];
+          if (url.startsWith("/") && !url.includes(".css") && !url.includes(".js") && !url.includes(".png") && !url.includes(".svg") && !url.includes(".ico")) {
+            urlPatterns.push(url);
+          }
         }
+        // Dedupe
+        const uniqueUrls = [...new Set(urlPatterns)].sort();
+        logParts.push(`\n===== ALL AJAX/URL PATTERNS (${uniqueUrls.length}) =====`);
+        for (const u of uniqueUrls) {
+          logParts.push(u);
+        }
+
+        // Find all function definitions related to "Patient", "Report", "Export"
+        const fnRegex = /function\s+(\w*(?:Patient|Report|Export|Excel|Run|Print)\w*)\s*\(/gi;
+        let fnMatch;
+        const functions: string[] = [];
+        while ((fnMatch = fnRegex.exec(html)) !== null) {
+          functions.push(fnMatch[1]);
+        }
+        logParts.push(`\n===== RELEVANT JS FUNCTIONS (${functions.length}) =====`);
+        for (const fn of functions) {
+          logParts.push(fn);
+        }
+
+        // Extract onclick handlers related to export/report
+        const onclickRegex = /onclick\s*=\s*"([^"]*(?:Export|Report|Patient|Excel|Print|Run)[^"]*)"/gi;
+        let onclickMatch;
+        const handlers: string[] = [];
+        while ((onclickMatch = onclickRegex.exec(html)) !== null) {
+          handlers.push(onclickMatch[1]);
+        }
+        logParts.push(`\n===== ONCLICK HANDLERS (${handlers.length}) =====`);
+        for (const h of handlers) {
+          logParts.push(h);
+        }
+
+        // Search for the "Export To Excel" and "Run Report" button HTML
+        const exportBtnRegex = /(?:<[^>]*(?:Export|Run Report|Print Report)[^>]*>[\s\S]{0,200})/gi;
+        let btnMatch;
+        logParts.push(`\n===== EXPORT/REPORT BUTTONS =====`);
+        while ((btnMatch = exportBtnRegex.exec(html)) !== null) {
+          logParts.push(btnMatch[0].substring(0, 300));
+        }
+
+        // Also search for "PatientReport" in script blocks
+        const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+        let scriptMatch;
+        logParts.push(`\n===== SCRIPT BLOCKS WITH 'PatientReport' or 'ExportPatient' =====`);
+        while ((scriptMatch = scriptRegex.exec(html)) !== null) {
+          const scriptContent = scriptMatch[1];
+          if (scriptContent.includes("PatientReport") || scriptContent.includes("ExportPatient") || scriptContent.includes("ExportToExcel") || scriptContent.includes("RunReport") || scriptContent.includes("btnRunReport") || scriptContent.includes("btnExport")) {
+            // Extract just the relevant lines
+            const lines = scriptContent.split("\n");
+            for (const line of lines) {
+              if (line.match(/patient|report|export|excel|print|run/i) && line.trim().length > 5) {
+                logParts.push(line.trim().substring(0, 300));
+              }
+            }
+          }
+        }
+
+      } catch (err: any) {
+        logParts.push(`SCHEDULER ERROR: ${err.message}`);
       }
 
-      // Also test key AJAX endpoints
-      const ajaxTests = [
-        "/Patient/Patient/GetAllPatientForLocalStorage",
-        "/User/Scheduler/GetPhysiciansForRunReport",
-        "/Dashboard/Dashboard/GetAllProviders",
-      ];
-      for (const endpoint of ajaxTests) {
-        try {
-          const { status, body, contentType } = await ajaxFetch(endpoint);
-          logParts.push(`\nAJAX ${endpoint}: status=${status} type=${contentType} length=${body.length}`);
-          logParts.push(`Body (first 1000): ${body.substring(0, 1000)}`);
-        } catch (err: any) {
-          logParts.push(`\nAJAX ${endpoint} ERROR: ${err.message}`);
-        }
+      // Also test the JSON patient endpoint
+      try {
+        const { status, body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
+        logParts.push(`\nJSON Patient endpoint: status=${status} type=${contentType} length=${body.length}`);
+      } catch (err: any) {
+        logParts.push(`JSON Patient endpoint ERROR: ${err.message}`);
       }
 
       await serviceClient.from("scrape_jobs").update({ status: "completed", progress: 100, log_output: logParts.join("\n") }).eq("id", job.id);
