@@ -128,6 +128,11 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ error: "ChiroFusion credentials not found." }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
+    const serviceClient = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    );
+
     // If continuing a batch, reuse existing job; otherwise create new one
     let job: any;
     if (_batchJobId) {
@@ -148,11 +153,6 @@ Deno.serve(async (req) => {
       }
       job = newJob;
     }
-
-    const serviceClient = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
 
     let sessionCookies = "";
     const logParts: string[] = _batchLogParts ? [..._batchLogParts] : [];
@@ -1367,6 +1367,15 @@ Deno.serve(async (req) => {
                   }).toString(),
                 });
 
+                // Debug: log first 10 non-default patients' GetFilesFromBlob responses
+                const isDebugPatient = (withFiles + searchFailed) < 10 && !allDefault;
+                if (isDebugPatient) {
+                  logParts.push(`🔍 ${patient.firstName} ${patient.lastName} (id=${patientId}): GetFilesFromBlob status=${filesRes.status} len=${filesRes.body.length}`);
+                  if (filesRes.body.length > 0 && filesRes.body.length < 2000) {
+                    logParts.push(`  Response: ${filesRes.body.substring(0, 1000)}`);
+                  }
+                }
+
                 if (filesRes.status !== 200 || filesRes.body.length < 10) {
                   processedCount++;
                   continue;
@@ -1376,6 +1385,9 @@ Deno.serve(async (req) => {
                 try { filesData = JSON.parse(filesRes.body); } catch { processedCount++; continue; }
 
                 const files = filesData.Data || (Array.isArray(filesData) ? filesData : []);
+                if (isDebugPatient) {
+                  logParts.push(`  Parsed: ${files.length} files, keys: ${files.length > 0 ? Object.keys(files[0]).join(", ") : "N/A"}`);
+                }
                 if (files.length === 0) {
                   processedCount++;
                   continue;
@@ -1389,7 +1401,7 @@ Deno.serve(async (req) => {
                 }
 
                 if (blobNames.length === 0) {
-                  if (processedCount < 3) logParts.push(`${patient.firstName} ${patient.lastName}: ${files.length} files but no blob name field. Keys: ${Object.keys(files[0]).join(", ")}`);
+                  if (isDebugPatient) logParts.push(`  ⚠️ ${files.length} files but no blob name field. Keys: ${Object.keys(files[0]).join(", ")}. Sample: ${JSON.stringify(files[0]).substring(0, 500)}`);
                   processedCount++;
                   continue;
                 }
