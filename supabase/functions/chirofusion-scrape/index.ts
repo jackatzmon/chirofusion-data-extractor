@@ -5,6 +5,61 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
+/** Extract forms, selects, inputs, and links from HTML for discovery */
+function extractPageStructure(html: string): string {
+  const lines: string[] = [];
+
+  // Extract form tags with action/method
+  const formRegex = /<form[^>]*>/gi;
+  let match;
+  while ((match = formRegex.exec(html)) !== null) {
+    lines.push(`FORM: ${match[0]}`);
+  }
+
+  // Extract select elements with their options
+  const selectRegex = /<select[^>]*id="([^"]*)"[^>]*>[\s\S]*?<\/select>/gi;
+  while ((match = selectRegex.exec(html)) !== null) {
+    const optionRegex = /<option[^>]*value="([^"]*)"[^>]*>([^<]*)<\/option>/gi;
+    let optMatch;
+    const opts: string[] = [];
+    while ((optMatch = optionRegex.exec(match[0])) !== null) {
+      opts.push(`${optMatch[1]}=${optMatch[2]}`);
+    }
+    lines.push(`SELECT#${match[1]}: ${opts.slice(0, 20).join(" | ")}`);
+  }
+
+  // Extract input fields
+  const inputRegex = /<input[^>]*(name|id)="([^"]*)"[^>]*>/gi;
+  while ((match = inputRegex.exec(html)) !== null) {
+    lines.push(`INPUT: ${match[0].substring(0, 200)}`);
+  }
+
+  // Extract script blocks that might contain AJAX URLs
+  const ajaxRegex = /\$\.(ajax|post|get)\s*\(\s*["']([^"']+)["']/gi;
+  while ((match = ajaxRegex.exec(html)) !== null) {
+    lines.push(`AJAX: $.${match[1]}("${match[2]}")`);
+  }
+
+  const fetchRegex = /fetch\s*\(\s*["']([^"']+)["']/gi;
+  while ((match = fetchRegex.exec(html)) !== null) {
+    lines.push(`FETCH: ${match[1]}`);
+  }
+
+  // Extract any URL patterns in script tags
+  const urlRegex = /["'](\/[A-Za-z]+\/[A-Za-z]+[^"']*?)["']/g;
+  const urls = new Set<string>();
+  while ((match = urlRegex.exec(html)) !== null) {
+    if (!match[1].includes('.css') && !match[1].includes('.js') && !match[1].includes('.png')) {
+      urls.add(match[1]);
+    }
+  }
+  if (urls.size > 0) {
+    lines.push(`URL_PATTERNS: ${[...urls].slice(0, 30).join(", ")}`);
+  }
+
+  return lines.join("\n");
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
@@ -28,7 +83,8 @@ Deno.serve(async (req) => {
     }
 
     const userId = claimsData.claims.sub as string;
-    const { dataTypes } = await req.json();
+    const body = await req.json();
+    const { dataTypes = [], mode = "scrape" } = body;
 
     // Get user's ChiroFusion credentials
     const { data: creds, error: credsError } = await supabase
@@ -44,7 +100,7 @@ Deno.serve(async (req) => {
     // Create a scrape job
     const { data: job, error: jobError } = await supabase
       .from("scrape_jobs")
-      .insert({ user_id: userId, data_types: dataTypes, status: "running" })
+      .insert({ user_id: userId, data_types: mode === "discover" ? ["discovery"] : dataTypes, status: "running", mode })
       .select()
       .single();
 
@@ -87,85 +143,66 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ error: loginError.message }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    // Step 2: Scrape each data type
+    // ==================== DISCOVER MODE ====================
+    if (mode === "discover") {
+      console.log("Running in DISCOVER mode...");
+      const logParts: string[] = [];
+
+      const pagesToFetch = [
+        { name: "Home", url: "https://www.chirofusionlive.com/" },
+        { name: "Scheduler", url: "https://www.chirofusionlive.com/User/Scheduler" },
+        { name: "Billing", url: "https://www.chirofusionlive.com/Billing/" },
+      ];
+
+      for (const page of pagesToFetch) {
+        try {
+          console.log(`Fetching ${page.name} page...`);
+          const res = await fetch(page.url, {
+            headers: { Cookie: sessionCookies },
+            redirect: "follow",
+          });
+
+          const html = await res.text();
+          const structure = extractPageStructure(html);
+
+          const section = `\n===== ${page.name.toUpperCase()} (${page.url}) =====\nStatus: ${res.status}\nFinal URL: ${res.url}\nHTML Length: ${html.length}\n\n${structure}\n\n--- RAW HTML (first 3000 chars) ---\n${html.substring(0, 3000)}\n`;
+
+          logParts.push(section);
+          console.log(`${page.name}: ${html.length} chars, extracted ${structure.split("\n").length} structure lines`);
+        } catch (err: any) {
+          logParts.push(`\n===== ${page.name.toUpperCase()} ERROR =====\n${err.message}\n`);
+          console.error(`Error fetching ${page.name}:`, err.message);
+        }
+      }
+
+      const fullLog = logParts.join("\n");
+
+      // Update job with discovery log
+      await serviceClient.from("scrape_jobs").update({
+        status: "completed",
+        progress: 100,
+        log_output: fullLog,
+      }).eq("id", job.id);
+
+      console.log("Discovery complete. Total log length:", fullLog.length);
+
+      return new Response(JSON.stringify({ success: true, jobId: job.id, mode: "discover" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // ==================== SCRAPE MODE (placeholder for Phase 2) ====================
+    console.log("Running in SCRAPE mode...");
     let progress = 0;
     const totalTypes = dataTypes.length;
 
     for (const dataType of dataTypes) {
       try {
         console.log(`Scraping ${dataType}...`);
-        let csvContent = "";
 
-        switch (dataType) {
-          case "demographics": {
-            const res = await fetch("https://www.chirofusionlive.com/api/Patient/GetAll", {
-              headers: { Cookie: sessionCookies, Accept: "application/json" },
-            });
-            const patients = await res.json();
-            if (Array.isArray(patients) && patients.length > 0) {
-              const headers = Object.keys(patients[0]);
-              csvContent = headers.join(",") + "\n" + patients.map((p: any) => headers.map((h) => `"${String(p[h] ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
-            }
-            break;
-          }
-          case "appointments": {
-            const res = await fetch("https://www.chirofusionlive.com/api/Appointment/GetAll", {
-              headers: { Cookie: sessionCookies, Accept: "application/json" },
-            });
-            const appts = await res.json();
-            if (Array.isArray(appts) && appts.length > 0) {
-              const headers = Object.keys(appts[0]);
-              csvContent = headers.join(",") + "\n" + appts.map((a: any) => headers.map((h) => `"${String(a[h] ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
-            }
-            break;
-          }
-          case "soap_notes": {
-            const res = await fetch("https://www.chirofusionlive.com/api/SoapNote/GetAll", {
-              headers: { Cookie: sessionCookies, Accept: "application/json" },
-            });
-            const notes = await res.json();
-            if (Array.isArray(notes) && notes.length > 0) {
-              const headers = Object.keys(notes[0]);
-              csvContent = headers.join(",") + "\n" + notes.map((n: any) => headers.map((h) => `"${String(n[h] ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
-            }
-            break;
-          }
-          case "financials": {
-            const res = await fetch("https://www.chirofusionlive.com/api/Billing/GetAll", {
-              headers: { Cookie: sessionCookies, Accept: "application/json" },
-            });
-            const bills = await res.json();
-            if (Array.isArray(bills) && bills.length > 0) {
-              const headers = Object.keys(bills[0]);
-              csvContent = headers.join(",") + "\n" + bills.map((b: any) => headers.map((h) => `"${String(b[h] ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
-            }
-            break;
-          }
-        }
-
-        if (csvContent) {
-          const filePath = `${userId}/${dataType}_${Date.now()}.csv`;
-          const blob = new Blob([csvContent], { type: "text/csv" });
-
-          const { error: uploadError } = await serviceClient.storage
-            .from("scraped-data")
-            .upload(filePath, blob, { contentType: "text/csv" });
-
-          if (uploadError) {
-            console.error(`Upload error for ${dataType}:`, uploadError);
-          } else {
-            const rowCount = csvContent.split("\n").length - 1;
-            await serviceClient.from("scraped_data_results").insert({
-              scrape_job_id: job.id,
-              user_id: userId,
-              data_type: dataType,
-              file_path: filePath,
-              row_count: rowCount,
-            });
-          }
-        } else {
-          console.log(`No data returned for ${dataType}`);
-        }
+        // Phase 2: Real scraping will be implemented after discovery
+        // For now, log that we need discovery data first
+        console.log(`${dataType}: Real scraping not yet implemented. Run discovery first.`);
 
         progress += Math.round(100 / totalTypes);
         await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress, 100) }).eq("id", job.id);
@@ -174,8 +211,11 @@ Deno.serve(async (req) => {
       }
     }
 
-    // Mark job complete
-    await serviceClient.from("scrape_jobs").update({ status: "completed", progress: 100 }).eq("id", job.id);
+    await serviceClient.from("scrape_jobs").update({
+      status: "completed",
+      progress: 100,
+      log_output: "Scrape mode: Real scraping not yet implemented. Run discovery first to map ChiroFusion's endpoints.",
+    }).eq("id", job.id);
 
     return new Response(JSON.stringify({ success: true, jobId: job.id }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
   } catch (error: any) {
