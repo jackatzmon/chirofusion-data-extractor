@@ -249,6 +249,96 @@ Deno.serve(async (req) => {
     const totalTypes = dataTypes.length;
     let hasAnyData = false;
 
+    // Shared: get full patient list with IDs for per-patient scraping
+    // Caches result so it's only fetched once even if multiple data types need it
+    let _cachedPatients: { id: number; firstName: string; lastName: string }[] | null = null;
+    async function getAllPatientIds(): Promise<{ id: number; firstName: string; lastName: string }[]> {
+      if (_cachedPatients) return _cachedPatients;
+
+      // Method 1: JSON endpoint (fast, but may return subset)
+      const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
+      if (contentType.includes("application/json")) {
+        try {
+          const parsed = JSON.parse(body);
+          const patients = parsed.PatientData || parsed;
+          if (Array.isArray(patients) && patients.length > 0) {
+            _cachedPatients = patients.map((p: any) => ({
+              id: p.I,
+              firstName: p.F || "",
+              lastName: p.L || "",
+            }));
+            logParts.push(`Patient list: ${_cachedPatients!.length} patients from JSON endpoint`);
+
+            // Method 2: If JSON only returned a few, try paginating the Patient Report HTML
+            if (_cachedPatients!.length < 50) {
+              logParts.push(`Only ${_cachedPatients!.length} from JSON, trying Patient Report pagination...`);
+              const allFromReport: { id: number; firstName: string; lastName: string }[] = [];
+              let page = 1;
+              let hasMore = true;
+
+              while (hasMore && page <= 200) {
+                const { body: reportHtml, status } = await ajaxFetch(
+                  `/User/Scheduler/GetPatientReportData?reportType=PatientList&patientStatus=All&page=${page}&pageSize=100`,
+                );
+                logParts.push(`Report page ${page}: status=${status} length=${reportHtml.length}`);
+
+                if (status !== 200 || reportHtml.length < 50) {
+                  hasMore = false;
+                  break;
+                }
+
+                // Try to parse as JSON (may return patient array with IDs)
+                try {
+                  const reportData = JSON.parse(reportHtml);
+                  const items = reportData.Data || reportData.data || reportData;
+                  if (Array.isArray(items) && items.length > 0) {
+                    for (const item of items) {
+                      const pid = item.PatientId || item.PkPatientId || item.Id || item.I;
+                      if (pid) {
+                        allFromReport.push({
+                          id: pid,
+                          firstName: item.FirstName || item.F || "",
+                          lastName: item.LastName || item.L || "",
+                        });
+                      }
+                    }
+                    if (items.length < 100) hasMore = false;
+                  } else {
+                    hasMore = false;
+                  }
+                } catch {
+                  // If HTML, try extracting patient IDs from links
+                  const linkRegex = /patientId[=:](\d+)/gi;
+                  let linkMatch;
+                  const foundIds = new Set<number>();
+                  while ((linkMatch = linkRegex.exec(reportHtml)) !== null) {
+                    const pid = parseInt(linkMatch[1]);
+                    if (pid && !foundIds.has(pid)) {
+                      foundIds.add(pid);
+                      allFromReport.push({ id: pid, firstName: "", lastName: "" });
+                    }
+                  }
+                  if (foundIds.size === 0) hasMore = false;
+                }
+                page++;
+                await new Promise(r => setTimeout(r, 300));
+              }
+
+              if (allFromReport.length > _cachedPatients!.length) {
+                _cachedPatients = allFromReport;
+                logParts.push(`✅ Patient list expanded to ${_cachedPatients!.length} via report pagination`);
+              }
+            }
+
+            return _cachedPatients!;
+          }
+        } catch { /* ignore */ }
+      }
+
+      _cachedPatients = [];
+      return _cachedPatients;
+    }
+
     for (const dataType of dataTypes) {
       try {
         console.log(`Scraping ${dataType}...`);
@@ -383,49 +473,41 @@ Deno.serve(async (req) => {
 
           // ==================== SOAP NOTES ====================
           case "soap_notes": {
-            // Get patient list first
-            const { body: patBody } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
-            let patients: any[] = [];
-            try {
-              const parsed = JSON.parse(patBody);
-              patients = parsed.PatientData || parsed;
-            } catch { /* ignore */ }
+            const patients = await getAllPatientIds();
 
-            if (!Array.isArray(patients) || patients.length === 0) {
+            if (patients.length === 0) {
               logParts.push(`⚠️ SOAP Notes: No patients found`);
               break;
             }
 
-            logParts.push(`Found ${patients.length} patients for SOAP notes`);
+            logParts.push(`Processing ${patients.length} patients for SOAP notes`);
 
-            // For each patient, try to get their SOAP note report
             const soapResults: string[] = [];
             let processedCount = 0;
 
             for (const patient of patients) {
-              const patientId = patient.I;
-              if (!patientId) continue;
+              if (!patient.id) continue;
 
               try {
-                // Try the SOAP note report endpoint
-                const { status, body: soapBody, contentType } = await ajaxFetch(
-                  `/User/Scheduler/GetSopaNoteReportDetailsAsync?patientId=${patientId}`
+                const { status, body: soapBody } = await ajaxFetch(
+                  `/User/Scheduler/GetSopaNoteReportDetailsAsync?patientId=${patient.id}`
                 );
 
                 if (status === 200 && soapBody.length > 10) {
-                  soapResults.push(`Patient ${patient.F} ${patient.L} (${patientId}): ${soapBody.substring(0, 200)}`);
-                  logParts.push(`SOAP ${patient.F} ${patient.L}: status=${status} length=${soapBody.length}`);
+                  soapResults.push(`Patient ${patient.firstName} ${patient.lastName} (${patient.id}): ${soapBody.substring(0, 200)}`);
+                  logParts.push(`SOAP ${patient.firstName} ${patient.lastName}: status=${status} length=${soapBody.length}`);
                 }
               } catch (err: any) {
-                logParts.push(`SOAP ${patient.F} ${patient.L} error: ${err.message}`);
+                logParts.push(`SOAP ${patient.firstName} ${patient.lastName} error: ${err.message}`);
               }
 
               processedCount++;
-              const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
-              await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + newProgress, 99) }).eq("id", job.id);
+              if (processedCount % 50 === 0) {
+                const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
+                await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + newProgress, 99) }).eq("id", job.id);
+              }
 
-              // Avoid hammering the server
-              await new Promise(r => setTimeout(r, 500));
+              await new Promise(r => setTimeout(r, 300));
             }
 
             if (soapResults.length > 0) {
@@ -433,51 +515,38 @@ Deno.serve(async (req) => {
               rowCount = soapResults.length;
               logParts.push(`✅ SOAP Notes: ${rowCount} patient records`);
             } else {
-              logParts.push(`⚠️ SOAP Notes: No data retrieved. May need PDF export approach.`);
+              logParts.push(`⚠️ SOAP Notes: No data retrieved.`);
             }
             break;
           }
 
           // ==================== FINANCIALS ====================
           case "financials": {
-            // Get patient list first
-            const { body: patBody } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
-            let patients: any[] = [];
-            try {
-              const parsed = JSON.parse(patBody);
-              patients = parsed.PatientData || parsed;
-            } catch { /* ignore */ }
+            const patients = await getAllPatientIds();
 
-            if (!Array.isArray(patients) || patients.length === 0) {
+            if (patients.length === 0) {
               logParts.push(`⚠️ Financials: No patients found`);
               break;
             }
 
-            logParts.push(`Found ${patients.length} patients for financials`);
+            logParts.push(`Processing ${patients.length} patients for financials`);
 
-            // Navigate to billing and try patient accounting for each patient
             const financialRows: Record<string, unknown>[] = [];
             let processedCount = 0;
 
             for (const patient of patients) {
-              const patientId = patient.I;
-              if (!patientId) continue;
+              if (!patient.id) continue;
 
               try {
-                // Set patient in session
-                await ajaxFetch(`/Patient/Patient/SetVisitIdInSession?patientId=${patientId}`, { method: "POST" });
+                await ajaxFetch(`/Patient/Patient/SetVisitIdInSession?patientId=${patient.id}`, { method: "POST" });
 
-                // Try to get patient accounting data
-                const { status, body: billingBody, contentType } = await ajaxFetch(
-                  `/Billing/PatientAccounting?patientId=${patientId}`
+                const { status, body: billingBody } = await ajaxFetch(
+                  `/Billing/PatientAccounting?patientId=${patient.id}`
                 );
 
                 if (status === 200 && billingBody.length > 100) {
-                  // Parse HTML tables for financial data
                   const tableRegex = /<table[^>]*>[\s\S]*?<\/table>/gi;
                   const tables = billingBody.match(tableRegex) || [];
-
-                  // Extract text content from table cells
                   const cellRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
                   let cellMatch;
                   const rowData: string[] = [];
@@ -491,23 +560,25 @@ Deno.serve(async (req) => {
 
                   if (rowData.length > 0) {
                     financialRows.push({
-                      PatientID: patientId,
-                      PatientName: `${patient.F} ${patient.L}`,
+                      PatientID: patient.id,
+                      PatientName: `${patient.firstName} ${patient.lastName}`,
                       RawData: rowData.join(" | "),
                     });
                   }
 
-                  logParts.push(`Financial ${patient.F} ${patient.L}: ${tables.length} tables, ${rowData.length} cells`);
+                  logParts.push(`Financial ${patient.firstName} ${patient.lastName}: ${tables.length} tables, ${rowData.length} cells`);
                 }
               } catch (err: any) {
-                logParts.push(`Financial ${patient.F} ${patient.L} error: ${err.message}`);
+                logParts.push(`Financial ${patient.firstName} ${patient.lastName} error: ${err.message}`);
               }
 
               processedCount++;
-              const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
-              await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + newProgress, 99) }).eq("id", job.id);
+              if (processedCount % 50 === 0) {
+                const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
+                await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress + newProgress, 99) }).eq("id", job.id);
+              }
 
-              await new Promise(r => setTimeout(r, 500));
+              await new Promise(r => setTimeout(r, 300));
             }
 
             if (financialRows.length > 0) {
