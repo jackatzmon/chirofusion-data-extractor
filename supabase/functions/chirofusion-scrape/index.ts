@@ -679,8 +679,8 @@ Deno.serve(async (req) => {
     }
 
     // Search for a patient by name using the real GetSearchedPatient endpoint
-    // Regular search: archiveFilter=0, Archive search: archiveFilter=1
-    async function searchPatient(searchText: string, archiveFilter: number, debugLog: boolean): Promise<number | null> {
+    // Returns { id, dob } or null
+    async function searchPatient(searchText: string, archiveFilter: number, debugLog: boolean): Promise<{ id: number; dob: string } | null> {
       const res = await ajaxFetch("/Patient/Patient/GetSearchedPatient", {
         method: "POST",
         headers: {
@@ -711,9 +711,10 @@ Deno.serve(async (req) => {
               logParts.push(`  Sample: ${JSON.stringify(arr[0]).substring(0, 400)}`);
             }
             const match = arr[0];
-            const patientId = match.File_Number || match.PatientId || match.Id || match.I || match.PkPatientId ||
+            const patientId = match.File_Number || match.PatientId || match.Id || match.PkPatientId ||
                              match.ClientPatientId || match.id || match.Value || match.value;
-            if (patientId) return Number(patientId);
+            const dob = match.Dob || match.dob || match.DateOfBirth || "";
+            if (patientId) return { id: Number(patientId), dob: String(dob) };
           }
         } catch { /* not JSON */ }
       }
@@ -721,17 +722,17 @@ Deno.serve(async (req) => {
     }
 
     // Search by name: first try regular search, then archive if not found
-    async function findPatientId(firstName: string, lastName: string, debugLog: boolean): Promise<number | null> {
+    async function findPatientInfo(firstName: string, lastName: string, debugLog: boolean): Promise<{ id: number; dob: string } | null> {
       const searchText = `${lastName}, ${firstName}`.trim();
       
       // Try regular search first
-      let id = await searchPatient(searchText, 0, debugLog);
-      if (id !== null) return id;
+      let result = await searchPatient(searchText, 0, debugLog);
+      if (result !== null) return result;
 
       // Not found — try archive search ("click here to load more")
       if (debugLog) logParts.push(`"${searchText}" not in regular search, trying archive...`);
-      id = await searchPatient(searchText, 1, debugLog);
-      return id;
+      result = await searchPatient(searchText, 1, debugLog);
+      return result;
     }
 
     for (const dataType of dataTypes) {
@@ -1187,12 +1188,11 @@ Deno.serve(async (req) => {
 
             // Test search with first patient
             logParts.push(`\n--- Testing search with "${patients[0].lastName}, ${patients[0].firstName}" ---`);
-            const testId = await findPatientId(patients[0].firstName, patients[0].lastName, true);
-            logParts.push(`Test result: patientId=${testId}`);
+            const testResult = await findPatientInfo(patients[0].firstName, patients[0].lastName, true);
+            logParts.push(`Test result: patientId=${testResult?.id} dob=${testResult?.dob}`);
 
-            if (testId === null) {
+            if (testResult === null) {
               logParts.push(`⚠️ Could not find a working search endpoint. Cannot process medical files.`);
-              // Save discovery log output for review
               await serviceClient.from("scrape_jobs").update({ log_output: logParts.join("\n") }).eq("id", job.id);
               break;
             }
@@ -1202,6 +1202,16 @@ Deno.serve(async (req) => {
             let pdfCount = 0;
             let searchFailed = 0;
 
+            // Helper: extract 2-digit birth year from DOB string like "10/04/1938"
+            function birthYear2(dob: string): string {
+              const parts = dob.split("/");
+              if (parts.length === 3) {
+                const year = parts[2];
+                return year.length >= 2 ? year.slice(-2) : "";
+              }
+              return "";
+            }
+
             for (const patient of patients) {
               if (isTimingOut()) {
                 logParts.push(`⏱️ Medical Files: Stopped at ${processedCount}/${patients.length} (timeout safety)`);
@@ -1209,32 +1219,21 @@ Deno.serve(async (req) => {
               }
 
               try {
-                // 1. Search for patient by name to get their ID
-                const patientId = processedCount === 0 ? testId : await findPatientId(patient.firstName, patient.lastName, processedCount < 3);
+                // 1. Search for patient by name to get their File_Number and DOB
+                const info = processedCount === 0 ? testResult : await findPatientInfo(patient.firstName, patient.lastName, processedCount < 3);
                 
-                if (!patientId) {
+                if (!info) {
                   searchFailed++;
                   if (processedCount < 5) logParts.push(`⚠️ Search failed: ${patient.firstName} ${patient.lastName}`);
                   processedCount++;
                   continue;
                 }
 
-                // 2. Navigate to patient page using the ID from search
-                const { body: patientPageBody, finalUrl } = await fetchWithCookies(`${BASE_URL}/Patient?patientId=${patientId}`);
-                if (processedCount < 3) {
-                  logParts.push(`Patient page ${patient.firstName} ${patient.lastName} (id=${patientId}): bodyLen=${patientPageBody.length} finalUrl=${finalUrl}`);
-                  logParts.push(`Patient page content: ${patientPageBody.substring(0, 300)}`);
-                }
+                const patientId = info.id;
+                const by2 = birthYear2(info.dob);
+                const fileName = `${patient.lastName}${by2}`.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 
-                // 2b. Also try navigating to the Medical File tab specifically
-                const { body: medFileBody, finalUrl: medFileUrl } = await fetchWithCookies(`${BASE_URL}/User/Patient/MedicalFile?patientId=${patientId}`);
-                if (processedCount < 3) {
-                  logParts.push(`Medical File page: bodyLen=${medFileBody.length} finalUrl=${medFileUrl}`);
-                  logParts.push(`Med File content: ${medFileBody.substring(0, 300)}`);
-                }
-
-                // 3. Try multiple endpoints for getting the file list
-                // 3a. GetFilesFromBlob
+                // 2. Get file list directly via GetFilesFromBlob (no patient page navigation needed)
                 const filesRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
                   method: "POST",
                   headers: {
@@ -1253,22 +1252,8 @@ Deno.serve(async (req) => {
                 });
 
                 if (processedCount < 3) {
-                  logParts.push(`GetFilesFromBlob ${patient.firstName} ${patient.lastName}: status=${filesRes.status} len=${filesRes.body.length}`);
+                  logParts.push(`GetFilesFromBlob ${patient.firstName} ${patient.lastName} (id=${patientId}): status=${filesRes.status} len=${filesRes.body.length}`);
                   logParts.push(`Response: ${filesRes.body.substring(0, 500)}`);
-                }
-
-                // 3b. Try GetMedicalFileList / GetPatientMedicalFile as alternatives
-                if (processedCount < 3) {
-                  const altEndpoints = [
-                    `/Patient/Patient/GetMedicalFileList?patientId=${patientId}`,
-                    `/Patient/Patient/GetPatientMedicalFile?patientId=${patientId}`,
-                    `/User/Scheduler/GetSopaNoteReportDetailsAsync?patientId=${patientId}`,
-                    `/Patient/Patient/GetPatientDocuments?patientId=${patientId}`,
-                  ];
-                  for (const ep of altEndpoints) {
-                    const res = await ajaxFetch(ep);
-                    logParts.push(`Alt ${ep.split("?")[0]}: status=${res.status} len=${res.body.length} preview=${res.body.substring(0, 300)}`);
-                  }
                 }
 
                 if (filesRes.status !== 200 || filesRes.body.length < 10) {
@@ -1276,7 +1261,7 @@ Deno.serve(async (req) => {
                   continue;
                 }
 
-                // 4. Parse file list
+                // 3. Parse file list
                 let filesData: any;
                 try {
                   filesData = JSON.parse(filesRes.body);
@@ -1299,7 +1284,7 @@ Deno.serve(async (req) => {
                   continue;
                 }
 
-                // 5. Extract blob names
+                // 4. Extract blob names from all files
                 const blobNames: string[] = [];
                 for (const file of files) {
                   const blobName = file.BlobName || file.blobName || file.FileName || file.fileName || file.Name || file.name || file.FileKey || file.fileKey;
@@ -1312,13 +1297,12 @@ Deno.serve(async (req) => {
                   continue;
                 }
 
-                logParts.push(`${patient.firstName} ${patient.lastName}: ${blobNames.length} documents`);
+                logParts.push(`${patient.firstName} ${patient.lastName}: ${blobNames.length} documents → ${fileName}`);
 
-                // 6. Export as PDF
-                const patientName = `${patient.firstName}${patient.lastName}`.replace(/[^a-zA-Z0-9]/g, "").substring(0, 20);
+                // 5. Export as PDF (select all files, then export)
                 const exportBody = new URLSearchParams({
                   BlobName: blobNames.join("|"),
-                  FileName: patientName || `patient_${patientId}`,
+                  FileName: fileName,
                 }).toString();
 
                 const pdfRes = await fetch(`${BASE_URL}/User/Navigation/ExportToPdf`, {
@@ -1340,7 +1324,7 @@ Deno.serve(async (req) => {
                 if (pdfRes.status === 200) {
                   const pdfBuffer = await pdfRes.arrayBuffer();
                   if (pdfBuffer.byteLength > 100) {
-                    const filePath = `${userId}/medical_files/${patientId}_${patientName}_${Date.now()}.pdf`;
+                    const filePath = `${userId}/medical_files/${fileName}_${Date.now()}.pdf`;
                     const blob = new Blob([pdfBuffer], { type: "application/pdf" });
                     const { error: uploadError } = await serviceClient.storage
                       .from("scraped-data")
