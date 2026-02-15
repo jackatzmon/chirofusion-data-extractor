@@ -709,8 +709,8 @@ Deno.serve(async (req) => {
     const totalTypes = dataTypes.length;
     let hasAnyData = false;
     // Collectors for consolidated workbook
-    const collectedSheets: { type: string; csv: string }[] = [];
-    const soapIndex: { PatientName: string; Documents: number; PDFLink: string }[] = [];
+    const collectedSheets: { type: string; csv: string }[] = _batchState?.collectedSheets || [];
+    const soapIndex: { PatientName: string; Documents: number; PDFLink: string; Status: string }[] = _batchState?.soapIndex || [];
 
     // Shared: get full patient list with IDs for per-patient scraping
     // Caches result so it's only fetched once even if multiple data types need it
@@ -1298,6 +1298,7 @@ Deno.serve(async (req) => {
                   resumeIndex: i,
                   pdfCount, searchFailed, withFiles, skippedDefaultCase,
                   dataTypeIndex: dataTypes.indexOf(dataType),
+                  soapIndex, collectedSheets,
                 });
                 return new Response(JSON.stringify({ success: true, jobId: job.id, batching: true }), {
                   headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -1324,6 +1325,7 @@ Deno.serve(async (req) => {
 
                 if (searchRes.status !== 200 || searchRes.body.length < 10) {
                   searchFailed++;
+                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: "Search failed" });
                   processedCount++;
                   continue;
                 }
@@ -1334,12 +1336,14 @@ Deno.serve(async (req) => {
                   searchData = Array.isArray(parsed) ? parsed : (parsed.Data || []);
                 } catch {
                   searchFailed++;
+                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: "Search failed" });
                   processedCount++;
                   continue;
                 }
 
                 if (searchData.length === 0) {
                   searchFailed++;
+                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: "Not found" });
                   processedCount++;
                   continue;
                 }
@@ -1352,6 +1356,7 @@ Deno.serve(async (req) => {
 
                 if (allDefault) {
                   skippedDefaultCase++;
+                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: "Default case only" });
                   processedCount++;
                   continue;
                 }
@@ -1424,18 +1429,20 @@ Deno.serve(async (req) => {
                 }
 
                 if (filesRes.status !== 200 || filesRes.body.length < 10) {
+                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: "No files" });
                   processedCount++;
                   continue;
                 }
 
                 let filesData: any;
-                try { filesData = JSON.parse(filesRes.body); } catch { processedCount++; continue; }
+                try { filesData = JSON.parse(filesRes.body); } catch { soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: "Parse error" }); processedCount++; continue; }
 
                 const files = filesData.Data || (Array.isArray(filesData) ? filesData : []);
                 if (isDebugPatient) {
                   logParts.push(`  Parsed: ${files.length} files, keys: ${files.length > 0 ? Object.keys(files[0]).join(", ") : "N/A"}`);
                 }
                 if (files.length === 0) {
+                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: "No files" });
                   processedCount++;
                   continue;
                 }
@@ -1449,6 +1456,7 @@ Deno.serve(async (req) => {
 
                 if (blobNames.length === 0) {
                   if (isDebugPatient) logParts.push(`  ⚠️ ${files.length} files but no blob name field. Keys: ${Object.keys(files[0]).join(", ")}. Sample: ${JSON.stringify(files[0]).substring(0, 500)}`);
+                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: files.length, PDFLink: "", Status: "No exportable files" });
                   processedCount++;
                   continue;
                 }
@@ -1495,6 +1503,7 @@ Deno.serve(async (req) => {
                         PatientName: `${patient.lastName}, ${patient.firstName}`,
                         Documents: blobNames.length,
                         PDFLink: signedUrlData?.signedUrl || filePath,
+                        Status: "✅ Downloaded",
                       });
                       pdfCount++;
                     }
@@ -1663,9 +1672,37 @@ Deno.serve(async (req) => {
       }
     }
 
-    // Add SOAP Notes Index sheet with PDF download links
+    // Add SOAP Notes Index sheet with PDF download links (clickable hyperlinks)
     if (soapIndex.length > 0) {
-      const ws = XLSX.utils.json_to_sheet(soapIndex);
+      // Build sheet data without the raw URL — use "📎 Open PDF" as display text
+      const sheetData = soapIndex.map(row => ({
+        PatientName: row.PatientName,
+        Documents: row.Documents,
+        Status: row.Status,
+        PDFLink: row.PDFLink || "",
+      }));
+      const ws = XLSX.utils.json_to_sheet(sheetData);
+      
+      // Add clickable hyperlinks to PDFLink column (column D, index 3)
+      for (let r = 0; r < soapIndex.length; r++) {
+        const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: 3 }); // +1 for header row
+        if (soapIndex[r].PDFLink) {
+          ws[cellRef] = {
+            t: "s",
+            v: "📎 Open PDF",
+            l: { Target: soapIndex[r].PDFLink },
+          };
+        }
+      }
+      
+      // Set column widths
+      ws["!cols"] = [
+        { wch: 30 }, // PatientName
+        { wch: 12 }, // Documents
+        { wch: 20 }, // Status
+        { wch: 15 }, // PDFLink
+      ];
+      
       XLSX.utils.book_append_sheet(wb, ws, "SOAP Notes Index");
     }
 
