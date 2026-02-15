@@ -631,7 +631,7 @@ Deno.serve(async (req) => {
     async function getAllPatientIds(): Promise<{ id: number; firstName: string; lastName: string }[]> {
       if (_cachedPatients) return _cachedPatients;
 
-      // Step 1: Load Scheduler page to get tokens and multiselect values
+      // Step 1: Load Scheduler page and run report to prime the session
       const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
       const token = schedHtml.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/)?.[1] || "";
       setPracticeId(schedHtml);
@@ -648,7 +648,7 @@ Deno.serve(async (req) => {
       }
       const allStatusValues = statusOpts.join("^") || "1^2^3";
 
-      // Step 2: Call GetPatientReports (same approach that got 2321 demographics)
+      // Step 2: Run GetPatientReports to prime the session (this returns demographics but no IDs)
       const reportRes = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
@@ -660,49 +660,38 @@ Deno.serve(async (req) => {
         }).toString(),
       });
 
+      let demographicCount = 0;
       if (reportRes.status === 200 && reportRes.body.length > 100) {
         try {
           const reportData = JSON.parse(reportRes.body);
           const items = reportData.Data || reportData.data || (Array.isArray(reportData) ? reportData : null);
-          if (items && Array.isArray(items) && items.length > 0) {
-            // Log sample item to understand field names
-            logParts.push(`Patient report sample keys: ${JSON.stringify(Object.keys(items[0]))}`);
-            logParts.push(`Patient report sample: ${JSON.stringify(items[0]).substring(0, 500)}`);
-            _cachedPatients = items.map((p: any) => ({
-              id: p.PkPatientId || p.PatientId || p.Id || p.I || p.ClientPatientId || p.patientId,
-              firstName: p.FirstName || p.F || p.PatientFirstName || "",
-              lastName: p.LastName || p.L || p.PatientLastName || "",
-            }));
-            const withId = _cachedPatients!.filter(p => p.id);
-            const withoutId = _cachedPatients!.filter(p => !p.id);
-            logParts.push(`✅ Patient list: ${_cachedPatients!.length} total, ${withId.length} with ID, ${withoutId.length} without ID`);
-            if (withoutId.length > 0 && withId.length === 0) {
-              // All IDs are missing - log all keys from first item to find the right field
-              logParts.push(`⚠️ No patient IDs found! All fields: ${JSON.stringify(items[0])}`);
-            }
-            return _cachedPatients!;
-          }
+          if (items && Array.isArray(items)) demographicCount = items.length;
         } catch { /* not JSON */ }
       }
+      logParts.push(`Report primed session: ${demographicCount} demographics returned`);
 
-      // Fallback: JSON endpoint (returns limited set)
-      logParts.push(`GetPatientReports failed (status=${reportRes.status} len=${reportRes.body.length}), falling back to JSON endpoint`);
-      const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
-      if (contentType.includes("application/json")) {
+      // Step 3: Now call GetAllPatientForLocalStorage - after priming, this should return more patients
+      // This endpoint has the actual patient IDs (p.I field)
+      const { body: lsBody, contentType: lsCt } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
+      if (lsCt.includes("application/json")) {
         try {
-          const parsed = JSON.parse(body);
+          const parsed = JSON.parse(lsBody);
           const patients = parsed.PatientData || parsed;
           if (Array.isArray(patients) && patients.length > 0) {
+            logParts.push(`GetAllPatientForLocalStorage: ${patients.length} patients, sample keys: ${JSON.stringify(Object.keys(patients[0]))}`);
+            logParts.push(`Sample patient: ${JSON.stringify(patients[0]).substring(0, 300)}`);
             _cachedPatients = patients.map((p: any) => ({
-              id: p.I,
-              firstName: p.F || "",
-              lastName: p.L || "",
+              id: p.I || p.Id || p.PatientId || p.PkPatientId,
+              firstName: p.F || p.FirstName || "",
+              lastName: p.L || p.LastName || "",
             }));
-            logParts.push(`Patient list (fallback): ${_cachedPatients!.length} patients from JSON`);
+            const withId = _cachedPatients!.filter(p => p.id);
+            logParts.push(`✅ Patient list: ${_cachedPatients!.length} total, ${withId.length} with valid IDs`);
             return _cachedPatients!;
           }
         } catch { /* ignore */ }
       }
+      logParts.push(`⚠️ GetAllPatientForLocalStorage failed or empty (status len=${lsBody.length}, ct=${lsCt})`);
 
       _cachedPatients = [];
       return _cachedPatients;
