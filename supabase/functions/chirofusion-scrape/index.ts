@@ -380,19 +380,58 @@ Deno.serve(async (req) => {
     }
 
     // Self-invoke to continue processing in a new batch
-    // CRITICAL: Only pass minimal state in the HTTP body to avoid size limits.
-    // Large data (soapIndex, collectedSheets, logParts) is stored in the DB.
+    // CRITICAL: Large data is stored in Supabase Storage to avoid batch_state JSONB size limits
+    // which cause DB statement timeouts with 16MB+ payloads.
+    async function saveLargeDataToStorage(key: string, data: any): Promise<void> {
+      const path = `_batch_tmp/${job.id}/${key}.json`;
+      const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+      // Upsert: remove first then upload (storage doesn't support overwrite by default)
+      await serviceClient.storage.from("scraped-data").remove([path]);
+      await serviceClient.storage.from("scraped-data").upload(path, blob, { contentType: "application/json" });
+    }
+
+    async function loadLargeDataFromStorage(key: string, fallback: any = []): Promise<any> {
+      const path = `_batch_tmp/${job.id}/${key}.json`;
+      const { data, error } = await serviceClient.storage.from("scraped-data").download(path);
+      if (error || !data) return fallback;
+      try {
+        return JSON.parse(await data.text());
+      } catch { return fallback; }
+    }
+
     async function selfInvoke(batchState: any) {
       logParts.push(`🔄 Batch timeout — continuing from patient ${batchState.resumeIndex}...`);
-      // Save ALL large data to DB (batch_state + log_output)
+      
+      // Save large data arrays to Storage instead of batch_state to avoid statement timeouts
+      try {
+        await Promise.all([
+          saveLargeDataToStorage("collectedSheets", collectedSheets),
+          saveLargeDataToStorage("soapIndex", soapIndex),
+          saveLargeDataToStorage("financialsLedgerRows", batchState.financialsLedgerRows || []),
+          saveLargeDataToStorage("appointmentsIndex", batchState.appointmentsIndex || []),
+        ]);
+      } catch (storageErr) {
+        logParts.push(`⚠️ Storage save error: ${(storageErr as any).message}`);
+      }
+
+      // Only save minimal counters in batch_state (small JSONB)
       await serviceClient.from("scrape_jobs").update({
         log_output: logParts.join("\n"),
         batch_state: {
-          ...batchState,
-          soapIndex,
-          collectedSheets,
-          financialsLedgerRows: batchState.financialsLedgerRows || [],
-          appointmentsIndex: batchState.appointmentsIndex || [],
+          resumeIndex: batchState.resumeIndex,
+          pdfCount: batchState.pdfCount,
+          searchFailed: batchState.searchFailed,
+          withFiles: batchState.withFiles,
+          skippedDefaultCase: batchState.skippedDefaultCase,
+          dataTypeIndex: batchState.dataTypeIndex,
+          ledgerFetched: batchState.ledgerFetched,
+          ledgerEmpty: batchState.ledgerEmpty,
+          ledgerSearchFailed: batchState.ledgerSearchFailed,
+          apptPdfIndex: batchState.apptPdfIndex,
+          apptPdfCount: batchState.apptPdfCount,
+          apptSearchFailed: batchState.apptSearchFailed,
+          // Flag to indicate large data is in storage
+          _dataInStorage: true,
         },
       }).eq("id", job.id);
 
@@ -408,7 +447,6 @@ Deno.serve(async (req) => {
         body: JSON.stringify({
           dataTypes, mode, dateFrom, dateTo,
           _batchJobId: job.id,
-          // Only pass minimal counters — large data is read from DB
           _batchState: {
             resumeIndex: batchState.resumeIndex,
             pdfCount: batchState.pdfCount,
@@ -908,12 +946,21 @@ Deno.serve(async (req) => {
     let progress = 0;
     const totalTypes = dataTypes.length;
     let hasAnyData = false;
-    // Collectors for consolidated workbook — restore from DB batch_state on resume
+    // Collectors for consolidated workbook — restore from Storage on resume
     const dbBatchState = _batchJobId && job.batch_state ? job.batch_state as any : {};
-    const collectedSheets: { type: string; csv: string }[] = dbBatchState.collectedSheets || [];
-    const soapIndex: { PatientName: string; Documents: number; PDFLink: string; Status: string }[] = dbBatchState.soapIndex || [];
-    const financialsLedgerRows: Record<string, string>[] = dbBatchState.financialsLedgerRows || [];
-    const appointmentsIndex: { PatientName: string; Appointments: number; PDFLink: string; Status: string }[] = dbBatchState.appointmentsIndex || [];
+    const useStorage = dbBatchState._dataInStorage === true;
+    const collectedSheets: { type: string; csv: string }[] = useStorage
+      ? await loadLargeDataFromStorage("collectedSheets", [])
+      : (dbBatchState.collectedSheets || []);
+    const soapIndex: { PatientName: string; Documents: number; PDFLink: string; Status: string }[] = useStorage
+      ? await loadLargeDataFromStorage("soapIndex", [])
+      : (dbBatchState.soapIndex || []);
+    const financialsLedgerRows: Record<string, string>[] = useStorage
+      ? await loadLargeDataFromStorage("financialsLedgerRows", [])
+      : (dbBatchState.financialsLedgerRows || []);
+    const appointmentsIndex: { PatientName: string; Appointments: number; PDFLink: string; Status: string }[] = useStorage
+      ? await loadLargeDataFromStorage("appointmentsIndex", [])
+      : (dbBatchState.appointmentsIndex || []);
 
     // Shared: get full patient list with IDs for per-patient scraping
     // Caches result so it's only fetched once even if multiple data types need it
@@ -2189,6 +2236,14 @@ Deno.serve(async (req) => {
         logParts.push(`✅ Consolidated workbook: ${filePath} (${wb.SheetNames.join(", ")} — ${totalRows} total rows)`);
       }
     }
+
+    // Cleanup temp batch storage files
+    try {
+      const tmpFiles = ["collectedSheets", "soapIndex", "financialsLedgerRows", "appointmentsIndex"];
+      await serviceClient.storage.from("scraped-data").remove(
+        tmpFiles.map(f => `_batch_tmp/${job.id}/${f}.json`)
+      );
+    } catch { /* ignore cleanup errors */ }
 
     const finalMessage = hasAnyData ? null : "No data was retrieved. Check the log for details.";
     await serviceClient.from("scrape_jobs").update({

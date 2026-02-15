@@ -102,9 +102,10 @@ const Dashboard = () => {
         navigate("/auth");
         return;
       }
-      const { error } = hasCreds
-        ? await supabase.from("chirofusion_credentials").update({ cf_username: cfUsername, cf_password: cfPassword }).eq("user_id", user.id)
-        : await supabase.from("chirofusion_credentials").insert({ user_id: user.id, cf_username: cfUsername, cf_password: cfPassword });
+      const { error } = await supabase.from("chirofusion_credentials").upsert(
+        { user_id: user.id, cf_username: cfUsername, cf_password: cfPassword },
+        { onConflict: "user_id" }
+      );
       if (error) {
         toast({ title: "Error", description: error.message, variant: "destructive" });
       } else {
