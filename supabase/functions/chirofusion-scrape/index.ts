@@ -514,23 +514,34 @@ Deno.serve(async (req) => {
                 };
 
                 // Step 2a: First "Run" the report via AJAX (this generates data server-side)
-                // Try multiple possible "run report" endpoints
+                // Kendo UI grids require pagination params or they return empty
+                const kendoParams = {
+                  take: "5000",
+                  skip: "0",
+                  page: "1",
+                  pageSize: "5000",
+                };
+
+                // Try multiple possible "run report" endpoints with Kendo params
                 const runEndpoints = [
                   "/User/Scheduler/GetPatientReports",
                   "/User/Scheduler/RunPatientReport",
                   "/User/Scheduler/GetPatientReportData",
                 ];
                 for (const endpoint of runEndpoints) {
+                  if (found) break;
                   try {
+                    // Try with Kendo grid params
+                    const allParams = { ...reportParams, ...kendoParams };
                     const runRes = await ajaxFetch(endpoint, {
                       method: "POST",
                       headers: {
                         "Content-Type": "application/x-www-form-urlencoded",
-                        "__RequestVerificationToken": schedToken,
+                        "RequestVerificationToken": schedToken,
                       },
-                      body: new URLSearchParams(reportParams).toString(),
+                      body: new URLSearchParams(allParams).toString(),
                     });
-                    logParts.push(`Run ${endpoint}: status=${runRes.status} length=${runRes.body.length} type=${runRes.contentType}`);
+                    logParts.push(`Run ${endpoint} (kendo): status=${runRes.status} length=${runRes.body.length} type=${runRes.contentType}`);
                     if (runRes.body.length > 50) {
                       logParts.push(`  Preview: ${runRes.body.substring(0, 300)}`);
                     }
@@ -538,7 +549,7 @@ Deno.serve(async (req) => {
                     if (runRes.status === 200 && runRes.body.length > 50 && runRes.contentType.includes("json")) {
                       try {
                         const data = JSON.parse(runRes.body);
-                        const items = data.Data || data.data || data.Items || (Array.isArray(data) ? data : null);
+                        const items = data.Data || data.data || data.Items || data.Result || (Array.isArray(data) ? data : null);
                         if (items && Array.isArray(items) && items.length > 0) {
                           csvContent = jsonToCsv(items);
                           rowCount = items.length;
@@ -546,7 +557,36 @@ Deno.serve(async (req) => {
                           found = true;
                           break;
                         }
+                        // Check if Total exists but Data is nested differently
+                        if (data.Total && data.Total > 0) {
+                          logParts.push(`  Server reports Total=${data.Total} but Data array not found. Keys: ${Object.keys(data).join(", ")}`);
+                        }
                       } catch { /* not parseable JSON array */ }
+                    }
+
+                    // Also try without Kendo params (plain form submit)
+                    if (!found) {
+                      const runRes2 = await ajaxFetch(endpoint, {
+                        method: "POST",
+                        headers: {
+                          "Content-Type": "application/x-www-form-urlencoded",
+                          "RequestVerificationToken": schedToken,
+                        },
+                        body: new URLSearchParams(reportParams).toString(),
+                      });
+                      logParts.push(`Run ${endpoint} (plain): status=${runRes2.status} length=${runRes2.body.length}`);
+                      if (runRes2.status === 200 && runRes2.body.length > 50 && runRes2.contentType.includes("json")) {
+                        try {
+                          const data = JSON.parse(runRes2.body);
+                          const items = data.Data || data.data || data.Items || data.Result || (Array.isArray(data) ? data : null);
+                          if (items && Array.isArray(items) && items.length > 0) {
+                            csvContent = jsonToCsv(items);
+                            rowCount = items.length;
+                            logParts.push(`  ✅ Demographics from ${endpoint} (plain): ${rowCount} patients`);
+                            found = true;
+                          }
+                        } catch { /* ignore */ }
+                      }
                     }
                   } catch (err: any) {
                     logParts.push(`Run ${endpoint} error: ${err.message}`);
@@ -604,7 +644,7 @@ Deno.serve(async (req) => {
                       method: "POST",
                       headers: {
                         "Content-Type": "application/x-www-form-urlencoded",
-                        "__RequestVerificationToken": schedToken,
+                        "RequestVerificationToken": schedToken,
                       },
                       body: params.toString(),
                     });
@@ -613,7 +653,7 @@ Deno.serve(async (req) => {
                       logParts.push(`AJAX Preview: ${ajaxRes.body.substring(0, 300)}`);
                       try {
                         const data = JSON.parse(ajaxRes.body);
-                        const items = data.Data || data.data || data.Items || (Array.isArray(data) ? data : null);
+                        const items = data.Data || data.data || data.Items || data.Result || (Array.isArray(data) ? data : null);
                         if (items && Array.isArray(items) && items.length > 0) {
                           csvContent = jsonToCsv(items);
                           rowCount = items.length;
