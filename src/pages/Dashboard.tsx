@@ -71,7 +71,15 @@ const Dashboard = () => {
   useEffect(() => {
     const hasRunning = jobs.some((j) => j.status === "running");
     if (!hasRunning) return;
-    const interval = setInterval(() => { loadJobs(); loadResults(); }, 3000);
+    // Stop polling after 5 minutes to avoid infinite polling on stale jobs
+    const startedAt = Date.now();
+    const interval = setInterval(() => {
+      if (Date.now() - startedAt > 5 * 60 * 1000) {
+        clearInterval(interval);
+        return;
+      }
+      loadJobs(); loadResults();
+    }, 5000);
     return () => clearInterval(interval);
   }, [jobs, loadJobs]);
 

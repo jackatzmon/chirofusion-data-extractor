@@ -55,6 +55,15 @@ function extractPageStructure(html: string): string {
   return lines.join("\n");
 }
 
+// Mark stale running jobs as failed (in case previous runs were killed by CPU timeout)
+async function cleanupStaleJobs(supabase: any) {
+  const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  await supabase.from("scrape_jobs")
+    .update({ status: "failed", error_message: "Job timed out (CPU limit exceeded). Try selecting fewer data types per run." })
+    .eq("status", "running")
+    .lt("created_at", tenMinutesAgo);
+}
+
 /** Convert JSON array to CSV string */
 function jsonToCsv(data: Record<string, unknown>[]): string {
   if (!data.length) return "";
@@ -99,6 +108,10 @@ Deno.serve(async (req) => {
     }
 
     const userId = user.id;
+
+    // Cleanup any stale running jobs from previous crashed runs
+    await cleanupStaleJobs(supabase);
+
     const body = await req.json();
     const { dataTypes = [], mode = "scrape", dateFrom, dateTo } = body;
 
@@ -131,7 +144,7 @@ Deno.serve(async (req) => {
     let sessionCookies = "";
     const logParts: string[] = [];
     const startTime = Date.now();
-    const MAX_RUNTIME_MS = 140_000; // 140s safety margin (Supabase limit ~150s)
+    const MAX_RUNTIME_MS = 120_000; // 120s safety margin (Supabase CPU limit)
 
     function isTimingOut(): boolean {
       return (Date.now() - startTime) > MAX_RUNTIME_MS;
