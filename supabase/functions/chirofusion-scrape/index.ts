@@ -1186,6 +1186,18 @@ Deno.serve(async (req) => {
             logParts.push(`Processing ${patients.length} patients for medical file PDFs`);
             logParts.push(`DEBUG: isTimingOut=${isTimingOut()}, elapsed=${Date.now() - startTime}ms`);
 
+            // Initialize Patient module by fetching the Patient page once
+            logParts.push(`\n--- Initializing Patient module ---`);
+            try {
+              const { body: patientPageHtml } = await fetchWithCookies(`${BASE_URL}/Patient`);
+              logParts.push(`Patient page: ${patientPageHtml.length} chars`);
+              // Extract any tokens from the patient page
+              const patientToken = extractVerifToken(patientPageHtml);
+              if (patientToken) logParts.push(`Patient page token: ${patientToken.substring(0, 20)}...`);
+            } catch (e: any) {
+              logParts.push(`Patient page fetch failed: ${e.message}`);
+            }
+
             // Helper: call GetFileCategory to set patient context before GetFilesFromBlob
             async function setPatientContext(pid: string): Promise<void> {
               await ajaxFetch("/Patient/Patient/GetFileCategory", {
@@ -1200,18 +1212,10 @@ Deno.serve(async (req) => {
 
             // Test with a known-good patient (from user's curl) to verify GetFilesFromBlob works
             logParts.push(`\n--- Testing GetFilesFromBlob with known patient 2568509 ---`);
-            // Step 1: Set patient context via GetFileCategory
-            const catRes = await ajaxFetch("/Patient/Patient/GetFileCategory", {
-              method: "GET",
-              headers: {
-                "Referer": `${BASE_URL}/Patient`,
-                "ClientPatientId": "2568509",
-                ...(_practiceId ? { "practiceId": _practiceId } : {}),
-              },
-            });
-            logParts.push(`GetFileCategory context: status=${catRes.status} len=${catRes.body.length}`);
-            // Step 2: Now fetch files
-            const knownTestRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+
+            // Strategy A: GetFileCategory context + GetFilesFromBlob
+            await setPatientContext("2568509");
+            const testResA = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
               method: "POST",
               headers: {
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -1220,15 +1224,71 @@ Deno.serve(async (req) => {
                 ...(_practiceId ? { "practiceId": _practiceId } : {}),
               },
               body: new URLSearchParams({
-                sort: "",
-                group: "",
-                filter: "",
-                patientId: "2568509",
-                practiceId: _practiceId,
+                sort: "", group: "", filter: "",
+                patientId: "2568509", practiceId: _practiceId,
               }).toString(),
             });
-            logParts.push(`Known patient test: status=${knownTestRes.status} len=${knownTestRes.body.length}`);
-            logParts.push(`Known patient response: ${knownTestRes.body.substring(0, 500)}`);
+            logParts.push(`Strategy A (GetFileCategory+GetFilesFromBlob): status=${testResA.status} len=${testResA.body.length}`);
+            logParts.push(`Response A: ${testResA.body.substring(0, 300)}`);
+
+            // Strategy B: Try navigating to patient detail page first
+            try {
+              const { body: detailHtml } = await fetchWithCookies(`${BASE_URL}/Patient?patientId=2568509`);
+              logParts.push(`Patient detail page: ${detailHtml.length} chars, contains "permission"=${detailHtml.toLowerCase().includes("permission")}`);
+            } catch (e: any) {
+              logParts.push(`Patient detail page failed: ${e.message}`);
+            }
+            const testResB = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Referer": `${BASE_URL}/Patient`,
+                "ClientPatientId": "2568509",
+                ...(_practiceId ? { "practiceId": _practiceId } : {}),
+              },
+              body: new URLSearchParams({
+                sort: "", group: "", filter: "",
+                patientId: "2568509", practiceId: _practiceId,
+              }).toString(),
+            });
+            logParts.push(`Strategy B (detail page+GetFilesFromBlob): status=${testResB.status} len=${testResB.body.length}`);
+            logParts.push(`Response B: ${testResB.body.substring(0, 300)}`);
+
+            // Strategy C: Try GetMedicalFileList endpoint instead
+            try {
+              const testResC = await ajaxFetch(`/Patient/Patient/GetMedicalFileList?patientId=2568509`, {
+                method: "GET",
+                headers: {
+                  "Referer": `${BASE_URL}/Patient`,
+                  "ClientPatientId": "2568509",
+                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                },
+              });
+              logParts.push(`Strategy C (GetMedicalFileList): status=${testResC.status} len=${testResC.body.length}`);
+              logParts.push(`Response C: ${testResC.body.substring(0, 300)}`);
+            } catch (e: any) {
+              logParts.push(`Strategy C failed: ${e.message}`);
+            }
+
+            // Strategy D: Try GetPatientMedicalFile endpoint
+            try {
+              const testResD = await ajaxFetch(`/Patient/Patient/GetPatientMedicalFile?patientId=2568509`, {
+                method: "GET",
+                headers: {
+                  "Referer": `${BASE_URL}/Patient`,
+                  "ClientPatientId": "2568509",
+                  ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                },
+              });
+              logParts.push(`Strategy D (GetPatientMedicalFile): status=${testResD.status} len=${testResD.body.length}`);
+              logParts.push(`Response D: ${testResD.body.substring(0, 300)}`);
+            } catch (e: any) {
+              logParts.push(`Strategy D failed: ${e.message}`);
+            }
+
+            // Use best working strategy result for known test
+            const knownTestRes = testResB.body.length > testResA.body.length ? testResB : testResA;
+            logParts.push(`Best result: len=${knownTestRes.body.length}`);
 
             // Test search with first patient
             logParts.push(`\n--- Testing search with "${patients[0].lastName}, ${patients[0].firstName}" ---`);
