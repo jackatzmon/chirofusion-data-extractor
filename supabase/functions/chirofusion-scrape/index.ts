@@ -544,26 +544,45 @@ Deno.serve(async (req) => {
                   logParts.push(`INPUT: ${inputMatch[0].substring(0, 300)}`);
                 }
 
-                // Try standard HTML select extraction too
-                const reportTypes = extractSelectOptions(schedHtml, "ReportType");
-                const patientStatuses = extractSelectOptions(schedHtml, "PatientStatus");
-                if (reportTypes.length) logParts.push(`HTML ReportType options: ${JSON.stringify(reportTypes.slice(0, 10))}`);
-                if (patientStatuses.length) logParts.push(`HTML PatientStatus options: ${JSON.stringify(patientStatuses.slice(0, 10))}`);
+                // Extract RunPatientReport and ExportPatientReport function bodies
+                const fnBodyRegex = /function\s+(RunPatientReport|ExportPatientReport|ExportPatientList)\s*\([^)]*\)\s*\{([\s\S]{0,1500}?)\n\s*\}/g;
+                let fnBodyMatch;
+                while ((fnBodyMatch = fnBodyRegex.exec(schedHtml)) !== null) {
+                  logParts.push(`FN BODY ${fnBodyMatch[1]}: ${fnBodyMatch[2].replace(/\s+/g, " ").substring(0, 500)}`);
+                }
 
-                const patientReportType = reportTypes.find(
-                  o => o.text.toLowerCase().includes("patient") && o.text.toLowerCase().includes("list")
-                )?.value || reportTypes.find(
-                  o => o.text.toLowerCase().includes("patient")
-                )?.value || "1";
+                // Find the Kendo grid datasource for patient reports
+                const gridDsRegex = /patientReportGrid[\s\S]{0,500}?read\s*:\s*(?:["']([^"']+)["']|\{[^}]*url\s*:\s*["']([^"']+)["'])/gi;
+                let gridMatch;
+                while ((gridMatch = gridDsRegex.exec(schedHtml)) !== null) {
+                  logParts.push(`PATIENT REPORT GRID READ URL: ${gridMatch[1] || gridMatch[2]}`);
+                }
 
-                const allStatusValues = patientStatuses.map(o => o.value).filter(Boolean).join(",");
+                // Also search for GetPatientReports in any context
+                const getPRRegex = /GetPatientReport[^"'\s]*/gi;
+                const prEndpoints = new Set<string>();
+                let prMatch;
+                while ((prMatch = getPRRegex.exec(schedHtml)) !== null) {
+                  prEndpoints.add(prMatch[0]);
+                }
+                logParts.push(`GetPatientReport* variants: ${JSON.stringify([...prEndpoints])}`);
 
-                // Build report parameters
+                // Find AdditionalRunReportData function (used in Kendo transport)
+                const additionalDataRegex = /function\s+AdditionalRunReportData\s*\([^)]*\)\s*\{([\s\S]{0,500}?)\}/g;
+                const addMatch = additionalDataRegex.exec(schedHtml);
+                if (addMatch) {
+                  logParts.push(`AdditionalRunReportData: ${addMatch[1].replace(/\s+/g, " ").substring(0, 300)}`);
+                }
+
+                // Build report parameters using CORRECT field names from the actual form
+                // The visible form uses PatientReportType, the hidden export form uses ReportType
                 const reportParams: Record<string, string> = {
-                  ReportType: patientReportType,
-                  PatientStatus: allStatusValues || "Active",
-                  PatientStatusString: allStatusValues || "Active",
+                  PatientReportType: "1",  // Patient List
+                  ReportType: "1",
+                  PatientStatus: "Active",
+                  PatientStatusString: "Active",
                   IsAllPatientValue: "true",
+                  IsAllPatient: "true",
                   BirthMonths: "",
                   BirthMonthString: "",
                   PatientInsurance: "",
@@ -571,13 +590,11 @@ Deno.serve(async (req) => {
                   isOverrideDate: "false",
                 };
 
-                // Step 2a: TRIGGER report generation by calling GetPatientReports
-                // This endpoint returns empty (length=0) as acknowledgment that generation started
+                // Step 2a: TRIGGER report generation
                 const endpoint = "/User/Scheduler/GetPatientReports";
-                logParts.push(`Step 2a: Triggering report generation...`);
+                logParts.push(`Step 2a: Triggering report generation with corrected params...`);
                 
-                // Fire the trigger with multiple param formats to maximize chances
-                // Format 1: URL-encoded with token in body
+                // Try with form data (include both field name variants)
                 try {
                   const triggerParams = new URLSearchParams({
                     ...reportParams,
@@ -595,7 +612,6 @@ Deno.serve(async (req) => {
                   logParts.push(`Trigger (form): status=${runRes.status} length=${runRes.body.length}`);
                   if (runRes.body.length > 10) {
                     logParts.push(`  Preview: ${runRes.body.substring(0, 400)}`);
-                    // If it actually returned data directly, use it
                     if (runRes.status === 200 && runRes.body.length > 50 && runRes.contentType.includes("json")) {
                       try {
                         const data = JSON.parse(runRes.body);
@@ -605,31 +621,13 @@ Deno.serve(async (req) => {
                           rowCount = items.length;
                           logParts.push(`  ✅ Demographics direct: ${rowCount} patients`);
                           found = true;
+                        } else {
+                          logParts.push(`  Response keys: ${Object.keys(data).join(",")}, Total: ${data.Total || "N/A"}`);
                         }
                       } catch { /* not JSON array */ }
                     }
                   }
                 } catch (e: any) { logParts.push(`Trigger error: ${e.message}`); }
-
-                // Format 2: JSON body
-                if (!found) {
-                  try {
-                    const jsonBody = JSON.stringify({
-                      ...reportParams,
-                      take: 5000, skip: 0, page: 1, pageSize: 5000,
-                    });
-                    const runRes = await ajaxFetch(endpoint, {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/json",
-                        "RequestVerificationToken": schedToken,
-                      },
-                      body: jsonBody,
-                    });
-                    logParts.push(`Trigger (JSON): status=${runRes.status} length=${runRes.body.length}`);
-                    if (runRes.body.length > 10) logParts.push(`  Preview: ${runRes.body.substring(0, 400)}`);
-                  } catch (e: any) { logParts.push(`JSON trigger error: ${e.message}`); }
-                }
 
                 // Try any discovered URLs from page JS
                 for (const discUrl of uniqueDiscovered) {
