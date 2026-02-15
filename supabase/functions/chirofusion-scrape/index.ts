@@ -400,100 +400,111 @@ Deno.serve(async (req) => {
         switch (dataType) {
           // ==================== DEMOGRAPHICS ====================
           case "demographics": {
-            // Real endpoint discovered: /Scheduler/Scheduler/GetPatientReports
+            // Real endpoint: /Scheduler/Scheduler/GetPatientReports
             // RunPatientReport sends: ReportType, BirthMonths, PatientStatus, PatientInsurance
-            // This powers a Kendo Grid, so it accepts Kendo DataSource params
+            // Then Kendo Grid reads from the same endpoint
 
-            // Step 1: Load Scheduler page to establish session
+            // Step 1: Load Scheduler page
             logParts.push(`Step 1: Loading Scheduler page...`);
             await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
 
-            // Step 2: Call the real report endpoint
-            logParts.push(`Step 2: Calling /Scheduler/Scheduler/GetPatientReports...`);
+            // Step 2: Try multiple request formats to GetPatientReports
+            const endpoint = "/Scheduler/Scheduler/GetPatientReports";
+            const attempts: { label: string; opts: RequestInit }[] = [
+              // Kendo typically sends as form data with specific field names
+              {
+                label: "form (ReportType=1,PatientStatus=1,2,3)",
+                opts: {
+                  method: "POST",
+                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                  body: "ReportType=1&PatientStatus=1%2C2%2C3&BirthMonths=&PatientInsurance=&page=1&pageSize=10000&take=10000&skip=0",
+                },
+              },
+              {
+                label: "form (reportType=1,patientStatus=Active,Inactive,Deceased)",
+                opts: {
+                  method: "POST",
+                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                  body: "reportType=1&patientStatus=Active%2CInactive%2CDeceased&birthMonths=&patientInsurance=&page=1&pageSize=10000",
+                },
+              },
+              {
+                label: "JSON payload",
+                opts: {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    ReportType: 1,
+                    PatientStatus: [1, 2, 3],
+                    BirthMonths: [],
+                    PatientInsurance: [],
+                  }),
+                },
+              },
+              {
+                label: "GET with query params",
+                opts: {
+                  method: "GET",
+                },
+              },
+            ];
 
-            // Try as Kendo DataSource request (JSON)
-            const reportPayload = {
-              ReportType: "1",       // 1 = Patient List
-              PatientStatus: "All",
-              BirthMonths: "",
-              PatientInsurance: "",
-              page: 1,
-              pageSize: 10000,       // Request all at once
-              take: 10000,
-              skip: 0,
-            };
+            let found = false;
+            for (const attempt of attempts) {
+              const url = attempt.label.includes("GET")
+                ? `${endpoint}?ReportType=1&PatientStatus=1,2,3&page=1&pageSize=10000`
+                : endpoint;
 
-            const reportRes = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(reportPayload),
-            });
-            logParts.push(`GetPatientReports (JSON): status=${reportRes.status} type=${reportRes.contentType} length=${reportRes.body.length}`);
-            logParts.push(`Preview: ${reportRes.body.substring(0, 800)}`);
+              const res = await ajaxFetch(url, attempt.opts);
+              logParts.push(`${attempt.label}: status=${res.status} type=${res.contentType} length=${res.body.length}`);
+              if (res.body.length > 0) {
+                logParts.push(`Preview: ${res.body.substring(0, 800)}`);
+              }
 
-            if (reportRes.status === 200 && reportRes.body.length > 100 && !reportRes.body.includes("<!DOCTYPE")) {
-              try {
-                const reportData = JSON.parse(reportRes.body);
-                // Kendo DataSource returns { Data: [...], Total: N } or just an array
-                const items = reportData.Data || reportData.data || reportData;
-                if (Array.isArray(items) && items.length > 0) {
-                  csvContent = jsonToCsv(items);
-                  rowCount = items.length;
-                  logParts.push(`✅ Demographics: ${rowCount} patients from GetPatientReports`);
-                  break;
+              if (res.status === 200 && res.body.length > 100) {
+                try {
+                  const data = JSON.parse(res.body);
+                  const items = data.Data || data.data || data.Items || (Array.isArray(data) ? data : null);
+                  if (items && Array.isArray(items) && items.length > 0) {
+                    csvContent = jsonToCsv(items);
+                    rowCount = items.length;
+                    logParts.push(`✅ Demographics: ${rowCount} patients`);
+                    found = true;
+                    break;
+                  } else {
+                    logParts.push(`Parsed but no array data. Keys: ${Object.keys(data).join(", ")}`);
+                    logParts.push(`Full response: ${res.body.substring(0, 2000)}`);
+                  }
+                } catch (e: any) {
+                  logParts.push(`Not JSON: ${e.message}`);
+                  // Maybe it's CSV/Excel directly
+                  if (res.body.includes(",") && res.body.includes("\n")) {
+                    csvContent = res.body;
+                    rowCount = res.body.split("\n").length - 1;
+                    logParts.push(`✅ Demographics (CSV): ${rowCount} rows`);
+                    found = true;
+                    break;
+                  }
                 }
-              } catch (e: any) {
-                logParts.push(`Parse error: ${e.message}`);
               }
             }
 
-            // Try form-encoded variant
-            const reportRes2 = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body: new URLSearchParams({
-                ReportType: "1",
-                PatientStatus: "All",
-                BirthMonths: "",
-                PatientInsurance: "",
-                page: "1",
-                pageSize: "10000",
-                take: "10000",
-                skip: "0",
-              }).toString(),
-            });
-            logParts.push(`GetPatientReports (form): status=${reportRes2.status} type=${reportRes2.contentType} length=${reportRes2.body.length}`);
-            logParts.push(`Preview: ${reportRes2.body.substring(0, 800)}`);
-
-            if (reportRes2.status === 200 && reportRes2.body.length > 100 && !reportRes2.body.includes("<!DOCTYPE")) {
-              try {
-                const reportData = JSON.parse(reportRes2.body);
-                const items = reportData.Data || reportData.data || reportData;
-                if (Array.isArray(items) && items.length > 0) {
-                  csvContent = jsonToCsv(items);
-                  rowCount = items.length;
-                  logParts.push(`✅ Demographics: ${rowCount} patients from GetPatientReports (form)`);
-                  break;
+            if (!found) {
+              // Fallback: JSON endpoint (partial)
+              logParts.push(`All attempts failed. Using JSON fallback...`);
+              const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
+              if (contentType.includes("application/json")) {
+                const patients = (JSON.parse(body)).PatientData || JSON.parse(body);
+                if (Array.isArray(patients) && patients.length > 0) {
+                  const expanded = patients.map((p: any) => ({
+                    PatientID: p.I || "", FirstName: p.F || "", LastName: p.L || "",
+                    DateOfBirth: p.DOB || "", HomePhone: p.HP || "", MobilePhone: p.MP || "",
+                    Email: p.E || "",
+                  }));
+                  csvContent = jsonToCsv(expanded);
+                  rowCount = expanded.length;
+                  logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients (partial)`);
                 }
-              } catch (e: any) {
-                logParts.push(`Parse error: ${e.message}`);
-              }
-            }
-
-            // Fallback: JSON endpoint (partial)
-            logParts.push(`Falling back to JSON endpoint...`);
-            const { body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
-            if (contentType.includes("application/json")) {
-              const patients = (JSON.parse(body)).PatientData || JSON.parse(body);
-              if (Array.isArray(patients) && patients.length > 0) {
-                const expanded = patients.map((p: any) => ({
-                  PatientID: p.I || "", FirstName: p.F || "", LastName: p.L || "",
-                  DateOfBirth: p.DOB || "", HomePhone: p.HP || "", MobilePhone: p.MP || "",
-                  Email: p.E || "",
-                }));
-                csvContent = jsonToCsv(expanded);
-                rowCount = expanded.length;
-                logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients (partial)`);
               }
             }
             break;
