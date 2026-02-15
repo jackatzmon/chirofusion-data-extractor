@@ -141,7 +141,7 @@ const Dashboard = () => {
         body: { dataTypes: selectedTypes, mode: "scrape", dateFrom, dateTo },
       });
       if (error) throw error;
-      toast({ title: "Scrape started", description: "Your data download is running." });
+      toast({ title: "Processing scrape", description: "Your data download is running." });
       loadJobs();
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
@@ -235,7 +235,7 @@ const Dashboard = () => {
             )}
 
             <Button onClick={startScrape} disabled={loading || !hasCreds || selectedTypes.length === 0} className="w-full">
-              {loading ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Starting...</> : <><Play className="h-4 w-4 mr-2" /> Start Download</>}
+              {loading ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Processing...</> : <><Play className="h-4 w-4 mr-2" /> Start Download</>}
             </Button>
             {!hasCreds && <p className="text-sm text-muted-foreground">Save your credentials first to enable downloads.</p>}
           </CardContent>
@@ -252,8 +252,8 @@ const Dashboard = () => {
                 <div key={job.id} className="rounded-md border border-border p-3 space-y-2">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <span className={`text-sm font-medium capitalize ${job.status === "failed" ? "text-destructive" : "text-foreground"}`}>
-                        {job.status}
+                      <span className={`text-sm font-medium ${job.status === "failed" ? "text-destructive" : "text-foreground"}`}>
+                        {job.status === "completed" ? "Scrape Complete" : job.status === "running" ? "Processing Scrape" : job.status}
                       </span>
                       <span className="text-xs bg-muted text-muted-foreground px-2 py-0.5 rounded">{job.mode || "scrape"}</span>
                     </div>
