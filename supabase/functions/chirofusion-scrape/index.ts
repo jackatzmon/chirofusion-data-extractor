@@ -146,7 +146,7 @@ Deno.serve(async (req) => {
     const body = await req.json();
     const { dataTypes = [], mode = "scrape", dateFrom, dateTo,
       // Batch continuation fields (set automatically by self-invocation)
-      _batchJobId, _batchState, _batchLogParts
+      _batchJobId, _batchState
     } = body;
 
     const { data: creds, error: credsError } = await supabase
@@ -186,7 +186,11 @@ Deno.serve(async (req) => {
     }
 
     let sessionCookies = "";
-    const logParts: string[] = _batchLogParts ? [..._batchLogParts] : [];
+    // On resume, load logParts from DB instead of HTTP body
+    const logParts: string[] = [];
+    if (_batchJobId && job.log_output) {
+      logParts.push(...job.log_output.split("\n"));
+    }
     const startTime = Date.now();
     const MAX_RUNTIME_MS = 100_000; // 100s to leave room for cleanup + self-invoke
 
@@ -195,17 +199,23 @@ Deno.serve(async (req) => {
     }
 
     // Self-invoke to continue processing in a new batch
+    // CRITICAL: Only pass minimal state in the HTTP body to avoid size limits.
+    // Large data (soapIndex, collectedSheets, logParts) is stored in the DB.
     async function selfInvoke(batchState: any) {
       logParts.push(`🔄 Batch timeout — continuing from patient ${batchState.resumeIndex}...`);
-      // Save current log to job
+      // Save ALL large data to DB (batch_state + log_output)
       await serviceClient.from("scrape_jobs").update({
         log_output: logParts.join("\n"),
-        batch_state: batchState,
+        batch_state: {
+          ...batchState,
+          soapIndex,
+          collectedSheets,
+        },
       }).eq("id", job.id);
 
       const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
       const fnUrl = `${supabaseUrl}/functions/v1/chirofusion-scrape`;
-      // Fire and forget — we don't await the full response
+      // Fire and forget — only pass minimal fields in body
       fetch(fnUrl, {
         method: "POST",
         headers: {
@@ -215,8 +225,15 @@ Deno.serve(async (req) => {
         body: JSON.stringify({
           dataTypes, mode, dateFrom, dateTo,
           _batchJobId: job.id,
-          _batchState: batchState,
-          _batchLogParts: logParts,
+          // Only pass minimal counters — large data is read from DB
+          _batchState: {
+            resumeIndex: batchState.resumeIndex,
+            pdfCount: batchState.pdfCount,
+            searchFailed: batchState.searchFailed,
+            withFiles: batchState.withFiles,
+            skippedDefaultCase: batchState.skippedDefaultCase,
+            dataTypeIndex: batchState.dataTypeIndex,
+          },
         }),
       }).catch(err => console.error("Self-invoke error:", err));
     }
@@ -708,9 +725,10 @@ Deno.serve(async (req) => {
     let progress = 0;
     const totalTypes = dataTypes.length;
     let hasAnyData = false;
-    // Collectors for consolidated workbook
-    const collectedSheets: { type: string; csv: string }[] = _batchState?.collectedSheets || [];
-    const soapIndex: { PatientName: string; Documents: number; PDFLink: string; Status: string }[] = _batchState?.soapIndex || [];
+    // Collectors for consolidated workbook — restore from DB batch_state on resume
+    const dbBatchState = _batchJobId && job.batch_state ? job.batch_state as any : {};
+    const collectedSheets: { type: string; csv: string }[] = dbBatchState.collectedSheets || [];
+    const soapIndex: { PatientName: string; Documents: number; PDFLink: string; Status: string }[] = dbBatchState.soapIndex || [];
 
     // Shared: get full patient list with IDs for per-patient scraping
     // Caches result so it's only fetched once even if multiple data types need it
@@ -1298,7 +1316,6 @@ Deno.serve(async (req) => {
                   resumeIndex: i,
                   pdfCount, searchFailed, withFiles, skippedDefaultCase,
                   dataTypeIndex: dataTypes.indexOf(dataType),
-                  soapIndex, collectedSheets,
                 });
                 return new Response(JSON.stringify({ success: true, jobId: job.id, batching: true }), {
                   headers: { ...corsHeaders, "Content-Type": "application/json" },
