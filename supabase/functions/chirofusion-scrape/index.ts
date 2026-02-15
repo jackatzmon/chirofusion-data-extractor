@@ -474,7 +474,6 @@ Deno.serve(async (req) => {
             }
 
             // ===== Attempt 2: Run Report first, wait, then Export from Scheduler =====
-            // ChiroFusion reports are async: submit → server generates (3-5s) → then export
             if (!found) {
               logParts.push(`Step 2: Loading Scheduler page for Run Report → Export flow...`);
               try {
@@ -482,26 +481,58 @@ Deno.serve(async (req) => {
                 const schedToken = extractVerifToken(schedHtml);
                 logParts.push(`Scheduler page: ${schedHtml.length} chars, token: ${schedToken ? schedToken.substring(0, 20) + "..." : "NONE"}`);
 
-                // Extract actual option values from form selects
+                // Extract Kendo datasource URLs from JavaScript in the page
+                const dataSourceUrlRegex = /(?:dataSource|transport|read)\s*[:=]\s*\{[^}]*url\s*:\s*["']([^"']+)["']/gi;
+                const discoveredUrls: string[] = [];
+                let dsMatch;
+                while ((dsMatch = dataSourceUrlRegex.exec(schedHtml)) !== null) {
+                  if (dsMatch[1].toLowerCase().includes("patient") || dsMatch[1].toLowerCase().includes("report")) {
+                    discoveredUrls.push(dsMatch[1]);
+                  }
+                }
+                // Also look for function calls that reveal endpoints
+                const ajaxUrlRegex = /\$\.(?:ajax|post|get)\s*\(\s*["']([^"']*(?:[Pp]atient|[Rr]eport)[^"']*)["']/gi;
+                while ((dsMatch = ajaxUrlRegex.exec(schedHtml)) !== null) {
+                  discoveredUrls.push(dsMatch[1]);
+                }
+                // Also look for URL patterns in onclick/data attributes
+                const dataUrlRegex = /data-url\s*=\s*["']([^"']*(?:[Pp]atient|[Rr]eport)[^"']*)["']/gi;
+                while ((dsMatch = dataUrlRegex.exec(schedHtml)) !== null) {
+                  discoveredUrls.push(dsMatch[1]);
+                }
+                const uniqueDiscovered = [...new Set(discoveredUrls)];
+                logParts.push(`Discovered patient/report URLs in page JS: ${JSON.stringify(uniqueDiscovered)}`);
+
+                // Extract Kendo widget configs for dropdowns (they use data-role="dropdownlist")
+                const kdRegex = /id\s*=\s*["'](ReportType|PatientStatus)["'][^>]*data-(?:source|bind)\s*=\s*["']([^"']*)["']/gi;
+                let kdMatch;
+                while ((kdMatch = kdRegex.exec(schedHtml)) !== null) {
+                  logParts.push(`Kendo widget ${kdMatch[1]}: ${kdMatch[2].substring(0, 200)}`);
+                }
+
+                // Also try to find option values from inline JSON arrays
+                const optJsonRegex = /(?:ReportType|reportType)\s*(?:Data|Options|Items)?\s*[:=]\s*(\[[^\]]+\])/gi;
+                let optMatch;
+                while ((optMatch = optJsonRegex.exec(schedHtml)) !== null) {
+                  logParts.push(`ReportType options data: ${optMatch[1].substring(0, 300)}`);
+                }
+
+                // Try standard HTML select extraction too
                 const reportTypes = extractSelectOptions(schedHtml, "ReportType");
                 const patientStatuses = extractSelectOptions(schedHtml, "PatientStatus");
-                logParts.push(`ReportType options: ${JSON.stringify(reportTypes.slice(0, 10))}`);
-                logParts.push(`PatientStatus options: ${JSON.stringify(patientStatuses.slice(0, 10))}`);
+                if (reportTypes.length) logParts.push(`HTML ReportType options: ${JSON.stringify(reportTypes.slice(0, 10))}`);
+                if (patientStatuses.length) logParts.push(`HTML PatientStatus options: ${JSON.stringify(patientStatuses.slice(0, 10))}`);
 
-                // Find the right ReportType for patient list
                 const patientReportType = reportTypes.find(
                   o => o.text.toLowerCase().includes("patient") && o.text.toLowerCase().includes("list")
                 )?.value || reportTypes.find(
                   o => o.text.toLowerCase().includes("patient")
                 )?.value || "1";
 
-                // Get all patient status values
                 const allStatusValues = patientStatuses.map(o => o.value).filter(Boolean).join(",");
-                logParts.push(`Using ReportType=${patientReportType}, PatientStatus=${allStatusValues || "all"}`);
 
-                // Build the report parameters
+                // Build report parameters
                 const reportParams: Record<string, string> = {
-                  __RequestVerificationToken: schedToken,
                   ReportType: patientReportType,
                   PatientStatus: allStatusValues || "Active",
                   PatientStatusString: allStatusValues || "Active",
@@ -513,84 +544,101 @@ Deno.serve(async (req) => {
                   isOverrideDate: "false",
                 };
 
-                // Step 2a: First "Run" the report via AJAX (this generates data server-side)
-                // Kendo UI grids require pagination params or they return empty
-                const kendoParams = {
-                  take: "5000",
-                  skip: "0",
-                  page: "1",
-                  pageSize: "5000",
-                };
+                // Step 2a: Try GetPatientReports with multiple content types
+                const endpoint = "/User/Scheduler/GetPatientReports";
+                
+                // Try 1: JSON body (Kendo DataSource commonly uses JSON)
+                try {
+                  const jsonBody = JSON.stringify({
+                    ...reportParams,
+                    take: 5000,
+                    skip: 0,
+                    page: 1,
+                    pageSize: 5000,
+                  });
+                  const runRes = await ajaxFetch(endpoint, {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "RequestVerificationToken": schedToken,
+                    },
+                    body: jsonBody,
+                  });
+                  logParts.push(`${endpoint} (JSON body): status=${runRes.status} length=${runRes.body.length}`);
+                  if (runRes.body.length > 10) {
+                    logParts.push(`  Preview: ${runRes.body.substring(0, 400)}`);
+                    if (runRes.status === 200 && runRes.contentType.includes("json")) {
+                      const data = JSON.parse(runRes.body);
+                      const items = data.Data || data.data || data.Items || data.Result || (Array.isArray(data) ? data : null);
+                      if (items && Array.isArray(items) && items.length > 0) {
+                        csvContent = jsonToCsv(items);
+                        rowCount = items.length;
+                        logParts.push(`  ✅ Demographics: ${rowCount} patients`);
+                        found = true;
+                      } else if (data.Total) {
+                        logParts.push(`  Total=${data.Total}, keys: ${Object.keys(data).join(",")}`);
+                      }
+                    }
+                  }
+                } catch (e: any) { logParts.push(`JSON body error: ${e.message}`); }
 
-                // Try multiple possible "run report" endpoints with Kendo params
-                const runEndpoints = [
-                  "/User/Scheduler/GetPatientReports",
-                  "/User/Scheduler/RunPatientReport",
-                  "/User/Scheduler/GetPatientReportData",
-                ];
-                for (const endpoint of runEndpoints) {
-                  if (found) break;
+                // Try 2: URL-encoded with token in body + Kendo params
+                if (!found) {
                   try {
-                    // Try with Kendo grid params
-                    const allParams = { ...reportParams, ...kendoParams };
+                    const formParams = new URLSearchParams({
+                      ...reportParams,
+                      __RequestVerificationToken: schedToken,
+                      take: "5000",
+                      skip: "0",
+                      page: "1",
+                      pageSize: "5000",
+                    });
                     const runRes = await ajaxFetch(endpoint, {
                       method: "POST",
                       headers: {
                         "Content-Type": "application/x-www-form-urlencoded",
                         "RequestVerificationToken": schedToken,
                       },
-                      body: new URLSearchParams(allParams).toString(),
+                      body: formParams.toString(),
                     });
-                    logParts.push(`Run ${endpoint} (kendo): status=${runRes.status} length=${runRes.body.length} type=${runRes.contentType}`);
+                    logParts.push(`${endpoint} (form+token): status=${runRes.status} length=${runRes.body.length}`);
+                    if (runRes.body.length > 10) {
+                      logParts.push(`  Preview: ${runRes.body.substring(0, 400)}`);
+                    }
+                  } catch (e: any) { logParts.push(`form+token error: ${e.message}`); }
+                }
+
+                // Try 3: Any discovered URLs from the page JS
+                for (const discUrl of uniqueDiscovered) {
+                  if (found) break;
+                  try {
+                    const runRes = await ajaxFetch(discUrl, {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "RequestVerificationToken": schedToken,
+                      },
+                      body: new URLSearchParams({
+                        ...reportParams,
+                        __RequestVerificationToken: schedToken,
+                        take: "5000", skip: "0", page: "1", pageSize: "5000",
+                      }).toString(),
+                    });
+                    logParts.push(`Discovered ${discUrl}: status=${runRes.status} length=${runRes.body.length}`);
                     if (runRes.body.length > 50) {
                       logParts.push(`  Preview: ${runRes.body.substring(0, 300)}`);
-                    }
-                    // If this returns data directly (JSON array), use it
-                    if (runRes.status === 200 && runRes.body.length > 50 && runRes.contentType.includes("json")) {
-                      try {
+                      if (runRes.status === 200 && runRes.contentType.includes("json")) {
                         const data = JSON.parse(runRes.body);
                         const items = data.Data || data.data || data.Items || data.Result || (Array.isArray(data) ? data : null);
                         if (items && Array.isArray(items) && items.length > 0) {
                           csvContent = jsonToCsv(items);
                           rowCount = items.length;
-                          logParts.push(`  ✅ Demographics from ${endpoint}: ${rowCount} patients`);
+                          logParts.push(`  ✅ Demographics from ${discUrl}: ${rowCount} patients`);
                           found = true;
-                          break;
                         }
-                        // Check if Total exists but Data is nested differently
-                        if (data.Total && data.Total > 0) {
-                          logParts.push(`  Server reports Total=${data.Total} but Data array not found. Keys: ${Object.keys(data).join(", ")}`);
-                        }
-                      } catch { /* not parseable JSON array */ }
-                    }
-
-                    // Also try without Kendo params (plain form submit)
-                    if (!found) {
-                      const runRes2 = await ajaxFetch(endpoint, {
-                        method: "POST",
-                        headers: {
-                          "Content-Type": "application/x-www-form-urlencoded",
-                          "RequestVerificationToken": schedToken,
-                        },
-                        body: new URLSearchParams(reportParams).toString(),
-                      });
-                      logParts.push(`Run ${endpoint} (plain): status=${runRes2.status} length=${runRes2.body.length}`);
-                      if (runRes2.status === 200 && runRes2.body.length > 50 && runRes2.contentType.includes("json")) {
-                        try {
-                          const data = JSON.parse(runRes2.body);
-                          const items = data.Data || data.data || data.Items || data.Result || (Array.isArray(data) ? data : null);
-                          if (items && Array.isArray(items) && items.length > 0) {
-                            csvContent = jsonToCsv(items);
-                            rowCount = items.length;
-                            logParts.push(`  ✅ Demographics from ${endpoint} (plain): ${rowCount} patients`);
-                            found = true;
-                          }
-                        } catch { /* ignore */ }
                       }
                     }
-                  } catch (err: any) {
-                    logParts.push(`Run ${endpoint} error: ${err.message}`);
-                  }
+                  } catch (e: any) { logParts.push(`${discUrl} error: ${e.message}`); }
                 }
 
                 // Step 2b: Wait for report generation (user says ~3 seconds)
