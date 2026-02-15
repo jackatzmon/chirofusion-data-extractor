@@ -455,30 +455,33 @@ Deno.serve(async (req) => {
             }
             logParts.push(`Custom JS files: ${jsFiles.length} → ${jsFiles.map(f => f.split("/").pop()).join(", ")}`);
 
-            // Fetch each custom JS file and look for RunPatientReport/ExportPatientReport functions
-            for (const jsUrl of jsFiles.slice(0, 5)) {
+            // Fetch ALL custom JS files (not just first 5) to find RunPatientReport/ExportPatientReport
+            for (const jsUrl of jsFiles) {
               if (isTimingOut()) break;
               try {
                 const { body: jsBody } = await fetchWithCookies(jsUrl);
-                // Search for function definitions
-                const fnNames = ["RunPatientReport", "ExportPatientReport", "ExportPatientList", "GetPatientReport"];
+                const fnNames = ["RunPatientReport", "ExportPatientReport", "ExportPatientList", "GetPatientReport", "RunAppointmentReport", "ExportAppointmentReport"];
                 for (const fnName of fnNames) {
                   const idx = jsBody.indexOf(`function ${fnName}`);
                   if (idx >= 0) {
-                    // Extract ~600 chars of function body
-                    logParts.push(`FOUND ${fnName} in ${jsUrl.split("/").pop()}: ${jsBody.substring(idx, idx + 600).replace(/\s+/g, " ")}`);
+                    logParts.push(`FOUND ${fnName} in ${jsUrl.split("/").pop()}: ${jsBody.substring(idx, idx + 800).replace(/\s+/g, " ")}`);
                   }
-                  // Also check for property-style: fnName: function or fnName = function
                   const propIdx = jsBody.indexOf(`${fnName} =`);
                   if (propIdx >= 0 && propIdx !== idx) {
-                    logParts.push(`FOUND ${fnName}= in ${jsUrl.split("/").pop()}: ${jsBody.substring(propIdx, propIdx + 600).replace(/\s+/g, " ")}`);
+                    logParts.push(`FOUND ${fnName}= in ${jsUrl.split("/").pop()}: ${jsBody.substring(propIdx, propIdx + 800).replace(/\s+/g, " ")}`);
                   }
                 }
-                // Also look for any URL containing "PatientReport" or "GetPatient"
-                const urlInJs = /["']([^"']*(?:PatientReport|GetPatient|ExportPatient)[^"']*)["']/gi;
+                // Find Kendo grid read URLs for patient/report grids
+                const kendoReadRegex = /["']([^"']*(?:PatientReport|GetPatient|ExportPatient|PatientList)[^"']*)["']/gi;
                 let urlMatch;
-                while ((urlMatch = urlInJs.exec(jsBody)) !== null) {
+                while ((urlMatch = kendoReadRegex.exec(jsBody)) !== null) {
                   logParts.push(`URL in ${jsUrl.split("/").pop()}: ${urlMatch[1]}`);
+                }
+                // Also find any dataSource read URL patterns
+                const dsReadRegex = /dataSource[^}]*read[^}]*url[^"']*["']([^"']+)["']/gi;
+                let dsMatch;
+                while ((dsMatch = dsReadRegex.exec(jsBody)) !== null) {
+                  logParts.push(`DS_READ in ${jsUrl.split("/").pop()}: ${dsMatch[1]}`);
                 }
               } catch (e: any) {
                 logParts.push(`JS fetch error ${jsUrl.split("/").pop()}: ${e.message}`);
