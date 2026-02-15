@@ -1,4 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import * as XLSX from "https://esm.sh/xlsx@0.18.5";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -74,7 +75,37 @@ function jsonToCsv(data: Record<string, unknown>[]): string {
   return headers.join(",") + "\n" + rows.join("\n");
 }
 
-/** Parse .NET date format /Date(timestamp)/ */
+/** Parse CSV string back to JSON array */
+function parseCsvLine(line: string): string[] {
+  const result: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+      else { inQuotes = !inQuotes; }
+    } else if (ch === ',' && !inQuotes) {
+      result.push(current); current = "";
+    } else { current += ch; }
+  }
+  result.push(current);
+  return result;
+}
+
+function csvToJson(csv: string): Record<string, string>[] {
+  const lines = csv.split("\n").filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const headers = parseCsvLine(lines[0]);
+  return lines.slice(1).map(line => {
+    const values = parseCsvLine(line);
+    const obj: Record<string, string> = {};
+    headers.forEach((h, i) => { obj[h] = values[i] || ""; });
+    return obj;
+  });
+}
+
+
 function parseNetDate(dateStr: string | null): string {
   if (!dateStr) return "";
   const match = dateStr.match(/\/Date\((-?\d+)\)\//);
@@ -677,6 +708,9 @@ Deno.serve(async (req) => {
     let progress = 0;
     const totalTypes = dataTypes.length;
     let hasAnyData = false;
+    // Collectors for consolidated workbook
+    const collectedSheets: { type: string; csv: string }[] = [];
+    const soapIndex: { PatientName: string; Documents: number; PDFLink: string }[] = [];
 
     // Shared: get full patient list with IDs for per-patient scraping
     // Caches result so it's only fetched once even if multiple data types need it
@@ -1453,12 +1487,14 @@ Deno.serve(async (req) => {
                     if (uploadError) {
                       logParts.push(`❌ Upload error ${patient.firstName}: ${uploadError.message}`);
                     } else {
-                      await serviceClient.from("scraped_data_results").insert({
-                        scrape_job_id: job.id,
-                        user_id: userId,
-                        data_type: "soap_notes",
-                        file_path: filePath,
-                        row_count: blobNames.length,
+                      // Generate signed URL (30 days) for the workbook link
+                      const { data: signedUrlData } = await serviceClient.storage
+                        .from("scraped-data")
+                        .createSignedUrl(filePath, 2592000);
+                      soapIndex.push({
+                        PatientName: `${patient.lastName}, ${patient.firstName}`,
+                        Documents: blobNames.length,
+                        PDFLink: signedUrlData?.signedUrl || filePath,
                       });
                       pdfCount++;
                     }
@@ -1596,28 +1632,10 @@ Deno.serve(async (req) => {
           }
         }
 
-        // Upload CSV if we have data
+        // Collect CSV for consolidated workbook (instead of uploading individually)
         if (csvContent) {
-          hasAnyData = true;
-          const filePath = `${userId}/${dataType}_${Date.now()}.csv`;
-          const blob = new Blob([csvContent], { type: "text/csv" });
-
-          const { error: uploadError } = await serviceClient.storage
-            .from("scraped-data")
-            .upload(filePath, blob, { contentType: "text/csv" });
-
-          if (uploadError) {
-            logParts.push(`❌ Upload error for ${dataType}: ${uploadError.message}`);
-          } else {
-            await serviceClient.from("scraped_data_results").insert({
-              scrape_job_id: job.id,
-              user_id: userId,
-              data_type: dataType,
-              file_path: filePath,
-              row_count: rowCount,
-            });
-            logParts.push(`✅ Uploaded ${dataType}: ${filePath} (${rowCount} rows)`);
-          }
+          collectedSheets.push({ type: dataType, csv: csvContent });
+          logParts.push(`📊 Collected ${dataType}: ${rowCount} rows for workbook`);
         }
 
         progress += Math.round(100 / totalTypes);
@@ -1629,11 +1647,54 @@ Deno.serve(async (req) => {
       }
     }
 
-    const finalStatus = hasAnyData ? "completed" : "completed";
-    const finalMessage = hasAnyData ? null : "No data was retrieved. Check the log for details.";
+    // ==================== BUILD CONSOLIDATED XLSX WORKBOOK ====================
+    const wb = XLSX.utils.book_new();
+    const typeLabels: Record<string, string> = {
+      demographics: "Demographics",
+      appointments: "Appointments",
+      financials: "Financials",
+    };
 
+    for (const { type, csv } of collectedSheets) {
+      const rows = csvToJson(csv);
+      if (rows.length > 0) {
+        const ws = XLSX.utils.json_to_sheet(rows);
+        XLSX.utils.book_append_sheet(wb, ws, typeLabels[type] || type);
+      }
+    }
+
+    // Add SOAP Notes Index sheet with PDF download links
+    if (soapIndex.length > 0) {
+      const ws = XLSX.utils.json_to_sheet(soapIndex);
+      XLSX.utils.book_append_sheet(wb, ws, "SOAP Notes Index");
+    }
+
+    if (wb.SheetNames.length > 0) {
+      hasAnyData = true;
+      const xlsxBuffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+      const filePath = `${userId}/consolidated_export_${Date.now()}.xlsx`;
+      const xlsxBlob = new Blob([xlsxBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const { error: uploadError } = await serviceClient.storage
+        .from("scraped-data")
+        .upload(filePath, xlsxBlob, { contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      if (uploadError) {
+        logParts.push(`❌ Workbook upload error: ${uploadError.message}`);
+      } else {
+        const totalRows = collectedSheets.reduce((sum, s) => sum + csvToJson(s.csv).length, 0) + soapIndex.length;
+        await serviceClient.from("scraped_data_results").insert({
+          scrape_job_id: job.id,
+          user_id: userId,
+          data_type: "consolidated_export",
+          file_path: filePath,
+          row_count: totalRows,
+        });
+        logParts.push(`✅ Consolidated workbook: ${filePath} (${wb.SheetNames.join(", ")} — ${totalRows} total rows)`);
+      }
+    }
+
+    const finalMessage = hasAnyData ? null : "No data was retrieved. Check the log for details.";
     await serviceClient.from("scrape_jobs").update({
-      status: finalStatus,
+      status: "completed",
       progress: 100,
       log_output: logParts.join("\n"),
       error_message: finalMessage,
