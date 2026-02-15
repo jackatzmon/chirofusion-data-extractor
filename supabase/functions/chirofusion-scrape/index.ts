@@ -485,16 +485,16 @@ Deno.serve(async (req) => {
               }
             }
 
-            // ===== Attempt 1b: Try ExportPatientList using Scheduler page token =====
-            // The exportPatientListCsv form is ON the Scheduler page, so use Scheduler token
-            logParts.push(`Step 1b: ExportPatientList with Scheduler token...`);
+            // ===== Attempt 1b: Try ExportPatientList (simple form submit, no params) =====
+            // The form has NO hidden fields - just <input type="submit" />
+            logParts.push(`Step 1b: ExportPatientList (no params, like browser form submit)...`);
             try {
               const { response: expRes, body: expBody } = await fetchWithCookies(
                 `${BASE_URL}/Patient/Patient/ExportPatientList`,
                 {
                   method: "POST",
                   headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                  body: `__RequestVerificationToken=${encodeURIComponent(schedToken)}`,
+                  body: "",
                 }
               );
               const ct = expRes.headers.get("content-type") || "unknown";
@@ -573,38 +573,7 @@ Deno.serve(async (req) => {
                   }
                 } catch (e: any) { logParts.push(`Trigger error: ${e.message}`); }
 
-                // Try any discovered URLs from page JS
-                for (const discUrl of uniqueDiscovered) {
-                  if (found) break;
-                  try {
-                    const runRes = await ajaxFetch(discUrl, {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "RequestVerificationToken": schedToken,
-                      },
-                      body: new URLSearchParams({
-                        ...reportParams,
-                        __RequestVerificationToken: schedToken,
-                        take: "5000", skip: "0", page: "1", pageSize: "5000",
-                      }).toString(),
-                    });
-                    logParts.push(`Discovered ${discUrl}: status=${runRes.status} length=${runRes.body.length}`);
-                    if (runRes.body.length > 50) {
-                      logParts.push(`  Preview: ${runRes.body.substring(0, 300)}`);
-                      if (runRes.status === 200 && runRes.contentType.includes("json")) {
-                        const data = JSON.parse(runRes.body);
-                        const items = data.Data || data.data || data.Items || data.Result || (Array.isArray(data) ? data : null);
-                        if (items && Array.isArray(items) && items.length > 0) {
-                          csvContent = jsonToCsv(items);
-                          rowCount = items.length;
-                          logParts.push(`  ✅ Demographics from ${discUrl}: ${rowCount} patients`);
-                          found = true;
-                        }
-                      }
-                    }
-                  } catch (e: any) { logParts.push(`${discUrl} error: ${e.message}`); }
-                }
+                // (removed uniqueDiscovered loop - variable was never defined in scrape mode)
 
                 // Step 2b: ALWAYS wait for report generation, even if trigger returned empty
                 if (!found) {
