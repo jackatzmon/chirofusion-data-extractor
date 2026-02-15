@@ -218,90 +218,379 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ error: loginError.message }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    // ==================== DISCOVER MODE ====================
+    // ==================== DISCOVER MODE (COMPREHENSIVE) ====================
     if (mode === "discover") {
-      // Load Scheduler page and extract ALL URLs, JS function calls, and AJAX patterns
+      const schedToken = { value: "" };
+
+      // ===== 1. SCHEDULER PAGE: forms, hidden fields, tokens =====
       try {
-        const { body: html, finalUrl } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
-        logParts.push(`===== SCHEDULER PAGE =====`);
-        logParts.push(`URL: ${finalUrl} | Length: ${html.length}`);
+        const { body: html } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
+        logParts.push(`===== SCHEDULER PAGE: ${html.length} chars =====`);
 
-        // Extract ALL URL patterns from JavaScript (ajax calls, fetch, $.get, $.post, etc.)
-        const urlPatterns: string[] = [];
-        const urlRegex = /(?:url|href|src|action|ajax|get|post|fetch)\s*[:(\s'"]+\s*['"]([^'"]+?)['"]/gi;
-        let urlMatch;
-        while ((urlMatch = urlRegex.exec(html)) !== null) {
-          const url = urlMatch[1];
-          if (url.startsWith("/") && !url.includes(".css") && !url.includes(".js") && !url.includes(".png") && !url.includes(".svg") && !url.includes(".ico")) {
-            urlPatterns.push(url);
+        // Extract verification token
+        const tokenMatch = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
+        schedToken.value = tokenMatch ? tokenMatch[1] : "";
+        logParts.push(`Token: ${schedToken.value ? "YES" : "NONE"}`);
+
+        // Extract ALL <form> elements with their full HTML (action, method, hidden inputs)
+        const formRegex = /<form[^>]*id="([^"]*)"[^>]*>([\s\S]*?)<\/form>/gi;
+        let formMatch;
+        logParts.push(`\n===== ALL FORMS =====`);
+        while ((formMatch = formRegex.exec(html)) !== null) {
+          const formTag = formMatch[0].substring(0, formMatch[0].indexOf(">") + 1);
+          const formBody = formMatch[2];
+          // Extract hidden inputs
+          const hiddenRegex = /<input[^>]*type="hidden"[^>]*/gi;
+          const hiddens: string[] = [];
+          let hm;
+          while ((hm = hiddenRegex.exec(formBody)) !== null) hiddens.push(hm[0]);
+          // Extract submit buttons
+          const submitRegex = /<input[^>]*type="submit"[^>]*/gi;
+          const submits: string[] = [];
+          let sm;
+          while ((sm = submitRegex.exec(formBody)) !== null) submits.push(sm[0]);
+          logParts.push(`FORM#${formMatch[1]}: ${formTag}`);
+          if (hiddens.length) logParts.push(`  Hiddens: ${hiddens.join(" | ")}`);
+          if (submits.length) logParts.push(`  Submits: ${submits.join(" | ")}`);
+        }
+
+        // Also find forms without id
+        const formNoIdRegex = /<form(?![^>]*id=)[^>]*>([\s\S]*?)<\/form>/gi;
+        let fniMatch;
+        while ((fniMatch = formNoIdRegex.exec(html)) !== null) {
+          const tag = fniMatch[0].substring(0, fniMatch[0].indexOf(">") + 1);
+          logParts.push(`FORM(no-id): ${tag.substring(0, 300)}`);
+        }
+
+        // Extract ALL select elements with their options
+        const selectRegex = /<select[^>]*id="([^"]*)"[^>]*>([\s\S]*?)<\/select>/gi;
+        let selMatch;
+        logParts.push(`\n===== SELECT DROPDOWNS =====`);
+        while ((selMatch = selectRegex.exec(html)) !== null) {
+          const optRegex = /<option[^>]*value="([^"]*)"[^>]*>([^<]*)<\/option>/gi;
+          let om;
+          const opts: string[] = [];
+          while ((om = optRegex.exec(selMatch[2])) !== null) opts.push(`${om[1]}=${om[2]}`);
+          if (opts.length > 0) logParts.push(`SELECT#${selMatch[1]}: ${opts.join(" | ")}`);
+        }
+
+        // Fetch AppointmentReport JS and extract FULL function bodies
+        const scriptSrcRegex = /<script[^>]*src\s*=\s*["']([^"']+)["']/gi;
+        let srcMatch;
+        const jsFiles: string[] = [];
+        while ((srcMatch = scriptSrcRegex.exec(html)) !== null) {
+          const src = srcMatch[1];
+          if (src.includes("AppointmentReport") || src.includes("common") || src.includes("Patient") || src.includes("Billing")) {
+            jsFiles.push(src.startsWith("http") ? src : `${BASE_URL}${src}`);
           }
         }
-        // Dedupe
-        const uniqueUrls = [...new Set(urlPatterns)].sort();
-        logParts.push(`\n===== ALL AJAX/URL PATTERNS (${uniqueUrls.length}) =====`);
-        for (const u of uniqueUrls) {
-          logParts.push(u);
-        }
 
-        // Find all function definitions related to "Patient", "Report", "Export"
-        const fnRegex = /function\s+(\w*(?:Patient|Report|Export|Excel|Run|Print)\w*)\s*\(/gi;
-        let fnMatch;
-        const functions: string[] = [];
-        while ((fnMatch = fnRegex.exec(html)) !== null) {
-          functions.push(fnMatch[1]);
-        }
-        logParts.push(`\n===== RELEVANT JS FUNCTIONS (${functions.length}) =====`);
-        for (const fn of functions) {
-          logParts.push(fn);
-        }
+        for (const jsUrl of jsFiles) {
+          try {
+            const { body: jsBody } = await fetchWithCookies(jsUrl);
+            const shortName = jsUrl.split("/").pop()?.split("?")[0] || jsUrl;
+            logParts.push(`\n===== JS FILE: ${shortName} (${jsBody.length} chars) =====`);
 
-        // Extract onclick handlers related to export/report
-        const onclickRegex = /onclick\s*=\s*"([^"]*(?:Export|Report|Patient|Excel|Print|Run)[^"]*)"/gi;
-        let onclickMatch;
-        const handlers: string[] = [];
-        while ((onclickMatch = onclickRegex.exec(html)) !== null) {
-          handlers.push(onclickMatch[1]);
-        }
-        logParts.push(`\n===== ONCLICK HANDLERS (${handlers.length}) =====`);
-        for (const h of handlers) {
-          logParts.push(h);
-        }
+            // Extract FULL function bodies for key functions
+            const targetFns = [
+              "ExportPatientList", "ExportPatientReport", "RunPatientReport",
+              "ExportAppointmentReport", "RunAppointmentReport",
+              "ExportToExcel", "PrintPatientReportDetails",
+            ];
 
-        // Search for the "Export To Excel" and "Run Report" button HTML
-        const exportBtnRegex = /(?:<[^>]*(?:Export|Run Report|Print Report)[^>]*>[\s\S]{0,200})/gi;
-        let btnMatch;
-        logParts.push(`\n===== EXPORT/REPORT BUTTONS =====`);
-        while ((btnMatch = exportBtnRegex.exec(html)) !== null) {
-          logParts.push(btnMatch[0].substring(0, 300));
-        }
+            for (const fnName of targetFns) {
+              const idx = jsBody.indexOf(`function ${fnName}`);
+              if (idx < 0) continue;
 
-        // Also search for "PatientReport" in script blocks
-        const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/gi;
-        let scriptMatch;
-        logParts.push(`\n===== SCRIPT BLOCKS WITH 'PatientReport' or 'ExportPatient' =====`);
-        while ((scriptMatch = scriptRegex.exec(html)) !== null) {
-          const scriptContent = scriptMatch[1];
-          if (scriptContent.includes("PatientReport") || scriptContent.includes("ExportPatient") || scriptContent.includes("ExportToExcel") || scriptContent.includes("RunReport") || scriptContent.includes("btnRunReport") || scriptContent.includes("btnExport")) {
-            // Extract just the relevant lines
-            const lines = scriptContent.split("\n");
-            for (const line of lines) {
-              if (line.match(/patient|report|export|excel|print|run/i) && line.trim().length > 5) {
-                logParts.push(line.trim().substring(0, 300));
+              // Extract full function body by counting braces
+              let braceCount = 0;
+              let started = false;
+              let endIdx = idx;
+              for (let i = idx; i < jsBody.length && i < idx + 5000; i++) {
+                if (jsBody[i] === "{") { braceCount++; started = true; }
+                if (jsBody[i] === "}") { braceCount--; }
+                if (started && braceCount === 0) { endIdx = i + 1; break; }
               }
+              const fullFn = jsBody.substring(idx, endIdx).replace(/\s+/g, " ");
+              logParts.push(`\nFULL_FN ${fnName}: ${fullFn.substring(0, 2000)}`);
+              if (fullFn.length > 2000) logParts.push(`  ...(truncated at 2000/${fullFn.length} chars)`);
             }
+
+            // Find ALL URLs in this JS file
+            const allUrlRegex = /["'](\/(Scheduler|Patient|Billing|User|Account|Home)[^"']{3,})["']/gi;
+            let um;
+            const urls = new Set<string>();
+            while ((um = allUrlRegex.exec(jsBody)) !== null) urls.add(um[1]);
+            if (urls.size > 0) {
+              logParts.push(`\nALL URLs in ${shortName}:`);
+              for (const u of [...urls].sort()) logParts.push(`  ${u}`);
+            }
+          } catch (e: any) {
+            logParts.push(`JS fetch error ${jsUrl}: ${e.message}`);
           }
         }
-
       } catch (err: any) {
         logParts.push(`SCHEDULER ERROR: ${err.message}`);
       }
 
-      // Also test the JSON patient endpoint
+      // ===== 2. TEST KEY ENDPOINTS WITH DIFFERENT PARAMS =====
+      logParts.push(`\n===== ENDPOINT TESTS =====`);
+
+      // 2a: GetPatientReports with ReportType=1 (PatientList)
+      const patientReportParams = [
+        { ReportType: "1", BirthMonths: "", PatientStatus: "", PatientInsurance: "" },
+        { ReportType: "1", BirthMonths: "", PatientStatus: "Active", PatientInsurance: "" },
+        { ReportType: "1", BirthMonths: "", PatientStatus: "All", PatientInsurance: "" },
+      ];
+
+      for (const params of patientReportParams) {
+        try {
+          const res = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              "RequestVerificationToken": schedToken.value,
+            },
+            body: new URLSearchParams(params).toString(),
+          });
+          logParts.push(`GetPatientReports(Status=${params.PatientStatus || "empty"}): status=${res.status} len=${res.body.length} type=${res.contentType}`);
+          if (res.body.length > 0 && res.body.length < 2000) logParts.push(`  Body: ${res.body}`);
+          else if (res.body.length >= 2000) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
+        } catch (e: any) {
+          logParts.push(`GetPatientReports error: ${e.message}`);
+        }
+      }
+
+      // 2b: Try ExportPatientReports right after (report might be primed from above)
       try {
-        const { status, body, contentType } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
-        logParts.push(`\nJSON Patient endpoint: status=${status} type=${contentType} length=${body.length}`);
-      } catch (err: any) {
-        logParts.push(`JSON Patient endpoint ERROR: ${err.message}`);
+        const res = await ajaxFetch("/Scheduler/Scheduler/ExportPatientReports", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "RequestVerificationToken": schedToken.value,
+          },
+          body: new URLSearchParams({
+            ReportType: "1", BirthMonths: "", PatientStatus: "", PatientInsurance: "",
+            __RequestVerificationToken: schedToken.value,
+          }).toString(),
+        });
+        logParts.push(`ExportPatientReports: status=${res.status} len=${res.body.length} type=${res.contentType}`);
+        if (res.body.length > 0) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
+      } catch (e: any) {
+        logParts.push(`ExportPatientReports error: ${e.message}`);
+      }
+
+      // 2c: Try the 500 error body from ExportPatientReports in detail
+      try {
+        const { response: rawRes, body: rawBody } = await fetchWithCookies(
+          `${BASE_URL}/Scheduler/Scheduler/ExportPatientReports`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              "X-Requested-With": "XMLHttpRequest",
+              "RequestVerificationToken": schedToken.value,
+            },
+            body: new URLSearchParams({
+              ReportType: "1", BirthMonths: "", PatientStatus: "", PatientInsurance: "",
+            }).toString(),
+          }
+        );
+        logParts.push(`ExportPatientReports(raw): status=${rawRes.status} len=${rawBody.length}`);
+        logParts.push(`  Headers: ${JSON.stringify(Object.fromEntries(rawRes.headers.entries()))}`);
+        logParts.push(`  Full body: ${rawBody.substring(0, 1000)}`);
+      } catch (e: any) {
+        logParts.push(`Raw export error: ${e.message}`);
+      }
+
+      // 2d: ExportPatientList - try multiple paths
+      const exportPaths = [
+        "/Patient/Patient/ExportPatientList",
+        "/Scheduler/Scheduler/ExportPatientList",
+        "/User/Scheduler/ExportPatientList",
+        "/User/Patient/ExportPatientList",
+      ];
+      for (const path of exportPaths) {
+        try {
+          const res = await ajaxFetch(path, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "" });
+          logParts.push(`${path}: status=${res.status} len=${res.body.length} type=${res.contentType}`);
+          if (res.status === 200 && res.body.length > 50 && !res.body.includes("<!DOCTYPE")) {
+            logParts.push(`  ✅ FOUND DATA: ${res.body.substring(0, 300)}`);
+          }
+        } catch (e: any) {
+          logParts.push(`${path}: error ${e.message}`);
+        }
+      }
+
+      // 2e: Try GET on export paths too
+      for (const path of exportPaths) {
+        try {
+          const { response: res, body } = await fetchWithCookies(`${BASE_URL}${path}`);
+          const ct = res.headers.get("content-type") || "";
+          const cd = res.headers.get("content-disposition") || "";
+          logParts.push(`GET ${path}: status=${res.status} len=${body.length} type=${ct} disp=${cd}`);
+          if (res.status === 200 && body.length > 50 && !body.includes("<!DOCTYPE")) {
+            logParts.push(`  ✅ FOUND DATA: ${body.substring(0, 300)}`);
+          }
+        } catch (e: any) {
+          logParts.push(`GET ${path}: error ${e.message}`);
+        }
+      }
+
+      // ===== 3. APPOINTMENT REPORT ENDPOINTS =====
+      logParts.push(`\n===== APPOINTMENT ENDPOINTS =====`);
+      const today = new Date().toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
+
+      // 3a: GetAppointmentReport
+      const apptParams = {
+        ReportType: "CompletedVisits",
+        DateFrom: "08/10/2021",
+        DateTo: today,
+        PhysicianId: "0",
+        AppointmentTypeId: "",
+        LocationId: "",
+      };
+
+      const apptPaths = [
+        "/Scheduler/Scheduler/GetAppointmentReport",
+        "/User/Scheduler/GetAppointmentReport",
+      ];
+      for (const path of apptPaths) {
+        try {
+          const res = await ajaxFetch(path, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              "RequestVerificationToken": schedToken.value,
+            },
+            body: new URLSearchParams(apptParams).toString(),
+          });
+          logParts.push(`${path}: status=${res.status} len=${res.body.length} type=${res.contentType}`);
+          if (res.body.length > 0 && res.body.length < 1000) logParts.push(`  Body: ${res.body}`);
+          else if (res.body.length >= 1000) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
+        } catch (e: any) {
+          logParts.push(`${path}: error ${e.message}`);
+        }
+      }
+
+      // 3b: ExportAppointmentReport
+      const apptExportPaths = [
+        "/Scheduler/Scheduler/ExportAppointmentReport",
+        "/User/Scheduler/ExportAppointmentReport",
+      ];
+      for (const path of apptExportPaths) {
+        try {
+          const res = await ajaxFetch(path, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              "RequestVerificationToken": schedToken.value,
+            },
+            body: new URLSearchParams(apptParams).toString(),
+          });
+          logParts.push(`${path}: status=${res.status} len=${res.body.length} type=${res.contentType}`);
+          if (res.body.length > 0) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
+        } catch (e: any) {
+          logParts.push(`${path}: error ${e.message}`);
+        }
+      }
+
+      // ===== 4. BILLING/SOAP ENDPOINTS =====
+      logParts.push(`\n===== BILLING & SOAP ENDPOINTS =====`);
+
+      // 4a: Load billing page
+      try {
+        const { body: billingHtml } = await fetchWithCookies(`${BASE_URL}/Billing/`);
+        logParts.push(`Billing page: ${billingHtml.length} chars`);
+        // Extract forms
+        const bFormRegex = /<form[^>]*>([\s\S]*?)<\/form>/gi;
+        let bfm;
+        while ((bfm = bFormRegex.exec(billingHtml)) !== null) {
+          const tag = bfm[0].substring(0, bfm[0].indexOf(">") + 1);
+          logParts.push(`  Billing form: ${tag.substring(0, 200)}`);
+        }
+      } catch (e: any) {
+        logParts.push(`Billing page error: ${e.message}`);
+      }
+
+      // 4b: Home page (SOAP notes search)
+      try {
+        const { body: homeHtml } = await fetchWithCookies(`${BASE_URL}/`);
+        logParts.push(`Home page: ${homeHtml.length} chars`);
+      } catch (e: any) {
+        logParts.push(`Home page error: ${e.message}`);
+      }
+
+      // 4c: Try patient search/SOAP endpoints
+      try {
+        const { body: patientJson } = await ajaxFetch("/Patient/Patient/GetAllPatientForLocalStorage");
+        const parsed = JSON.parse(patientJson);
+        const patients = parsed.PatientData || parsed;
+        logParts.push(`Patient JSON: ${Array.isArray(patients) ? patients.length : "N/A"} patients`);
+        if (Array.isArray(patients) && patients.length > 0) {
+          logParts.push(`  All keys: ${Object.keys(patients[0]).join(", ")}`);
+          logParts.push(`  Sample: ${JSON.stringify(patients[0])}`);
+
+          // Try SOAP/Medical File endpoints for first patient
+          const pid = patients[0].I;
+          if (pid) {
+            const soapPaths = [
+              `/User/Scheduler/GetSopaNoteReportDetailsAsync?patientId=${pid}`,
+              `/Patient/Patient/GetMedicalFileList?patientId=${pid}`,
+              `/Patient/Patient/GetPatientMedicalFile?patientId=${pid}`,
+              `/Patient/Patient/ExportMedicalFile?patientId=${pid}`,
+              `/User/Patient/MedicalFile?patientId=${pid}`,
+            ];
+            for (const sp of soapPaths) {
+              try {
+                const res = await ajaxFetch(sp);
+                logParts.push(`${sp}: status=${res.status} len=${res.body.length} type=${res.contentType}`);
+                if (res.status === 200 && res.body.length > 0 && res.body.length < 1000) logParts.push(`  Body: ${res.body.substring(0, 500)}`);
+              } catch (e: any) {
+                logParts.push(`${sp}: error ${e.message}`);
+              }
+            }
+          }
+        }
+      } catch (e: any) {
+        logParts.push(`Patient JSON error: ${e.message}`);
+      }
+
+      // ===== 5. WAIT 20s AND TRY EXPORT AGAIN (report might have primed) =====
+      logParts.push(`\n===== WAITING 20s FOR REPORT GENERATION =====`);
+      await new Promise(r => setTimeout(r, 20000));
+
+      try {
+        const res = await ajaxFetch("/Scheduler/Scheduler/ExportPatientReports", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "RequestVerificationToken": schedToken.value,
+          },
+          body: new URLSearchParams({
+            ReportType: "1", BirthMonths: "", PatientStatus: "", PatientInsurance: "",
+          }).toString(),
+        });
+        logParts.push(`ExportPatientReports(after 20s): status=${res.status} len=${res.body.length} type=${res.contentType}`);
+        if (res.body.length > 0) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
+      } catch (e: any) {
+        logParts.push(`Export after wait error: ${e.message}`);
+      }
+
+      // Also try appointment export after the wait
+      try {
+        const res = await ajaxFetch("/Scheduler/Scheduler/ExportAppointmentReport", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "RequestVerificationToken": schedToken.value,
+          },
+          body: new URLSearchParams(apptParams).toString(),
+        });
+        logParts.push(`ExportAppointmentReport(after 20s): status=${res.status} len=${res.body.length} type=${res.contentType}`);
+        if (res.body.length > 0) logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
+      } catch (e: any) {
+        logParts.push(`Appt export after wait error: ${e.message}`);
       }
 
       await serviceClient.from("scrape_jobs").update({ status: "completed", progress: 100, log_output: logParts.join("\n") }).eq("id", job.id);
