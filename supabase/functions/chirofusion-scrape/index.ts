@@ -788,95 +788,198 @@ Deno.serve(async (req) => {
               }
             }
 
-            // ===== Step 2: Trigger report, then poll export with retries =====
-            // Flow: POST GetPatientReports (triggers server-side generation) → wait → retry ExportPatientReports
-            logParts.push(`Step 2: Trigger GetPatientReports then poll export...`);
+            // ===== Step 2: Extract #exportPatientListCsv form action =====
+            const formActionMatch = schedHtml.match(/<form[^>]*id\s*=\s*["']exportPatientListCsv["'][^>]*action\s*=\s*["']([^"']+)["']/i)
+              || schedHtml.match(/<form[^>]*action\s*=\s*["']([^"']+)["'][^>]*id\s*=\s*["']exportPatientListCsv["']/i);
+            const csvFormAction = formActionMatch ? formActionMatch[1] : null;
+            logParts.push(`exportPatientListCsv form action: ${csvFormAction || "NOT FOUND"}`);
 
-            const reportData = {
-              ReportType: "1",  // PatientReportType.PatientList = 1
-              BirthMonths: "",
-              PatientStatus: "All",
-              PatientInsurance: "",
-            };
+            // Also extract hidden inputs from that form
+            if (csvFormAction) {
+              const formFullMatch = schedHtml.match(/<form[^>]*id\s*=\s*["']exportPatientListCsv["'][^>]*>([\s\S]*?)<\/form>/i);
+              if (formFullMatch) {
+                const hiddenRegex = /<input[^>]*type\s*=\s*["']hidden["'][^>]*/gi;
+                let hm;
+                while ((hm = hiddenRegex.exec(formFullMatch[1])) !== null) {
+                  logParts.push(`  Form hidden: ${hm[0]}`);
+                }
+              }
+            }
 
-            try {
-              // Step 2a: Trigger the report (this starts server-side generation)
-              const triggerRes = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/x-www-form-urlencoded",
-                  "RequestVerificationToken": schedToken,
-                },
-                body: new URLSearchParams(reportData).toString(),
-              });
-              logParts.push(`Trigger: status=${triggerRes.status} len=${triggerRes.body.length} type=${triggerRes.contentType}`);
+            // ===== Step 2a: Try #exportPatientListCsv form submission first =====
+            if (csvFormAction) {
+              logParts.push(`Step 2a: Trying exportPatientListCsv form POST to ${csvFormAction}...`);
+              try {
+                const formRes = await ajaxFetch(csvFormAction, {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "RequestVerificationToken": schedToken,
+                  },
+                  body: new URLSearchParams({ __RequestVerificationToken: schedToken }).toString(),
+                });
+                logParts.push(`  Form POST: status=${formRes.status} len=${formRes.body.length} type=${formRes.contentType}`);
+                if (formRes.status === 200 && formRes.body.length > 100 && !formRes.body.includes("<!DOCTYPE")) {
+                  csvContent = formRes.body;
+                  rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
+                  logParts.push(`✅ Demographics from form: ${rowCount} rows`);
+                  found = true;
+                } else if (formRes.body.length > 0) {
+                  logParts.push(`  Form response preview: ${formRes.body.substring(0, 500)}`);
+                }
+              } catch (e: any) {
+                logParts.push(`  Form POST error: ${e.message}`);
+              }
+            }
 
-              // Step 2b: Poll ExportPatientReports with retries
-              // DO NOT dismiss the dialog / press OK — let the report finish generating
-              const MAX_RETRIES = 8;
-              const RETRY_INTERVAL_MS = 4000; // 4 seconds between retries
+            // ===== Step 2b: Trigger GetPatientReports with EMPTY PatientStatus (= no filter = all) =====
+            if (!found) {
+              logParts.push(`Step 2b: Trigger GetPatientReports (empty PatientStatus = all)...`);
+              const reportData = {
+                ReportType: "1",
+                BirthMonths: "",
+                PatientStatus: "",
+                PatientInsurance: "",
+              };
 
-              for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-                if (isTimingOut()) {
-                  logParts.push(`⏱️ Export poll: timeout safety at attempt ${attempt}`);
-                  break;
+              try {
+                const triggerRes = await ajaxFetch("/Scheduler/Scheduler/GetPatientReports", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "RequestVerificationToken": schedToken,
+                  },
+                  body: new URLSearchParams(reportData).toString(),
+                });
+                logParts.push(`  Trigger: status=${triggerRes.status} len=${triggerRes.body.length} type=${triggerRes.contentType}`);
+                if (triggerRes.body.length > 0 && triggerRes.body.length < 2000) {
+                  logParts.push(`  Trigger body: ${triggerRes.body}`);
+                } else if (triggerRes.body.length >= 2000) {
+                  logParts.push(`  Trigger body preview: ${triggerRes.body.substring(0, 1000)}`);
+                  // If trigger itself returns data (Kendo grid JSON), try to use it
+                  try {
+                    const triggerData = JSON.parse(triggerRes.body);
+                    const items = triggerData.Data || triggerData.data || (Array.isArray(triggerData) ? triggerData : null);
+                    if (items && Array.isArray(items) && items.length > 0) {
+                      csvContent = jsonToCsv(items);
+                      rowCount = items.length;
+                      logParts.push(`✅ Demographics from trigger response: ${rowCount} patients`);
+                      found = true;
+                    }
+                  } catch { /* not JSON */ }
                 }
 
-                logParts.push(`Export attempt ${attempt}/${MAX_RETRIES} (waiting ${RETRY_INTERVAL_MS / 1000}s)...`);
-                await new Promise(r => setTimeout(r, RETRY_INTERVAL_MS));
+                // Poll ExportPatientReports
+                if (!found) {
+                  const MAX_RETRIES = 6;
+                  const RETRY_INTERVAL_MS = 5000;
 
+                  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                    if (isTimingOut()) { logParts.push(`⏱️ Timeout at attempt ${attempt}`); break; }
+                    logParts.push(`  Export attempt ${attempt}/${MAX_RETRIES} (waiting ${RETRY_INTERVAL_MS / 1000}s)...`);
+                    await new Promise(r => setTimeout(r, RETRY_INTERVAL_MS));
+
+                    try {
+                      const expRes = await ajaxFetch("/Scheduler/Scheduler/ExportPatientReports", {
+                        method: "POST",
+                        headers: {
+                          "Content-Type": "application/x-www-form-urlencoded",
+                          "RequestVerificationToken": schedToken,
+                        },
+                        body: new URLSearchParams({
+                          ...reportData,
+                          __RequestVerificationToken: schedToken,
+                        }).toString(),
+                      });
+                      logParts.push(`    status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
+
+                      // LOG THE ERROR BODY so we can debug
+                      if (expRes.status >= 400) {
+                        logParts.push(`    ERROR BODY: ${expRes.body.substring(0, 500)}`);
+                        continue;
+                      }
+
+                      if (expRes.status === 200 && expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE") && !expRes.body.includes("<html")) {
+                        csvContent = expRes.body;
+                        rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
+                        logParts.push(`✅ Demographics export: ${rowCount} rows (attempt ${attempt})`);
+                        found = true;
+                        break;
+                      }
+                    } catch (e: any) {
+                      logParts.push(`    Attempt ${attempt} error: ${e.message}`);
+                    }
+                  }
+                }
+              } catch (e: any) {
+                logParts.push(`  Trigger error: ${e.message}`);
+              }
+            }
+
+            // ===== Step 2c: Try exportPatientListCsv form AFTER priming the report =====
+            if (!found && csvFormAction) {
+              logParts.push(`Step 2c: Retrying form POST after report primed...`);
+              try {
+                const formRes = await ajaxFetch(csvFormAction, {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "RequestVerificationToken": schedToken,
+                  },
+                  body: new URLSearchParams({ __RequestVerificationToken: schedToken }).toString(),
+                });
+                logParts.push(`  Form POST: status=${formRes.status} len=${formRes.body.length} type=${formRes.contentType}`);
+                if (formRes.status === 200 && formRes.body.length > 100 && !formRes.body.includes("<!DOCTYPE")) {
+                  csvContent = formRes.body;
+                  rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
+                  logParts.push(`✅ Demographics from form (post-prime): ${rowCount} rows`);
+                  found = true;
+                } else if (formRes.body.length > 0) {
+                  logParts.push(`  Response preview: ${formRes.body.substring(0, 500)}`);
+                }
+              } catch (e: any) {
+                logParts.push(`  Form POST error: ${e.message}`);
+              }
+            }
+
+            // ===== Step 2d: Try Kendo grid read endpoint directly =====
+            if (!found) {
+              const kendoPaths = [
+                "/Scheduler/Scheduler/GetPatientListReportData",
+                "/Scheduler/Scheduler/PatientListReportData",
+                "/Scheduler/Scheduler/GetPatientReportData",
+              ];
+              for (const kp of kendoPaths) {
+                if (found || isTimingOut()) break;
                 try {
-                  const expRes = await ajaxFetch("/Scheduler/Scheduler/ExportPatientReports", {
+                  const res = await ajaxFetch(kp, {
                     method: "POST",
                     headers: {
                       "Content-Type": "application/x-www-form-urlencoded",
                       "RequestVerificationToken": schedToken,
                     },
                     body: new URLSearchParams({
-                      ...reportData,
-                      __RequestVerificationToken: schedToken,
+                      take: "5000", skip: "0", page: "1", pageSize: "5000",
                     }).toString(),
                   });
-                  logParts.push(`  status=${expRes.status} len=${expRes.body.length} type=${expRes.contentType}`);
-
-                  // Success: got non-HTML content with substantial size
-                  if (expRes.status === 200 && expRes.body.length > 50 && !expRes.body.includes("<!DOCTYPE") && !expRes.body.includes("<html")) {
-                    csvContent = expRes.body;
-                    rowCount = csvContent.split("\n").filter((l: string) => l.trim()).length - 1;
-                    logParts.push(`✅ Demographics export: ${rowCount} rows (attempt ${attempt})`);
-                    found = true;
-                    break;
-                  }
-
-                  // If we got JSON data from the trigger, try parsing it
-                  if (expRes.status === 200 && expRes.contentType.includes("json") && expRes.body.length > 10) {
+                  logParts.push(`Kendo ${kp}: status=${res.status} len=${res.body.length} type=${res.contentType}`);
+                  if (res.status === 200 && res.contentType.includes("json") && res.body.length > 50) {
+                    logParts.push(`  Preview: ${res.body.substring(0, 500)}`);
                     try {
-                      const data = JSON.parse(expRes.body);
+                      const data = JSON.parse(res.body);
                       const items = data.Data || data.data || (Array.isArray(data) ? data : null);
                       if (items && Array.isArray(items) && items.length > 0) {
                         csvContent = jsonToCsv(items);
                         rowCount = items.length;
-                        logParts.push(`✅ Demographics JSON: ${rowCount} patients (attempt ${attempt})`);
+                        logParts.push(`✅ Demographics from Kendo: ${rowCount} patients`);
                         found = true;
-                        break;
                       }
-                    } catch { /* not JSON, continue retrying */ }
-                  }
-
-                  // 500/404 = report not ready yet, keep retrying
-                  if (expRes.status >= 400) {
-                    logParts.push(`  Not ready yet (${expRes.status}), retrying...`);
+                    } catch { /* not JSON */ }
                   }
                 } catch (e: any) {
-                  logParts.push(`  Attempt ${attempt} error: ${e.message}`);
+                  logParts.push(`Kendo ${kp}: error ${e.message}`);
                 }
               }
-
-              if (!found) {
-                logParts.push(`⚠️ Export polling exhausted after ${MAX_RETRIES} attempts`);
-              }
-            } catch (e: any) {
-              logParts.push(`GetPatientReports trigger error: ${e.message}`);
             }
 
             // ===== Fallback: JSON endpoint (partial data but reliable) =====
@@ -889,7 +992,6 @@ Deno.serve(async (req) => {
                   const parsed = JSON.parse(body);
                   const patients = parsed.PatientData || parsed;
                   if (Array.isArray(patients) && patients.length > 0) {
-                    // Map all available fields from the JSON response
                     const expanded = patients.map((p: any) => ({
                       PatientID: p.I || p.Id || "",
                       FirstName: p.F || p.FirstName || "",
@@ -908,7 +1010,6 @@ Deno.serve(async (req) => {
                     csvContent = jsonToCsv(expanded);
                     rowCount = expanded.length;
                     logParts.push(`⚠️ Demographics (JSON fallback): ${rowCount} patients`);
-                    // Log first patient's raw keys so we can map more fields next time
                     logParts.push(`Sample patient keys: ${Object.keys(patients[0]).join(", ")}`);
                     logParts.push(`Sample patient data: ${JSON.stringify(patients[0]).substring(0, 500)}`);
                   }
