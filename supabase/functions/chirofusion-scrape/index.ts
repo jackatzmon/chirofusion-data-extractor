@@ -665,12 +665,21 @@ Deno.serve(async (req) => {
           const reportData = JSON.parse(reportRes.body);
           const items = reportData.Data || reportData.data || (Array.isArray(reportData) ? reportData : null);
           if (items && Array.isArray(items) && items.length > 0) {
+            // Log sample item to understand field names
+            logParts.push(`Patient report sample keys: ${JSON.stringify(Object.keys(items[0]))}`);
+            logParts.push(`Patient report sample: ${JSON.stringify(items[0]).substring(0, 500)}`);
             _cachedPatients = items.map((p: any) => ({
-              id: p.PkPatientId || p.PatientId || p.Id || p.I,
-              firstName: p.FirstName || p.F || "",
-              lastName: p.LastName || p.L || "",
+              id: p.PkPatientId || p.PatientId || p.Id || p.I || p.ClientPatientId || p.patientId,
+              firstName: p.FirstName || p.F || p.PatientFirstName || "",
+              lastName: p.LastName || p.L || p.PatientLastName || "",
             }));
-            logParts.push(`✅ Patient list: ${_cachedPatients!.length} patients from GetPatientReports`);
+            const withId = _cachedPatients!.filter(p => p.id);
+            const withoutId = _cachedPatients!.filter(p => !p.id);
+            logParts.push(`✅ Patient list: ${_cachedPatients!.length} total, ${withId.length} with ID, ${withoutId.length} without ID`);
+            if (withoutId.length > 0 && withId.length === 0) {
+              // All IDs are missing - log all keys from first item to find the right field
+              logParts.push(`⚠️ No patient IDs found! All fields: ${JSON.stringify(items[0])}`);
+            }
             return _cachedPatients!;
           }
         } catch { /* not JSON */ }
@@ -1148,14 +1157,17 @@ Deno.serve(async (req) => {
             }
 
             logParts.push(`Processing ${patients.length} patients for medical file PDFs`);
+            logParts.push(`DEBUG: First 3 patient IDs: ${patients.slice(0, 3).map(p => `${p.id}(${p.firstName} ${p.lastName})`).join(", ")}`);
+            logParts.push(`DEBUG: isTimingOut=${isTimingOut()}, elapsed=${Date.now() - startTime}ms`);
 
             let processedCount = 0;
             let pdfCount = 0;
+            let skippedNoId = 0;
 
             for (const patient of patients) {
-              if (!patient.id) continue;
+              if (!patient.id) { skippedNoId++; continue; }
               if (isTimingOut()) {
-                logParts.push(`⏱️ Medical Files: Stopped at ${processedCount}/${patients.length} (timeout safety)`);
+                logParts.push(`⏱️ Medical Files: Stopped at ${processedCount}/${patients.length} (timeout safety, skippedNoId=${skippedNoId})`);
                 break;
               }
 
