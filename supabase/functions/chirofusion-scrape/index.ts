@@ -364,6 +364,30 @@ Deno.serve(async (req) => {
         return new Response(JSON.stringify({ error: jobError.message }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
       job = newJob;
+
+      // For non-discover modes, self-invoke immediately and return fast
+      // so the browser doesn't timeout waiting for the scrape to finish
+      if (mode === "scrape") {
+        const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+        const fnUrl = `${supabaseUrl}/functions/v1/chirofusion-scrape`;
+        fetch(fnUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": authHeader!,
+          },
+          body: JSON.stringify({
+            dataTypes, mode, dateFrom, dateTo,
+            _batchJobId: job.id,
+            _batchState: { resumeIndex: 0, dataTypeIndex: 0 },
+          }),
+        }).catch(err => console.error("Initial self-invoke error:", err));
+        // Wait briefly to ensure request is dispatched
+        await new Promise(r => setTimeout(r, 2000));
+        return new Response(JSON.stringify({ success: true, jobId: job.id, message: "Scrape started in background" }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
     }
 
     let sessionCookies = "";
