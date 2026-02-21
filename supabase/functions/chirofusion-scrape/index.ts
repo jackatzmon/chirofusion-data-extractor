@@ -330,6 +330,8 @@ Deno.serve(async (req) => {
       _batchJobId, _batchState,
       // Test mode: limit number of patients processed
       testLimit,
+      // Test mode: filter to a specific patient name (e.g. "Dagostino, Siyka")
+      testPatientName,
     } = body;
 
     const { data: creds, error: credsError } = await supabase
@@ -2030,9 +2032,17 @@ Deno.serve(async (req) => {
               logParts.push(`Processing ${patients.length} patients for account ledgers`);
             }
 
-            // Apply test limit if specified
-            const effectivePatients = testLimit && testLimit > 0 ? patients.slice(0, testLimit) : patients;
-            if (testLimit) {
+            // Apply test filters if specified
+            let effectivePatients = patients;
+            if (testPatientName) {
+              const target = testPatientName.toLowerCase().trim();
+              effectivePatients = patients.filter((p: any) => 
+                `${p.lastName}, ${p.firstName}`.toLowerCase().includes(target) ||
+                `${p.lastName},${p.firstName}`.toLowerCase().includes(target)
+              );
+              logParts.push(`⚠️ TEST MODE: filtering to patient "${testPatientName}" — found ${effectivePatients.length} matches`);
+            } else if (testLimit && testLimit > 0) {
+              effectivePatients = patients.slice(0, testLimit);
               logParts.push(`⚠️ TEST MODE: limiting to ${testLimit} patients`);
             }
 
