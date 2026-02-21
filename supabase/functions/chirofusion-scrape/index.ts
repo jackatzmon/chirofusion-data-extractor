@@ -327,7 +327,9 @@ Deno.serve(async (req) => {
     const body = await req.json();
     const { dataTypes = [], mode = "scrape", dateFrom, dateTo,
       // Batch continuation fields (set automatically by self-invocation)
-      _batchJobId, _batchState
+      _batchJobId, _batchState,
+      // Test mode: limit number of patients processed
+      testLimit,
     } = body;
 
     const { data: creds, error: credsError } = await supabase
@@ -2028,8 +2030,14 @@ Deno.serve(async (req) => {
               logParts.push(`Processing ${patients.length} patients for account ledgers`);
             }
 
-            for (let i = processedCount; i < patients.length; i++) {
-              const patient = patients[i];
+            // Apply test limit if specified
+            const effectivePatients = testLimit && testLimit > 0 ? patients.slice(0, testLimit) : patients;
+            if (testLimit) {
+              logParts.push(`⚠️ TEST MODE: limiting to ${testLimit} patients`);
+            }
+
+            for (let i = processedCount; i < effectivePatients.length; i++) {
+              const patient = effectivePatients[i];
               if (isTimingOut()) {
                 // Save collected ledger rows to batch_state and self-invoke
                 await selfInvoke({
@@ -2045,7 +2053,7 @@ Deno.serve(async (req) => {
 
               try {
                 const patientName = `${patient.lastName}, ${patient.firstName}`;
-                const isDebug = i < 3;
+                const isDebug = i < 10 || !!testLimit; // debug all in test mode
 
                 // 1. Search for patient to get patientId
                 const info = await findPatientInfo(patient.firstName, patient.lastName, isDebug);
@@ -2103,6 +2111,13 @@ Deno.serve(async (req) => {
                 if (isDebug) {
                   logParts.push(`🔍 Ledger ${patientName} (id=${info.id}): status=${ledgerRes.status} len=${ledgerRes.body.length}`);
                   logParts.push(`  Preview: ${ledgerRes.body.substring(0, 500)}`);
+                }
+
+                // Extract totals from hidden inputs for debugging
+                if (isDebug) {
+                  const chargesMatch = ledgerRes.body.match(/class="tot-charges"\s+value="([^"]*)"/);
+                  const paymentsMatch = ledgerRes.body.match(/class="tot-inspayment"\s+value="([^"]*)"/);
+                  logParts.push(`  Totals: charges=${chargesMatch?.[1] || '?'}, payments=${paymentsMatch?.[1] || '?'}`);
                 }
 
                 if (ledgerRes.status !== 200 || ledgerRes.body.length < 50) {
