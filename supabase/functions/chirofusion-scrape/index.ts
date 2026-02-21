@@ -2095,29 +2095,37 @@ Deno.serve(async (req) => {
                 const isTrace = isDebug || !!testPatientName;
                 if (isTrace) logParts.push(`  Using CaseId=${useCaseId} for ${patientName}`);
 
-                // Helper to save any response HTML for user inspection
-                async function saveStepHtml(stepName: string, body: string, status: number) {
+                // Helper to save response HTML for live viewing + debug archive
+                async function saveStepHtml(stepName: string, url: string, body: string, status: number) {
                   if (!isTrace) return;
-                  const safeName = patientName.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
-                  const safeStep = stepName.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
-                  const ts = Date.now();
-                  const htmlPath = `${userId}/debug_ledger_html/${safeName}_${safeStep}_${ts}.html`;
-                  // Wrap in a basic HTML page with metadata header
-                  const wrapper = `<!DOCTYPE html><html><head><title>${stepName} — ${patientName}</title></head><body>
-<div style="background:#222;color:#0f0;padding:12px;font-family:monospace;font-size:13px;margin-bottom:16px;">
-<b>STEP:</b> ${stepName}<br>
-<b>Patient:</b> ${patientName} (id=${info.id}, caseId=${useCaseId})<br>
-<b>HTTP Status:</b> ${status}<br>
-<b>Response Length:</b> ${body.length} bytes<br>
-<b>Timestamp:</b> ${new Date().toISOString()}<br>
+                  const wrapper = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${stepName} — ${patientName}</title>
+<style>body{margin:0;font-family:system-ui,sans-serif}#hdr{background:#1a1a2e;color:#0ff;padding:14px 18px;font-size:13px;line-height:1.7;border-bottom:3px solid #0ff}#hdr b{color:#fff}#hdr .url{color:#7fff7f;word-break:break-all}#content{padding:16px}</style></head><body>
+<div id="hdr">
+<b>📍 STEP:</b> ${stepName}<br>
+<b>🌐 URL:</b> <span class="url">${url}</span><br>
+<b>👤 Patient:</b> ${patientName} (id=${info.id}, caseId=${useCaseId})<br>
+<b>📊 HTTP Status:</b> ${status} &nbsp;|&nbsp; <b>Size:</b> ${body.length} bytes<br>
+<b>🕐 Time:</b> ${new Date().toISOString()}
 </div>
-<hr>
+<div id="content">
 ${body}
+</div>
 </body></html>`;
                   const htmlBlob = new Blob([wrapper], { type: "text/html" });
-                  await serviceClient.storage.from("scraped-data").upload(htmlPath, htmlBlob, { contentType: "text/html", upsert: true });
-                  const { data: htmlUrl } = await serviceClient.storage.from("scraped-data").createSignedUrl(htmlPath, 86400);
-                  logParts.push(`  📄 ${stepName}: ${htmlUrl?.signedUrl || htmlPath}`);
+                  
+                  // Write to the live view path (overwrite each step)
+                  const livePath = `${userId}/live_view/current.html`;
+                  await serviceClient.storage.from("scraped-data").remove([livePath]);
+                  await serviceClient.storage.from("scraped-data").upload(livePath, htmlBlob, { contentType: "text/html" });
+                  
+                  // Also archive for later inspection
+                  const safeName = patientName.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
+                  const safeStep = stepName.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
+                  const archivePath = `${userId}/debug_ledger_html/${safeName}_${safeStep}_${Date.now()}.html`;
+                  const archiveBlob = new Blob([wrapper], { type: "text/html" });
+                  await serviceClient.storage.from("scraped-data").upload(archivePath, archiveBlob, { contentType: "text/html", upsert: true });
+                  
+                  logParts.push(`  📄 ${stepName}: ${url} → ${status} (${body.length}b)`);
                 }
 
                 // 2. Set patient context via SetVisitIdInSession
@@ -2134,7 +2142,7 @@ ${body}
                     CaseId: useCaseId,
                   }).toString(),
                 });
-                await saveStepHtml("Step2_SetVisitIdInSession", visitRes.body, visitRes.status);
+                await saveStepHtml("Step2_SetVisitIdInSession", `${BASE_URL}/Patient/Patient/SetVisitIdInSession`, visitRes.body, visitRes.status);
 
                 // 3. Set billing context to Patient Accounting
                 const billingRes = await ajaxFetch("/Billing/Billing/SetBillingDefaultPageInSession", {
@@ -2149,7 +2157,7 @@ ${body}
                     billingDefaultPage: "PatientAccounting",
                   }).toString(),
                 });
-                await saveStepHtml("Step3_SetBillingDefaultPage", billingRes.body, billingRes.status);
+                await saveStepHtml("Step3_SetBillingDefaultPage", `${BASE_URL}/Billing/Billing/SetBillingDefaultPageInSession`, billingRes.body, billingRes.status);
 
                 // 4. Fetch the account ledger HTML
                 const ledgerRes = await ajaxFetch("/Billing/PatientAccounting/ShowLedger", {
@@ -2165,7 +2173,7 @@ ${body}
                     ShowUac: "true",
                   }).toString(),
                 });
-                await saveStepHtml("Step4_ShowLedger", ledgerRes.body, ledgerRes.status);
+                await saveStepHtml("Step4_ShowLedger", `${BASE_URL}/Billing/PatientAccounting/ShowLedger`, ledgerRes.body, ledgerRes.status);
 
                 if (isTrace) {
                   logParts.push(`🔍 Ledger ${patientName} (id=${info.id}, case=${useCaseId}): status=${ledgerRes.status} len=${ledgerRes.body.length}`);

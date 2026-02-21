@@ -1,9 +1,9 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "@/hooks/use-toast";
-import { Square, ChevronDown, ChevronUp, FileSpreadsheet, Trash2, Terminal } from "lucide-react";
+import { Square, ChevronDown, ChevronUp, FileSpreadsheet, Trash2, Monitor } from "lucide-react";
 
 type ScrapeJob = {
   id: string;
@@ -128,13 +128,13 @@ export default function JobProgressCard({
         <Card className="border-primary/30">
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <Terminal className="h-5 w-5 text-primary" />
-              Processing Job — Live View
+              <Monitor className="h-5 w-5 text-primary" />
+              Processing Job
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             <ActiveJobSpinner job={runningJob} />
-            <LiveLogViewer log={runningJob.log_output} />
+            <LivePageViewer />
             <Button
               variant="destructive"
               size="sm"
@@ -346,50 +346,30 @@ function ActiveJobSpinner({ job }: { job: ScrapeJob }) {
   );
 }
 
-/** Renders clickable links in log text */
-function LogLine({ text }: { text: string }) {
-  // Match URLs (signed Supabase storage URLs or any https:// URL)
-  const urlRegex = /(https?:\/\/[^\s]+)/g;
-  const parts = text.split(urlRegex);
-  
-  return (
-    <div className="leading-5">
-      {parts.map((part, i) =>
-        urlRegex.test(part) ? (
-          <a
-            key={i}
-            href={part}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-primary underline hover:text-primary/80 break-all"
-          >
-            🔗 Open page
-          </a>
-        ) : (
-          <span key={i}>{part}</span>
-        )
-      )}
-    </div>
-  );
-}
-
-/** Live-updating log viewer that auto-scrolls */
-function LiveLogViewer({ log }: { log: string | null }) {
+/** Live page viewer — shows what the scraper is seeing in an iframe */
+function LivePageViewer() {
+  const [iframeUrl, setIframeUrl] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(true);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const prevLenRef = useRef(0);
+
+  const refreshUrl = useCallback(async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return;
+    const livePath = `${user.id}/live_view/current.html`;
+    const { data } = await supabase.storage
+      .from("scraped-data")
+      .createSignedUrl(livePath, 300);
+    if (data?.signedUrl) {
+      setIframeUrl(data.signedUrl + "&t=" + Date.now());
+    }
+  }, []);
 
   useEffect(() => {
-    // Auto-scroll when new content appears
-    if (scrollRef.current && log && log.length > prevLenRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-    prevLenRef.current = log?.length || 0;
-  }, [log]);
+    refreshUrl();
+    const interval = setInterval(refreshUrl, 3000);
+    return () => clearInterval(interval);
+  }, [refreshUrl]);
 
-  if (!log) return null;
-
-  const lines = log.split("\n");
+  if (!iframeUrl) return null;
 
   return (
     <div className="rounded-md border border-border overflow-hidden">
@@ -398,19 +378,20 @@ function LiveLogViewer({ log }: { log: string | null }) {
         className="w-full flex items-center justify-between px-3 py-2 bg-muted/50 hover:bg-muted transition-colors"
       >
         <span className="text-xs font-medium text-foreground flex items-center gap-1.5">
-          <Terminal className="h-3.5 w-3.5" />
-          Live Log ({lines.length} lines)
+          <Monitor className="h-3.5 w-3.5" />
+          Live Page View — What the scraper sees
         </span>
         {expanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
       </button>
       {expanded && (
-        <div
-          ref={scrollRef}
-          className="p-3 bg-background font-mono text-[11px] text-muted-foreground overflow-x-auto max-h-[400px] overflow-y-auto space-y-0.5"
-        >
-          {lines.map((line, i) => (
-            <LogLine key={i} text={line} />
-          ))}
+        <div className="bg-background">
+          <iframe
+            src={iframeUrl}
+            className="w-full border-0"
+            style={{ height: "500px" }}
+            title="Live scraper view"
+            sandbox="allow-same-origin"
+          />
         </div>
       )}
     </div>
