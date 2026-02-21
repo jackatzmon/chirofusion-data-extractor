@@ -2177,6 +2177,7 @@ ${body}
 
                 if (isTrace) {
                   logParts.push(`🔍 Ledger skeleton ${patientName} (id=${info.id}): status=${skeletonRes.status} len=${skeletonRes.body.length}`);
+                  logParts.push(`  Skeleton HTML preview: ${skeletonRes.body.substring(0, 500)}`);
                 }
 
                 if (skeletonRes.status !== 200 || skeletonRes.body.length < 50) {
