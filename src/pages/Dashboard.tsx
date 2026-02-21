@@ -6,8 +6,8 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "@/hooks/use-toast";
-import { Progress } from "@/components/ui/progress";
-import { LogOut, Download, Play, Loader2, Search, ChevronDown, ChevronUp } from "lucide-react";
+import { LogOut, Play, Loader2, Search } from "lucide-react";
+import JobProgressCard from "@/components/JobProgressCard";
 
 const DATA_TYPES = [
   { id: "demographics", label: "Patient Demographics" },
@@ -25,6 +25,7 @@ type ScrapeJob = {
   created_at: string;
   mode: string;
   log_output: string | null;
+  batch_state?: any;
 };
 
 type ScrapeResult = {
@@ -45,7 +46,7 @@ const Dashboard = () => {
   const [loading, setLoading] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [savingCreds, setSavingCreds] = useState(false);
-  const [expandedJobLog, setExpandedJobLog] = useState<string | null>(null);
+  
   const [dateFrom, setDateFrom] = useState("08/10/2021");
   const [dateTo, setDateTo] = useState(
     new Date().toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" })
@@ -247,70 +248,13 @@ const Dashboard = () => {
           </CardContent>
         </Card>
 
-        {/* Jobs Card */}
-        {jobs.length > 0 && (
-          <Card>
-            <CardHeader>
-              <CardTitle>Recent Jobs</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {jobs.map((job) => (
-                <div key={job.id} className="rounded-md border border-border p-3 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className={`text-sm font-medium ${job.status === "failed" ? "text-destructive" : "text-foreground"}`}>
-                        {job.status === "completed" ? "Scrape Complete" : job.status === "running" ? "Processing Scrape" : job.status}
-                      </span>
-                      <span className="text-xs bg-muted text-muted-foreground px-2 py-0.5 rounded">{job.mode || "scrape"}</span>
-                    </div>
-                    <span className="text-xs text-muted-foreground">{new Date(job.created_at).toLocaleString()}</span>
-                  </div>
-                  <div className="text-xs text-muted-foreground">{(job.data_types || []).join(", ")}</div>
-                  {job.status === "running" && <Progress value={job.progress} />}
-                  {job.error_message && <p className="text-xs text-destructive">{job.error_message}</p>}
-                  {job.log_output && (
-                    <div>
-                      <button
-                        onClick={() => setExpandedJobLog(expandedJobLog === job.id ? null : job.id)}
-                        className="flex items-center gap-1 text-xs text-primary hover:underline"
-                      >
-                        {expandedJobLog === job.id ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-                        {expandedJobLog === job.id ? "Hide Log" : "View Log"}
-                      </button>
-                      {expandedJobLog === job.id && (
-                        <pre className="mt-2 p-3 bg-muted rounded text-xs text-muted-foreground overflow-x-auto max-h-96 overflow-y-auto whitespace-pre-wrap break-words">
-                          {job.log_output}
-                        </pre>
-                      )}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </CardContent>
-          </Card>
-        )}
-
-        {/* Results Card */}
-        {results.length > 0 && (
-          <Card>
-            <CardHeader>
-              <CardTitle>Downloaded Files</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              {results.map((result) => (
-                <div key={result.id} className="flex items-center justify-between rounded-md border border-border p-3">
-                  <div>
-                    <span className="text-sm font-medium capitalize text-foreground">{result.data_type === "consolidated_export" ? "📊 Consolidated Workbook" : result.data_type.replace("_", " ")}</span>
-                    {result.row_count != null && <span className="ml-2 text-xs text-muted-foreground">({result.row_count} rows)</span>}
-                  </div>
-                  <Button variant="outline" size="sm" onClick={() => downloadFile(result.file_path)}>
-                    <Download className="h-4 w-4 mr-1" /> Download
-                  </Button>
-                </div>
-              ))}
-            </CardContent>
-          </Card>
-        )}
+        {/* Jobs & Progress */}
+        <JobProgressCard
+          jobs={jobs}
+          results={results}
+          onAbort={() => { loadJobs(); loadResults(); }}
+          onDownload={downloadFile}
+        />
       </main>
     </div>
   );
