@@ -2209,13 +2209,19 @@ ${body}
                   if (visitIdMatches.length > 0) {
                     logParts.push(`  Sample VisitIds: ${visitIdMatches.slice(0, 5).join(", ")}`);
                   }
-                  // Also search for "visit" mentions to debug
-                  const visitMentions = billingHtml.match(/visit/gi);
-                  logParts.push(`  "visit" mentions in billing HTML: ${visitMentions ? visitMentions.length : 0}`);
-                  // Show a snippet around first "visit" mention
-                  const visitIdx = billingHtml.toLowerCase().indexOf("visit");
-                  if (visitIdx >= 0) {
-                    logParts.push(`  First "visit" context: ...${billingHtml.substring(Math.max(0, visitIdx - 30), visitIdx + 80)}...`);
+                  // Search for known visit ID pattern from user's data
+                  const knownIdIdx = billingHtml.indexOf("28702154");
+                  logParts.push(`  Known VisitId "28702154" found at index: ${knownIdIdx}`);
+                  if (knownIdIdx >= 0) {
+                    logParts.push(`  Context around known ID: ...${billingHtml.substring(Math.max(0, knownIdIdx - 100), knownIdIdx + 100)}...`);
+                  }
+                  // Search for "GetVisit" or "loadVisit" or "PatientAccounting" JS calls
+                  const jsPatterns = ["GetVisit", "loadVisit", "PatientAccounting", "ShowVisit", "VisitList", "visitData", "dataSource"];
+                  for (const jp of jsPatterns) {
+                    const jpIdx = billingHtml.indexOf(jp);
+                    if (jpIdx >= 0) {
+                      logParts.push(`  Found "${jp}" at ${jpIdx}: ...${billingHtml.substring(Math.max(0, jpIdx - 40), jpIdx + 120)}...`);
+                    }
                   }
                 }
 
