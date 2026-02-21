@@ -2092,10 +2092,36 @@ Deno.serve(async (req) => {
                 }
 
                 const useCaseId = info.caseId ? String(info.caseId) : "0";
-                if (isDebug) logParts.push(`  Using CaseId=${useCaseId} for ${patientName}`);
+                const isTrace = isDebug || !!testPatientName;
+                if (isTrace) logParts.push(`  Using CaseId=${useCaseId} for ${patientName}`);
+
+                // Helper to save any response HTML for user inspection
+                async function saveStepHtml(stepName: string, body: string, status: number) {
+                  if (!isTrace) return;
+                  const safeName = patientName.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
+                  const safeStep = stepName.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
+                  const ts = Date.now();
+                  const htmlPath = `${userId}/debug_ledger_html/${safeName}_${safeStep}_${ts}.html`;
+                  // Wrap in a basic HTML page with metadata header
+                  const wrapper = `<!DOCTYPE html><html><head><title>${stepName} — ${patientName}</title></head><body>
+<div style="background:#222;color:#0f0;padding:12px;font-family:monospace;font-size:13px;margin-bottom:16px;">
+<b>STEP:</b> ${stepName}<br>
+<b>Patient:</b> ${patientName} (id=${info.id}, caseId=${useCaseId})<br>
+<b>HTTP Status:</b> ${status}<br>
+<b>Response Length:</b> ${body.length} bytes<br>
+<b>Timestamp:</b> ${new Date().toISOString()}<br>
+</div>
+<hr>
+${body}
+</body></html>`;
+                  const htmlBlob = new Blob([wrapper], { type: "text/html" });
+                  await serviceClient.storage.from("scraped-data").upload(htmlPath, htmlBlob, { contentType: "text/html", upsert: true });
+                  const { data: htmlUrl } = await serviceClient.storage.from("scraped-data").createSignedUrl(htmlPath, 86400);
+                  logParts.push(`  📄 ${stepName}: ${htmlUrl?.signedUrl || htmlPath}`);
+                }
 
                 // 2. Set patient context via SetVisitIdInSession
-                await ajaxFetch("/Patient/Patient/SetVisitIdInSession", {
+                const visitRes = await ajaxFetch("/Patient/Patient/SetVisitIdInSession", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -2108,9 +2134,10 @@ Deno.serve(async (req) => {
                     CaseId: useCaseId,
                   }).toString(),
                 });
+                await saveStepHtml("Step2_SetVisitIdInSession", visitRes.body, visitRes.status);
 
                 // 3. Set billing context to Patient Accounting
-                await ajaxFetch("/Billing/Billing/SetBillingDefaultPageInSession", {
+                const billingRes = await ajaxFetch("/Billing/Billing/SetBillingDefaultPageInSession", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -2122,6 +2149,7 @@ Deno.serve(async (req) => {
                     billingDefaultPage: "PatientAccounting",
                   }).toString(),
                 });
+                await saveStepHtml("Step3_SetBillingDefaultPage", billingRes.body, billingRes.status);
 
                 // 4. Fetch the account ledger HTML
                 const ledgerRes = await ajaxFetch("/Billing/PatientAccounting/ShowLedger", {
@@ -2137,26 +2165,17 @@ Deno.serve(async (req) => {
                     ShowUac: "true",
                   }).toString(),
                 });
+                await saveStepHtml("Step4_ShowLedger", ledgerRes.body, ledgerRes.status);
 
-                if (isDebug) {
+                if (isTrace) {
                   logParts.push(`🔍 Ledger ${patientName} (id=${info.id}, case=${useCaseId}): status=${ledgerRes.status} len=${ledgerRes.body.length}`);
                 }
 
                 // Extract totals from hidden inputs for debugging
                 const chargesMatch = ledgerRes.body.match(/class="tot-charges"\s+value="([^"]*)"/);
                 const paymentsMatch = ledgerRes.body.match(/class="tot-inspayment"\s+value="([^"]*)"/);
-                if (isDebug) {
+                if (isTrace) {
                   logParts.push(`  Totals: charges=${chargesMatch?.[1] || '?'}, payments=${paymentsMatch?.[1] || '?'}`);
-                }
-
-                // 🔍 SAVE RAW HTML so user can inspect exactly what we got
-                if (isDebug || !!testPatientName) {
-                  const safeName = patientName.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
-                  const htmlPath = `${userId}/debug_ledger_html/${safeName}_${Date.now()}.html`;
-                  const htmlBlob = new Blob([ledgerRes.body], { type: "text/html" });
-                  await serviceClient.storage.from("scraped-data").upload(htmlPath, htmlBlob, { contentType: "text/html", upsert: true });
-                  const { data: htmlUrl } = await serviceClient.storage.from("scraped-data").createSignedUrl(htmlPath, 86400);
-                  logParts.push(`  📄 RAW HTML saved: ${htmlUrl?.signedUrl || htmlPath}`);
                 }
 
                 if (ledgerRes.status !== 200 || ledgerRes.body.length < 50) {
