@@ -131,18 +131,18 @@ const Dashboard = () => {
     } finally { setDiscovering(false); }
   };
 
-  const startScrape = async () => {
+  const startScrape = async (limit?: number) => {
     if (selectedTypes.length === 0) {
       toast({ title: "Select data types", description: "Choose at least one.", variant: "destructive" });
       return;
     }
     setLoading(true);
     try {
-      const { error } = await supabase.functions.invoke("chirofusion-scrape", {
-        body: { dataTypes: selectedTypes, mode: "scrape", dateFrom, dateTo },
-      });
+      const payload: any = { dataTypes: selectedTypes, mode: "scrape", dateFrom, dateTo };
+      if (limit) payload.testLimit = limit;
+      const { error } = await supabase.functions.invoke("chirofusion-scrape", { body: payload });
       if (error) throw error;
-      toast({ title: "Processing scrape", description: "Your data download is running." });
+      toast({ title: limit ? "Test scrape started" : "Processing scrape", description: limit ? `Testing with ${limit} patients.` : "Your data download is running." });
       loadJobs();
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
@@ -235,9 +235,14 @@ const Dashboard = () => {
               </div>
             )}
 
-            <Button onClick={startScrape} disabled={loading || !hasCreds || selectedTypes.length === 0} className="w-full">
-              {loading ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Processing...</> : <><Play className="h-4 w-4 mr-2" /> Start Download</>}
-            </Button>
+            <div className="flex gap-2">
+              <Button onClick={() => startScrape(5)} disabled={loading || !hasCreds || selectedTypes.length === 0} variant="secondary" className="flex-1">
+                {loading ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Processing...</> : <>🧪 Test (5 patients)</>}
+              </Button>
+              <Button onClick={() => startScrape()} disabled={loading || !hasCreds || selectedTypes.length === 0} className="flex-1">
+                {loading ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Processing...</> : <><Play className="h-4 w-4 mr-2" /> Start Full Download</>}
+              </Button>
+            </div>
             {!hasCreds && <p className="text-sm text-muted-foreground">Save your credentials first to enable downloads.</p>}
           </CardContent>
         </Card>
