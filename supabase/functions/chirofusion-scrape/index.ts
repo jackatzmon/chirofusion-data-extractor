@@ -2159,8 +2159,8 @@ ${body}
                 });
                 await saveStepHtml("Step3_SetBillingDefaultPage", `${BASE_URL}/Billing/Billing/SetBillingDefaultPageInSession`, billingRes.body, billingRes.status);
 
-                // 4. Fetch the account ledger HTML
-                const ledgerRes = await ajaxFetch("/Billing/PatientAccounting/ShowLedger", {
+                // 4a. Fetch the skeleton ledger page (returns visit checkboxes but no data)
+                const skeletonRes = await ajaxFetch("/Billing/PatientAccounting/ShowLedger", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -2173,10 +2173,63 @@ ${body}
                     ShowUac: "true",
                   }).toString(),
                 });
-                await saveStepHtml("Step4_ShowLedger", `${BASE_URL}/Billing/PatientAccounting/ShowLedger`, ledgerRes.body, ledgerRes.status);
+                await saveStepHtml("Step4a_ShowLedger_Skeleton", `${BASE_URL}/Billing/PatientAccounting/ShowLedger`, skeletonRes.body, skeletonRes.status);
 
                 if (isTrace) {
-                  logParts.push(`🔍 Ledger ${patientName} (id=${info.id}, case=${useCaseId}): status=${ledgerRes.status} len=${ledgerRes.body.length}`);
+                  logParts.push(`🔍 Ledger skeleton ${patientName} (id=${info.id}): status=${skeletonRes.status} len=${skeletonRes.body.length}`);
+                }
+
+                if (skeletonRes.status !== 200 || skeletonRes.body.length < 50) {
+                  ledgerEmpty++;
+                  processedCount = i + 1;
+                  continue;
+                }
+
+                // 4b. Extract VisitIds from the skeleton HTML (checkboxes or data attributes)
+                const visitIdMatches: string[] = [];
+                // Look for visit IDs in checkbox values, data-id attributes, or hidden inputs
+                const visitIdRegex = /(?:value|data-id|data-visitid|VisitId)[\s]*[=:]\s*["']?(\d{5,})["']?/gi;
+                let vidMatch;
+                while ((vidMatch = visitIdRegex.exec(skeletonRes.body)) !== null) {
+                  if (!visitIdMatches.includes(vidMatch[1])) {
+                    visitIdMatches.push(vidMatch[1]);
+                  }
+                }
+
+                if (isTrace) {
+                  logParts.push(`  Found ${visitIdMatches.length} VisitIds in skeleton`);
+                }
+
+                if (visitIdMatches.length === 0) {
+                  // No visits found - patient has no ledger entries
+                  ledgerEmpty++;
+                  allLedgerRows.push({
+                    PatientName: patientName,
+                    Date: "", Description: "", CPTCode: "", Charges: "", Payments: "", Adjustments: "", Balance: "",
+                    Status: "No visits found",
+                  });
+                  processedCount = i + 1;
+                  continue;
+                }
+
+                // 4c. Make second ShowLedger call with all VisitIds to get actual transaction data
+                const ledgerRes = await ajaxFetch("/Billing/PatientAccounting/ShowLedger", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Referer": `${BASE_URL}/Billing/`,
+                    "ClientPatientId": String(info.id),
+                    ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                  },
+                  body: new URLSearchParams({
+                    VisitIds: visitIdMatches.join(","),
+                    IsLedger: "1",
+                  }).toString(),
+                });
+                await saveStepHtml("Step4b_ShowLedger_Data", `${BASE_URL}/Billing/PatientAccounting/ShowLedger`, ledgerRes.body, ledgerRes.status);
+
+                if (isTrace) {
+                  logParts.push(`🔍 Ledger data ${patientName}: status=${ledgerRes.status} len=${ledgerRes.body.length}`);
                 }
 
                 // Extract totals from hidden inputs for debugging
