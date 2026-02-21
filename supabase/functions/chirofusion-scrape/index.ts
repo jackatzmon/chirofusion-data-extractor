@@ -142,9 +142,15 @@ function parseLedgerHtml(html: string): Record<string, string>[] {
     headers.push("Date", "Description", "CPTCode", "Charges", "Payments", "Adjustments", "Balance");
   }
 
-  // Extract <tbody> content if present, otherwise use full HTML
-  const tbodyMatch = html.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i);
-  const bodyContent = tbodyMatch ? tbodyMatch[1] : html;
+  // Extract ALL <tbody> sections (there may be one per visit/date group)
+  let bodyContent = "";
+  const tbodyRegex = /<tbody[^>]*>([\s\S]*?)<\/tbody>/gi;
+  let tbodyMatch;
+  while ((tbodyMatch = tbodyRegex.exec(html)) !== null) {
+    bodyContent += tbodyMatch[1] + "\n";
+  }
+  // If no tbody found, use full HTML
+  if (!bodyContent) bodyContent = html;
 
   while ((trMatch = trRegex.exec(bodyContent)) !== null) {
     const trContent = trMatch[1];
