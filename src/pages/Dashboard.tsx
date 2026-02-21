@@ -46,7 +46,7 @@ const Dashboard = () => {
   const [loading, setLoading] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [savingCreds, setSavingCreds] = useState(false);
-  
+  const [testPatientName, setTestPatientName] = useState("");
   const [dateFrom, setDateFrom] = useState("08/10/2021");
   const [dateTo, setDateTo] = useState(
     new Date().toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" })
@@ -132,7 +132,7 @@ const Dashboard = () => {
     } finally { setDiscovering(false); }
   };
 
-  const startScrape = async (limit?: number) => {
+  const startScrape = async (limit?: number, patientName?: string) => {
     if (selectedTypes.length === 0) {
       toast({ title: "Select data types", description: "Choose at least one.", variant: "destructive" });
       return;
@@ -141,9 +141,11 @@ const Dashboard = () => {
     try {
       const payload: any = { dataTypes: selectedTypes, mode: "scrape", dateFrom, dateTo };
       if (limit) payload.testLimit = limit;
+      if (patientName) payload.testPatientName = patientName;
       const { error } = await supabase.functions.invoke("chirofusion-scrape", { body: payload });
       if (error) throw error;
-      toast({ title: limit ? "Test scrape started" : "Processing scrape", description: limit ? `Testing with ${limit} patients.` : "Your data download is running." });
+      const desc = patientName ? `Testing with "${patientName}"` : limit ? `Testing with ${limit} patients.` : "Your data download is running.";
+      toast({ title: limit || patientName ? "Test scrape started" : "Processing scrape", description: desc });
       loadJobs();
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
@@ -235,6 +237,24 @@ const Dashboard = () => {
                 </div>
               </div>
             )}
+
+            {/* Test specific patient */}
+            <div className="flex gap-2">
+              <Input
+                placeholder="Patient name (e.g. Dagostino, Siyka)"
+                value={testPatientName}
+                onChange={(e) => setTestPatientName(e.target.value)}
+                className="flex-1"
+              />
+              <Button
+                onClick={() => startScrape(undefined, testPatientName)}
+                disabled={loading || !hasCreds || selectedTypes.length === 0 || !testPatientName.trim()}
+                variant="secondary"
+                size="sm"
+              >
+                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <>🧪 Test Patient</>}
+              </Button>
+            </div>
 
             <div className="flex gap-2">
               <Button onClick={() => startScrape(5)} disabled={loading || !hasCreds || selectedTypes.length === 0} variant="secondary" className="flex-1">
