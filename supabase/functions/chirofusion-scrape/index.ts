@@ -1057,7 +1057,7 @@ Deno.serve(async (req) => {
 
     // Search for a patient by name using the real GetSearchedPatient endpoint
     // Returns { id, dob } or null
-    async function searchPatient(searchText: string, archiveFilter: number, debugLog: boolean): Promise<{ id: number; dob: string } | null> {
+    async function searchPatient(searchText: string, archiveFilter: number, debugLog: boolean): Promise<{ id: number; dob: string; caseId?: number } | null> {
       const res = await ajaxFetch("/Patient/Patient/GetSearchedPatient", {
         method: "POST",
         headers: {
@@ -1091,7 +1091,8 @@ Deno.serve(async (req) => {
             const patientId = match.File_Number || match.PatientId || match.Id || match.PkPatientId ||
                              match.ClientPatientId || match.id || match.Value || match.value;
             const dob = match.Dob || match.dob || match.DateOfBirth || "";
-            if (patientId) return { id: Number(patientId), dob: String(dob) };
+            const caseId = match.CaseId || match.caseId || match.Case_Id;
+            if (patientId) return { id: Number(patientId), dob: String(dob), caseId: caseId ? Number(caseId) : undefined };
           }
         } catch { /* not JSON */ }
       }
@@ -1099,7 +1100,7 @@ Deno.serve(async (req) => {
     }
 
     // Search by name: first try regular search, then archive if not found
-    async function findPatientInfo(firstName: string, lastName: string, debugLog: boolean): Promise<{ id: number; dob: string } | null> {
+    async function findPatientInfo(firstName: string, lastName: string, debugLog: boolean): Promise<{ id: number; dob: string; caseId?: number } | null> {
       const searchText = `${lastName}, ${firstName}`.trim();
       
       // Try regular search first
@@ -2090,6 +2091,9 @@ Deno.serve(async (req) => {
                   continue;
                 }
 
+                const useCaseId = info.caseId ? String(info.caseId) : "0";
+                if (isDebug) logParts.push(`  Using CaseId=${useCaseId} for ${patientName}`);
+
                 // 2. Set patient context via SetVisitIdInSession
                 await ajaxFetch("/Patient/Patient/SetVisitIdInSession", {
                   method: "POST",
@@ -2101,7 +2105,7 @@ Deno.serve(async (req) => {
                   },
                   body: new URLSearchParams({
                     PatientId: String(info.id),
-                    CaseId: "0",
+                    CaseId: useCaseId,
                   }).toString(),
                 });
 
@@ -2135,15 +2139,24 @@ Deno.serve(async (req) => {
                 });
 
                 if (isDebug) {
-                  logParts.push(`🔍 Ledger ${patientName} (id=${info.id}): status=${ledgerRes.status} len=${ledgerRes.body.length}`);
-                  logParts.push(`  Preview: ${ledgerRes.body.substring(0, 500)}`);
+                  logParts.push(`🔍 Ledger ${patientName} (id=${info.id}, case=${useCaseId}): status=${ledgerRes.status} len=${ledgerRes.body.length}`);
                 }
 
                 // Extract totals from hidden inputs for debugging
+                const chargesMatch = ledgerRes.body.match(/class="tot-charges"\s+value="([^"]*)"/);
+                const paymentsMatch = ledgerRes.body.match(/class="tot-inspayment"\s+value="([^"]*)"/);
                 if (isDebug) {
-                  const chargesMatch = ledgerRes.body.match(/class="tot-charges"\s+value="([^"]*)"/);
-                  const paymentsMatch = ledgerRes.body.match(/class="tot-inspayment"\s+value="([^"]*)"/);
                   logParts.push(`  Totals: charges=${chargesMatch?.[1] || '?'}, payments=${paymentsMatch?.[1] || '?'}`);
+                }
+
+                // 🔍 SAVE RAW HTML so user can inspect exactly what we got
+                if (isDebug || !!testPatientName) {
+                  const safeName = patientName.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
+                  const htmlPath = `${userId}/debug_ledger_html/${safeName}_${Date.now()}.html`;
+                  const htmlBlob = new Blob([ledgerRes.body], { type: "text/html" });
+                  await serviceClient.storage.from("scraped-data").upload(htmlPath, htmlBlob, { contentType: "text/html", upsert: true });
+                  const { data: htmlUrl } = await serviceClient.storage.from("scraped-data").createSignedUrl(htmlPath, 86400);
+                  logParts.push(`  📄 RAW HTML saved: ${htmlUrl?.signedUrl || htmlPath}`);
                 }
 
                 if (ledgerRes.status !== 200 || ledgerRes.body.length < 50) {
