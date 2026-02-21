@@ -2209,19 +2209,25 @@ ${body}
                   if (visitIdMatches.length > 0) {
                     logParts.push(`  Sample VisitIds: ${visitIdMatches.slice(0, 5).join(", ")}`);
                   }
-                  // Search for known visit ID pattern from user's data
-                  const knownIdIdx = billingHtml.indexOf("28702154");
-                  logParts.push(`  Known VisitId "28702154" found at index: ${knownIdIdx}`);
-                  if (knownIdIdx >= 0) {
-                    logParts.push(`  Context around known ID: ...${billingHtml.substring(Math.max(0, knownIdIdx - 100), knownIdIdx + 100)}...`);
-                  }
-                  // Search for "GetVisit" or "loadVisit" or "PatientAccounting" JS calls
-                  const jsPatterns = ["GetVisit", "loadVisit", "PatientAccounting", "ShowVisit", "VisitList", "visitData", "dataSource"];
-                  for (const jp of jsPatterns) {
-                    const jpIdx = billingHtml.indexOf(jp);
-                    if (jpIdx >= 0) {
-                      logParts.push(`  Found "${jp}" at ${jpIdx}: ...${billingHtml.substring(Math.max(0, jpIdx - 40), jpIdx + 120)}...`);
+                  // Search for ShowVisitDates function and related endpoints
+                  const searchTerms = ["ShowVisitDates", "GetVisitDates", "GetVisits", "visitDateList", "GetPatientVisit", "GetLedgerVisit", "AccountingVisit", "GetPatientAccounting"];
+                  for (const term of searchTerms) {
+                    let startIdx = 0;
+                    const termLower = term.toLowerCase();
+                    const htmlLower = billingHtml.toLowerCase();
+                    let found = 0;
+                    while (startIdx < htmlLower.length && found < 3) {
+                      const idx = htmlLower.indexOf(termLower, startIdx);
+                      if (idx < 0) break;
+                      logParts.push(`  "${term}" at ${idx}: ...${billingHtml.substring(Math.max(0, idx - 20), Math.min(billingHtml.length, idx + 200))}...`);
+                      startIdx = idx + term.length;
+                      found++;
                     }
+                  }
+                  // Also look for JS script src references to find external JS files
+                  const scriptMatches = billingHtml.match(/src=["'][^"']*(?:billing|accounting|ledger|visit)[^"']*["']/gi);
+                  if (scriptMatches) {
+                    logParts.push(`  Billing-related scripts: ${scriptMatches.join(", ")}`)
                   }
                 }
 
