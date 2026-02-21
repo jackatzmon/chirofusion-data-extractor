@@ -3,7 +3,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "@/hooks/use-toast";
-import { Download, Square, ChevronDown, ChevronUp, FileSpreadsheet } from "lucide-react";
+import { Square, ChevronDown, ChevronUp, FileSpreadsheet, Trash2 } from "lucide-react";
 
 type ScrapeJob = {
   id: string;
@@ -61,11 +61,13 @@ export default function JobProgressCard({
   results,
   onAbort,
   onDownload,
+  onRefresh,
 }: {
   jobs: ScrapeJob[];
   results: ScrapeResult[];
   onAbort: () => void;
   onDownload: (filePath: string) => void;
+  onRefresh: () => void;
 }) {
   const [expandedJobLog, setExpandedJobLog] = useState<string | null>(null);
   const [aborting, setAborting] = useState(false);
@@ -85,6 +87,32 @@ export default function JobProgressCard({
       toast({ title: "Error", description: e.message, variant: "destructive" });
     } finally {
       setAborting(false);
+    }
+  };
+
+  const handleDeleteJob = async (jobId: string) => {
+    try {
+      // Delete associated results first
+      await supabase.from("scraped_data_results").delete().eq("scrape_job_id", jobId);
+      await supabase.from("scrape_jobs").delete().eq("id", jobId);
+      toast({ title: "Deleted", description: "Job and its data removed." });
+      onRefresh();
+    } catch (e: any) {
+      toast({ title: "Error", description: e.message, variant: "destructive" });
+    }
+  };
+
+  const handleClearAll = async () => {
+    try {
+      const nonRunning = jobs.filter((j) => j.status !== "running");
+      for (const job of nonRunning) {
+        await supabase.from("scraped_data_results").delete().eq("scrape_job_id", job.id);
+        await supabase.from("scrape_jobs").delete().eq("id", job.id);
+      }
+      toast({ title: "Cleared", description: `Removed ${nonRunning.length} jobs.` });
+      onRefresh();
+    } catch (e: any) {
+      toast({ title: "Error", description: e.message, variant: "destructive" });
     }
   };
 
@@ -120,8 +148,11 @@ export default function JobProgressCard({
       {/* Completed / failed jobs */}
       {otherJobs.length > 0 && (
         <Card>
-          <CardHeader>
+          <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle>Recent Jobs</CardTitle>
+            <Button variant="ghost" size="sm" onClick={handleClearAll} className="text-destructive hover:text-destructive">
+              <Trash2 className="h-4 w-4 mr-1" /> Clear All
+            </Button>
           </CardHeader>
           <CardContent className="space-y-3">
             {otherJobs.map((job) => {
@@ -156,9 +187,19 @@ export default function JobProgressCard({
                         {job.mode || "scrape"}
                       </span>
                     </div>
-                    <span className="text-xs text-muted-foreground">
-                      {new Date(job.created_at).toLocaleString()}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground">
+                        {new Date(job.created_at).toLocaleString()}
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                        onClick={() => handleDeleteJob(job.id)}
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </Button>
+                    </div>
                   </div>
                   <div className="text-xs text-muted-foreground">
                     {(job.data_types || []).join(", ")}
