@@ -2159,11 +2159,27 @@ ${body}
                 });
                 await saveStepHtml("Step3_SetBillingDefaultPage", `${BASE_URL}/Billing/Billing/SetBillingDefaultPageInSession`, billingRes.body, billingRes.status);
 
-                // 4a. Fetch the skeleton ledger page (returns visit checkboxes but no data)
+                // 3b. Navigate to the Billing page to establish full session context
+                const billingPageRes = await ajaxFetch("/Billing", {
+                  method: "GET",
+                  headers: {
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": `${BASE_URL}/Patient`,
+                    "ClientPatientId": String(info.id),
+                    ...(_practiceId ? { "practiceId": _practiceId } : {}),
+                  },
+                });
+                await saveStepHtml("Step3b_BillingPage", `${BASE_URL}/Billing`, `(${billingPageRes.body.length}b)`, billingPageRes.status);
+                if (isTrace) {
+                  logParts.push(`  Billing page GET: status=${billingPageRes.status} len=${billingPageRes.body.length}`);
+                }
+
+                // 4a. Fetch the skeleton ledger page (should now return visit checkboxes)
                 const skeletonRes = await ajaxFetch("/Billing/PatientAccounting/ShowLedger", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Requested-With": "XMLHttpRequest",
                     "Referer": `${BASE_URL}/Billing/`,
                     "ClientPatientId": String(info.id),
                     ...(_practiceId ? { "practiceId": _practiceId } : {}),
