@@ -2186,7 +2186,7 @@ ${body}
                   },
                   body: new URLSearchParams({
                     IsLedger: "1",
-                    ShowUac: "true",
+                    ShowUac: "1",
                   }).toString(),
                 });
                 await saveStepHtml("Step4a_ShowLedger_Skeleton", `${BASE_URL}/Billing/PatientAccounting/ShowLedger`, skeletonRes.body, skeletonRes.status);
