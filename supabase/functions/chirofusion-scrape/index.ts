@@ -2174,32 +2174,41 @@ ${body}
                   logParts.push(`  Billing page GET: status=${billingPageRes.status} len=${billingPageRes.body.length}`);
                 }
 
-                // 4. Extract VisitIds from the billing page HTML (visits are embedded as checkboxes/data attributes)
+                // 4. Extract VisitIds from the billing page HTML
                 const visitIdMatches: string[] = [];
-                // Try multiple regex patterns to find visit IDs in the billing page
-                const visitPatterns = [
-                  /visitid[\s]*[=:]\s*["']?(\d{5,})["']?/gi,
-                  /visit[-_]?id[\s]*[=:]\s*["']?(\d{5,})["']?/gi,
-                  /data-id[\s]*=\s*["']?(\d{5,})["']?/gi,
-                  /value[\s]*=\s*["'](\d{6,})["']/gi,
-                  /VisitIds?['":\s]*[=]?\s*["']?([\d,]+)["']?/gi,
-                ];
-                
                 const billingHtml = billingPageRes.body;
-                for (const pat of visitPatterns) {
-                  let m;
-                  while ((m = pat.exec(billingHtml)) !== null) {
-                    // For the VisitIds pattern that captures comma-separated values
-                    const val = m[1];
-                    if (val.includes(",")) {
-                      for (const id of val.split(",")) {
-                        const trimmed = id.trim();
-                        if (trimmed.length >= 5 && !visitIdMatches.includes(trimmed)) {
-                          visitIdMatches.push(trimmed);
+                
+                // Primary pattern: DeleteVisitFromDashBoard('VISITID') - these contain ALL visit IDs
+                const deleteVisitPattern = /DeleteVisitFromDashBoard\(['"](\d+)['"]\)/g;
+                let dvm;
+                while ((dvm = deleteVisitPattern.exec(billingHtml)) !== null) {
+                  const id = dvm[1];
+                  if (!visitIdMatches.includes(id)) {
+                    visitIdMatches.push(id);
+                  }
+                }
+                
+                // Fallback patterns if DeleteVisitFromDashBoard not found
+                if (visitIdMatches.length === 0) {
+                  const visitPatterns = [
+                    /visitid[\s]*[=:]\s*["']?(\d{5,})["']?/gi,
+                    /VisitIds?['":\s]*[=]?\s*["']?([\d,]+)["']?/gi,
+                  ];
+                
+                  for (const pat of visitPatterns) {
+                    let m;
+                    while ((m = pat.exec(billingHtml)) !== null) {
+                      const val = m[1];
+                      if (val.includes(",")) {
+                        for (const id of val.split(",")) {
+                          const trimmed = id.trim();
+                          if (trimmed.length >= 5 && !visitIdMatches.includes(trimmed)) {
+                            visitIdMatches.push(trimmed);
+                          }
                         }
+                      } else if (val.length >= 5 && !visitIdMatches.includes(val)) {
+                        visitIdMatches.push(val);
                       }
-                    } else if (val.length >= 5 && !visitIdMatches.includes(val)) {
-                      visitIdMatches.push(val);
                     }
                   }
                 }
@@ -2209,30 +2218,9 @@ ${body}
                   if (visitIdMatches.length > 0) {
                     logParts.push(`  Sample VisitIds: ${visitIdMatches.slice(0, 5).join(", ")}`);
                   }
-                  // Search for ShowVisitDates function and related endpoints
-                  const searchTerms = ["ShowVisitDates", "GetVisitDates", "GetVisits", "visitDateList", "GetPatientVisit", "GetLedgerVisit", "AccountingVisit", "GetPatientAccounting"];
-                  for (const term of searchTerms) {
-                    let startIdx = 0;
-                    const termLower = term.toLowerCase();
-                    const htmlLower = billingHtml.toLowerCase();
-                    let found = 0;
-                    while (startIdx < htmlLower.length && found < 3) {
-                      const idx = htmlLower.indexOf(termLower, startIdx);
-                      if (idx < 0) break;
-                      logParts.push(`  "${term}" at ${idx}: ...${billingHtml.substring(Math.max(0, idx - 20), Math.min(billingHtml.length, idx + 200))}...`);
-                      startIdx = idx + term.length;
-                      found++;
-                    }
-                  }
-                  // Also look for JS script src references to find external JS files
-                  const scriptMatches = billingHtml.match(/src=["'][^"']*(?:billing|accounting|ledger|visit)[^"']*["']/gi);
-                  if (scriptMatches) {
-                    logParts.push(`  Billing-related scripts: ${scriptMatches.join(", ")}`)
-                  }
                 }
 
                 if (visitIdMatches.length === 0) {
-                  // No visits found - patient has no ledger entries
                   ledgerEmpty++;
                   allLedgerRows.push({
                     PatientName: patientName,
