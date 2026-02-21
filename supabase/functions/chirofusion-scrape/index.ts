@@ -382,6 +382,7 @@ Deno.serve(async (req) => {
           },
           body: JSON.stringify({
             dataTypes, mode, dateFrom, dateTo,
+            testLimit, testPatientName,
             _batchJobId: job.id,
             _batchState: { resumeIndex: 0, dataTypeIndex: 0 },
           }),
@@ -475,6 +476,7 @@ Deno.serve(async (req) => {
         },
         body: JSON.stringify({
           dataTypes, mode, dateFrom, dateTo,
+          testLimit, testPatientName,
           _batchJobId: job.id,
           _batchState: {
             resumeIndex: batchState.resumeIndex,
@@ -1747,14 +1749,28 @@ Deno.serve(async (req) => {
             let withFiles = bs.withFiles || 0;
             let skippedDefaultCase = bs.skippedDefaultCase || 0;
 
-            if (processedCount > 0) {
-              logParts.push(`🔄 Resuming from patient ${processedCount}/${patients.length}`);
-            } else {
-              logParts.push(`Processing ${patients.length} patients for medical file PDFs (using SetVisitIdInSession for context)`);
+            // Apply test filters if specified
+            let effectivePatients = patients;
+            if (testPatientName) {
+              const target = testPatientName.toLowerCase().trim();
+              effectivePatients = patients.filter((p: any) => 
+                `${p.lastName}, ${p.firstName}`.toLowerCase().includes(target) ||
+                `${p.lastName},${p.firstName}`.toLowerCase().includes(target)
+              );
+              logParts.push(`⚠️ TEST MODE: filtering to patient "${testPatientName}" — found ${effectivePatients.length} matches`);
+            } else if (testLimit && testLimit > 0) {
+              effectivePatients = patients.slice(0, testLimit);
+              logParts.push(`⚠️ TEST MODE: limiting to ${testLimit} patients`);
             }
 
-            for (let i = processedCount; i < patients.length; i++) {
-              const patient = patients[i];
+            if (processedCount > 0) {
+              logParts.push(`🔄 Resuming from patient ${processedCount}/${effectivePatients.length}`);
+            } else {
+              logParts.push(`Processing ${effectivePatients.length} patients for medical file PDFs`);
+            }
+
+            for (let i = processedCount; i < effectivePatients.length; i++) {
+              const patient = effectivePatients[i];
               if (isTimingOut()) {
                 // Self-invoke to continue in a new batch
                 await selfInvoke({
