@@ -2169,52 +2169,54 @@ ${body}
                     ...(_practiceId ? { "practiceId": _practiceId } : {}),
                   },
                 });
-                await saveStepHtml("Step3b_BillingPage", `${BASE_URL}/Billing`, `(${billingPageRes.body.length}b)`, billingPageRes.status);
+                await saveStepHtml("Step3b_BillingPage", `${BASE_URL}/Billing`, billingPageRes.body, billingPageRes.status);
                 if (isTrace) {
                   logParts.push(`  Billing page GET: status=${billingPageRes.status} len=${billingPageRes.body.length}`);
                 }
 
-                // 4a. Fetch the skeleton ledger page (should now return visit checkboxes)
-                const skeletonRes = await ajaxFetch("/Billing/PatientAccounting/ShowLedger", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": `${BASE_URL}/Billing/`,
-                    "ClientPatientId": String(info.id),
-                    ...(_practiceId ? { "practiceId": _practiceId } : {}),
-                  },
-                  body: new URLSearchParams({
-                    IsLedger: "1",
-                    ShowUac: "true",
-                  }).toString(),
-                });
-                await saveStepHtml("Step4a_ShowLedger_Skeleton", `${BASE_URL}/Billing/PatientAccounting/ShowLedger`, skeletonRes.body, skeletonRes.status);
-
-                if (isTrace) {
-                  logParts.push(`🔍 Ledger skeleton ${patientName} (id=${info.id}): status=${skeletonRes.status} len=${skeletonRes.body.length}`);
-                  logParts.push(`  Skeleton HTML preview: ${skeletonRes.body.substring(0, 500)}`);
-                }
-
-                if (skeletonRes.status !== 200 || skeletonRes.body.length < 50) {
-                  ledgerEmpty++;
-                  processedCount = i + 1;
-                  continue;
-                }
-
-                // 4b. Extract VisitIds from the skeleton HTML (checkboxes or data attributes)
+                // 4. Extract VisitIds from the billing page HTML (visits are embedded as checkboxes/data attributes)
                 const visitIdMatches: string[] = [];
-                // Look for visit IDs in checkbox values, data-id attributes, or hidden inputs
-                const visitIdRegex = /(?:value|data-id|data-visitid|VisitId)[\s]*[=:]\s*["']?(\d{5,})["']?/gi;
-                let vidMatch;
-                while ((vidMatch = visitIdRegex.exec(skeletonRes.body)) !== null) {
-                  if (!visitIdMatches.includes(vidMatch[1])) {
-                    visitIdMatches.push(vidMatch[1]);
+                // Try multiple regex patterns to find visit IDs in the billing page
+                const visitPatterns = [
+                  /visitid[\s]*[=:]\s*["']?(\d{5,})["']?/gi,
+                  /visit[-_]?id[\s]*[=:]\s*["']?(\d{5,})["']?/gi,
+                  /data-id[\s]*=\s*["']?(\d{5,})["']?/gi,
+                  /value[\s]*=\s*["'](\d{6,})["']/gi,
+                  /VisitIds?['":\s]*[=]?\s*["']?([\d,]+)["']?/gi,
+                ];
+                
+                const billingHtml = billingPageRes.body;
+                for (const pat of visitPatterns) {
+                  let m;
+                  while ((m = pat.exec(billingHtml)) !== null) {
+                    // For the VisitIds pattern that captures comma-separated values
+                    const val = m[1];
+                    if (val.includes(",")) {
+                      for (const id of val.split(",")) {
+                        const trimmed = id.trim();
+                        if (trimmed.length >= 5 && !visitIdMatches.includes(trimmed)) {
+                          visitIdMatches.push(trimmed);
+                        }
+                      }
+                    } else if (val.length >= 5 && !visitIdMatches.includes(val)) {
+                      visitIdMatches.push(val);
+                    }
                   }
                 }
 
                 if (isTrace) {
-                  logParts.push(`  Found ${visitIdMatches.length} VisitIds in skeleton`);
+                  logParts.push(`  Found ${visitIdMatches.length} VisitIds in billing page`);
+                  if (visitIdMatches.length > 0) {
+                    logParts.push(`  Sample VisitIds: ${visitIdMatches.slice(0, 5).join(", ")}`);
+                  }
+                  // Also search for "visit" mentions to debug
+                  const visitMentions = billingHtml.match(/visit/gi);
+                  logParts.push(`  "visit" mentions in billing HTML: ${visitMentions ? visitMentions.length : 0}`);
+                  // Show a snippet around first "visit" mention
+                  const visitIdx = billingHtml.toLowerCase().indexOf("visit");
+                  if (visitIdx >= 0) {
+                    logParts.push(`  First "visit" context: ...${billingHtml.substring(Math.max(0, visitIdx - 30), visitIdx + 80)}...`);
+                  }
                 }
 
                 if (visitIdMatches.length === 0) {
