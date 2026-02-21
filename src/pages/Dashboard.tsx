@@ -274,6 +274,7 @@ const Dashboard = () => {
           results={results}
           onAbort={() => { loadJobs(); loadResults(); }}
           onDownload={downloadFile}
+          onRefresh={() => { loadJobs(); loadResults(); }}
         />
       </main>
     </div>
