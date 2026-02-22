@@ -2462,7 +2462,16 @@ ${body}
         }
 
         progress += Math.round(100 / totalTypes);
-        await serviceClient.from("scrape_jobs").update({ progress: Math.min(progress, 99) }).eq("id", job.id);
+        // CRITICAL: Save dataTypeIndex AFTER completing each type so if the NEXT type OOMs,
+        // we don't loop back and repeat this completed type forever.
+        await serviceClient.from("scrape_jobs").update({ 
+          progress: Math.min(progress, 99),
+          batch_state: {
+            ...(job.batch_state as any || {}),
+            dataTypeIndex: dtIdx + 1,  // Point to NEXT type
+            resumeIndex: 0,            // Reset patient index for next type
+          },
+        }).eq("id", job.id);
 
       } catch (scrapeError) {
         logParts.push(`❌ Error scraping ${dataType}: ${(scrapeError as any).message}`);
