@@ -1178,7 +1178,20 @@ Deno.serve(async (req) => {
       return result;
     }
 
-    for (const dataType of dataTypes) {
+    // MEMORY FIX: Skip data types that were already completed in previous batches.
+    // dataTypeIndex in batch_state indicates which type we're currently working on.
+    const resumeDataTypeIndex = (_batchState && typeof _batchState.dataTypeIndex === "number") ? _batchState.dataTypeIndex : 0;
+
+    for (let dtIdx = 0; dtIdx < dataTypes.length; dtIdx++) {
+      const dataType = dataTypes[dtIdx];
+
+      // Skip already-completed data types on resume
+      if (_batchJobId && dtIdx < resumeDataTypeIndex) {
+        logParts.push(`⏭️ Skipping ${dataType} (already completed in previous batch)`);
+        progress += Math.round(100 / totalTypes);
+        continue;
+      }
+
       try {
         console.log(`Scraping ${dataType}...`);
         logParts.push(`\n--- Scraping: ${dataType} ---`);
