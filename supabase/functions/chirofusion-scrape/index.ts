@@ -314,33 +314,47 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_ANON_KEY")!,
-      { global: { headers: { Authorization: authHeader } } }
-    );
-
-    const { data: { user }, error: userError } = await supabase.auth.getUser();
-    if (userError || !user) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
-    }
-
-    const userId = user.id;
-
-    // Cleanup any stale running jobs from previous crashed runs
-    await cleanupStaleJobs(supabase);
-
+    // Parse body first to check if this is a batch continuation
     const body = await req.json();
     const { dataTypes = [], mode = "scrape", dateFrom, dateTo,
-      // Batch continuation fields (set automatically by self-invocation)
       _batchJobId, _batchState,
-      // Test mode: limit number of patients processed
-      testLimit,
-      // Test mode: filter to a specific patient name (e.g. "Dagostino, Siyka")
-      testPatientName,
+      testLimit, testPatientName,
     } = body;
 
-    const { data: creds, error: credsError } = await supabase
+    const serviceClient = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    );
+
+    let userId: string;
+    let supabase: any;
+
+    if (_batchJobId) {
+      // Batch continuation via service role — get userId from the job record
+      const { data: existingJob } = await serviceClient.from("scrape_jobs").select("user_id").eq("id", _batchJobId).single();
+      if (!existingJob) {
+        return new Response(JSON.stringify({ error: "Batch job not found." }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      userId = existingJob.user_id;
+      supabase = serviceClient; // Use service client for batch continuations
+    } else {
+      // Normal user-initiated request
+      supabase = createClient(
+        Deno.env.get("SUPABASE_URL")!,
+        Deno.env.get("SUPABASE_ANON_KEY")!,
+        { global: { headers: { Authorization: authHeader } } }
+      );
+      const { data: { user }, error: userError } = await supabase.auth.getUser();
+      if (userError || !user) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      userId = user.id;
+    }
+
+    // Cleanup any stale running jobs from previous crashed runs
+    await cleanupStaleJobs(serviceClient);
+
+    const { data: creds, error: credsError } = await serviceClient
       .from("chirofusion_credentials")
       .select("*")
       .eq("user_id", userId)
@@ -349,11 +363,6 @@ Deno.serve(async (req) => {
     if (credsError || !creds) {
       return new Response(JSON.stringify({ error: "ChiroFusion credentials not found." }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
-
-    const serviceClient = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
 
     // If continuing a batch, reuse existing job; otherwise create new one
     let job: any;
