@@ -53,8 +53,11 @@ function parseProgressFromLog(log: string | null, batchState: any): { current: n
 const DATA_TYPE_LABELS: Record<string, string> = {
   demographics: "Demographics",
   appointments: "Appointments",
-  financials: "Financials",
   soap_notes: "SOAP Notes",
+  financials: "Financials",
+  consolidated_export: "📊 Consolidated Spreadsheet",
+  patient_summary: "📋 Patient Summary (Demographics, SOAP & Appt Index)",
+  financials_ledger: "💰 Financials Ledger",
 };
 
 export default function JobProgressCard({
@@ -196,7 +199,7 @@ export default function JobProgressCard({
                 r.scrape_job_id === job.id || r.created_at >= job.created_at
               );
               const consolidatedResult = jobResults.find(
-                (r) => r.data_type === "consolidated_export"
+                (r) => r.data_type === "consolidated_export" || r.data_type === "patient_summary"
               );
               const individualResults = jobResults.filter(
                 (r) => r.data_type !== "consolidated_export"
@@ -263,24 +266,11 @@ export default function JobProgressCard({
                     </Button>
                   )}
 
-                  {/* Download button for consolidated export */}
-                  {job.status === "completed" && consolidatedResult && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="w-full"
-                      onClick={() => onDownload(consolidatedResult.file_path)}
-                    >
-                      <FileSpreadsheet className="h-4 w-4 mr-2" />
-                      Open Spreadsheet
-                    </Button>
-                  )}
-
-                  {/* Individual file downloads */}
-                  {job.status === "completed" && !consolidatedResult && individualResults.length > 0 && (
+                  {/* Download buttons */}
+                  {job.status === "completed" && jobResults.length > 0 && (
                     <div className="space-y-1.5">
                       <p className="text-xs font-medium text-foreground">Downloads:</p>
-                      {individualResults.map((r) => (
+                      {jobResults.map((r) => (
                         <Button
                           key={r.id}
                           variant="outline"
