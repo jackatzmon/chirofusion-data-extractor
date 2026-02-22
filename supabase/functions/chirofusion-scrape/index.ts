@@ -417,7 +417,7 @@ Deno.serve(async (req) => {
       logParts.push(...job.log_output.split("\n"));
     }
     const startTime = Date.now();
-    const MAX_RUNTIME_MS = 100_000; // 100s to leave room for cleanup + self-invoke
+    const MAX_RUNTIME_MS = 55_000; // 55s — login+demographics re-fetch takes ~25-30s, need margin before 150s hard timeout
 
     function isTimingOut(): boolean {
       return (Date.now() - startTime) > MAX_RUNTIME_MS;
