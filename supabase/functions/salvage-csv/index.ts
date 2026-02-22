@@ -142,46 +142,12 @@ serve(async (req) => {
       XLSX.utils.book_append_sheet(wb, ws, "Appointments Index");
     }
 
-    // Sheet 4: Financials — too large for XLSX (47k rows exceeds 150MB memory limit)
-    // Write as separate CSV file instead
-    const ledgerRaw = await downloadJson(`${tmpPrefix}/financialsLedgerRows.json`);
-    let finCount = 0;
-    let csvPath = "";
-    if (ledgerRaw?.length) {
-      finCount = ledgerRaw.length;
-      // Add DOB in-place
-      for (const row of ledgerRaw) {
-        row.DOB = dobByName[(row.Patient || row.patient || "").trim()] || "";
-      }
-      const keys = Object.keys(ledgerRaw[0]);
-      const csvLines = [keys.join(",")];
-      for (const row of ledgerRaw) {
-        csvLines.push(keys.map(k => {
-          const v = (row[k] ?? "").toString().replace(/"/g, '""');
-          return v.includes(",") || v.includes('"') || v.includes("\n") ? `"${v}"` : v;
-        }).join(","));
-      }
-      ledgerRaw.length = 0; // free
-      csvPath = `${userId}/financials_ledger_${Date.now()}.csv`;
-      const { error: csvErr } = await serviceClient.storage
-        .from(bucket)
-        .upload(csvPath, new Blob([csvLines.join("\n")], { type: "text/csv" }), {
-          contentType: "text/csv", upsert: true,
-        });
-      if (csvErr) throw new Error(`CSV upload failed: ${csvErr.message}`);
-      await serviceClient.from("scraped_data_results").insert({
-        user_id: userId, scrape_job_id: jobId,
-        data_type: "financials_ledger", file_path: csvPath, row_count: finCount,
-      });
-    }
+    // Free source arrays
+    if (soapIndex) soapIndex.length = 0;
+    if (apptIndex) apptIndex.length = 0;
+    if (patientList) patientList.length = 0;
 
-    if (wb.SheetNames.length === 0 && !csvPath) {
-      return new Response(JSON.stringify({ ok: false, message: "No data files found" }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // Upload XLSX (Patient Summary + SOAP + Appointments)
+    // Upload XLSX (3 sheets: Patient Summary + SOAP + Appointments)
     let xlsxPath = "";
     if (wb.SheetNames.length > 0) {
       const xlsxBuffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
@@ -194,17 +160,60 @@ serve(async (req) => {
           contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
           upsert: true,
         });
-      if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
-
+      if (uploadError) throw new Error(`XLSX upload failed: ${uploadError.message}`);
       await serviceClient.from("scraped_data_results").insert({
         user_id: userId, scrape_job_id: jobId,
         data_type: "patient_summary", file_path: xlsxPath, row_count: demoCount,
       });
     }
 
+    // Sheet 4: Financials as separate XLSX — loaded after freeing everything else
+    const ledgerRaw = await downloadJson(`${tmpPrefix}/financialsLedgerRows.json`);
+    let finCount = 0;
+    let finPath = "";
+    if (ledgerRaw?.length) {
+      finCount = ledgerRaw.length;
+      // Add DOB in-place
+      for (const row of ledgerRaw) {
+        row.DOB = dobByName[(row.PatientName || row.Patient || row.patient || "").trim()] || "";
+      }
+      // Build a separate lean workbook for financials only
+      const finWb = XLSX.utils.book_new();
+      const keys = Object.keys(ledgerRaw[0]);
+      const aoa: (string | number)[][] = [keys];
+      for (const row of ledgerRaw) {
+        aoa.push(keys.map(k => row[k] ?? ""));
+      }
+      ledgerRaw.length = 0;
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      aoa.length = 0;
+      XLSX.utils.book_append_sheet(finWb, ws, "Financials");
+      const finBuffer = XLSX.write(finWb, { type: "buffer", bookType: "xlsx" });
+      finPath = `${userId}/financials_ledger_${Date.now()}.xlsx`;
+      const { error: finErr } = await serviceClient.storage
+        .from(bucket)
+        .upload(finPath, new Blob([finBuffer], {
+          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }), {
+          contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          upsert: true,
+        });
+      if (finErr) throw new Error(`Financials upload failed: ${finErr.message}`);
+      await serviceClient.from("scraped_data_results").insert({
+        user_id: userId, scrape_job_id: jobId,
+        data_type: "financials_ledger", file_path: finPath, row_count: finCount,
+      });
+    }
+
+    if (!xlsxPath && !finPath) {
+      return new Response(JSON.stringify({ ok: false, message: "No data files found" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     return new Response(JSON.stringify({
-      ok: true, xlsxPath, csvPath,
-      message: `Patient Summary XLSX (${demoCount} patients, ${wb.SheetNames.length} sheets) + Financials CSV (${finCount} rows)`,
+      ok: true, xlsxPath, finPath,
+      message: `Patient Summary XLSX (${demoCount} patients) + Financials XLSX (${finCount} rows)`,
     }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
   } catch (e: any) {
     return new Response(JSON.stringify({ error: e.message }), {
