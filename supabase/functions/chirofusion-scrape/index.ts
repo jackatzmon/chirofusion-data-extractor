@@ -1520,13 +1520,61 @@ Deno.serve(async (req) => {
 
           // ==================== APPOINTMENTS ====================
           case "appointments": {
-            // Based on browser cURL: POST to /Scheduler/Scheduler/GetAppointmentReport
-            // ReportType=1204 (Appointment Hx), IsAllPatient=true, with __RequestVerificationToken
             const fromDate = dateFrom || "08/01/2021";
             const toDate = dateTo || new Date().toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
 
             logParts.push(`Date range: ${fromDate} to ${toDate}`);
 
+            // Check if we're resuming PDF generation — if so, load cached appointment data
+            const apptBsCheck = _batchState || {};
+            const isApptResume = _batchJobId && apptBsCheck.dataTypeIndex === dataTypes.indexOf(dataType) && (apptBsCheck.apptPdfResumeIndex || 0) > 0;
+            const apptCachePath = `_batch_tmp/${job.id}/apptData.json`;
+
+            if (isApptResume) {
+              logParts.push(`🔄 Resuming appointment PDFs — loading cached data from storage...`);
+            }
+
+            let apptItems: Record<string, unknown>[] = [];
+            let sampleKeys: string[] = [];
+            let patientNameKey: string | undefined;
+            let lastNameKey: string | undefined;
+            let firstNameKey: string | undefined;
+            let dateKey: string | undefined;
+            let typeKey: string | undefined;
+            let checkinKey: string | undefined;
+
+            function getPatientName(row: Record<string, unknown>): string {
+              if (patientNameKey && row[patientNameKey]) return String(row[patientNameKey]);
+              const ln = lastNameKey ? String(row[lastNameKey] || "") : "";
+              const fn = firstNameKey ? String(row[firstNameKey] || "") : "";
+              if (ln || fn) return `${ln}, ${fn}`.replace(/^, |, $/g, "");
+              return "Unknown";
+            }
+
+            if (isApptResume) {
+              // Load cached sorted appointment data from storage
+              try {
+                const { data: cachedData, error: cachedErr } = await serviceClient.storage.from("scraped-data").download(apptCachePath);
+                if (cachedData && !cachedErr) {
+                  const parsed = JSON.parse(await cachedData.text());
+                  apptItems = parsed.items;
+                  sampleKeys = parsed.sampleKeys;
+                  patientNameKey = parsed.patientNameKey;
+                  lastNameKey = parsed.lastNameKey;
+                  firstNameKey = parsed.firstNameKey;
+                  dateKey = parsed.dateKey;
+                  typeKey = parsed.typeKey;
+                  checkinKey = parsed.checkinKey;
+                  logParts.push(`✅ Loaded ${apptItems.length} cached appointment rows`);
+                } else {
+                  logParts.push(`❌ Failed to load cached appt data: ${cachedErr?.message}`);
+                  break;
+                }
+              } catch (e) {
+                logParts.push(`❌ Cache load error: ${(e as any).message}`);
+                break;
+              }
+            } else {
             // Step 1: Load Scheduler page to get verification token and practiceId
             const { body: schedHtmlAppt } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
             const apptToken = extractVerifToken(schedHtmlAppt);
@@ -1641,51 +1689,34 @@ Deno.serve(async (req) => {
             }
 
             // Step 5: Detect field names for sorting (handle various naming conventions)
-            const sampleKeys = Object.keys(apptItems[0]);
+            sampleKeys = Object.keys(apptItems[0]);
             logParts.push(`Appointment fields: ${sampleKeys.join(", ")}`);
 
             // Find patient name field(s)
-            const patientNameKey = sampleKeys.find(k => /^(PatientName|Patient_Name|Patient|FullName|Name)$/i.test(k));
-            const lastNameKey = sampleKeys.find(k => /^(LastName|Last_Name|PatientLastName)$/i.test(k));
-            const firstNameKey = sampleKeys.find(k => /^(FirstName|First_Name|PatientFirstName)$/i.test(k));
-            // Date field
-            const dateKey = sampleKeys.find(k => /^(AppointmentDate|Date|ApptDate|VisitDate|Appointment_Date|ServiceDate)$/i.test(k));
-            // Appt type field
-            const typeKey = sampleKeys.find(k => /^(AppointmentType|Appt_Type|ApptType|Type|AppointmentTypeName|VisitType)$/i.test(k));
-            // Check-in field
-            const checkinKey = sampleKeys.find(k => /^(CheckedIn|Checked_In|IsCheckedIn|CheckIn|Status|AppointmentStatus|Appt_Status)$/i.test(k));
+            patientNameKey = sampleKeys.find(k => /^(PatientName|Patient_Name|Patient|FullName|Name)$/i.test(k));
+            lastNameKey = sampleKeys.find(k => /^(LastName|Last_Name|PatientLastName)$/i.test(k));
+            firstNameKey = sampleKeys.find(k => /^(FirstName|First_Name|PatientFirstName)$/i.test(k));
+            dateKey = sampleKeys.find(k => /^(AppointmentDate|Date|ApptDate|VisitDate|Appointment_Date|ServiceDate)$/i.test(k));
+            typeKey = sampleKeys.find(k => /^(AppointmentType|Appt_Type|ApptType|Type|AppointmentTypeName|VisitType)$/i.test(k));
+            checkinKey = sampleKeys.find(k => /^(CheckedIn|Checked_In|IsCheckedIn|CheckIn|Status|AppointmentStatus|Appt_Status)$/i.test(k));
 
             logParts.push(`Field mapping: name=${patientNameKey || `${lastNameKey}+${firstNameKey}`} date=${dateKey} type=${typeKey} checkin=${checkinKey}`);
-
-            // Helper to get patient display name from a row
-            function getPatientName(row: Record<string, unknown>): string {
-              if (patientNameKey && row[patientNameKey]) return String(row[patientNameKey]);
-              const ln = lastNameKey ? String(row[lastNameKey] || "") : "";
-              const fn = firstNameKey ? String(row[firstNameKey] || "") : "";
-              if (ln || fn) return `${ln}, ${fn}`.replace(/^, |, $/g, "");
-              return "Unknown";
-            }
 
             // Step 6: Sort by patient name → date → appointment type
             apptItems.sort((a, b) => {
               const nameA = getPatientName(a).toLowerCase();
               const nameB = getPatientName(b).toLowerCase();
               if (nameA !== nameB) return nameA < nameB ? -1 : 1;
-
-              // Sort by date chronologically
               if (dateKey) {
                 const dA = new Date(String(a[dateKey] || "")).getTime() || 0;
                 const dB = new Date(String(b[dateKey] || "")).getTime() || 0;
                 if (dA !== dB) return dA - dB;
               }
-
-              // Sort by appointment type
               if (typeKey) {
                 const tA = String(a[typeKey] || "").toLowerCase();
                 const tB = String(b[typeKey] || "").toLowerCase();
                 if (tA !== tB) return tA < tB ? -1 : 1;
               }
-
               return 0;
             });
 
@@ -1694,6 +1725,22 @@ Deno.serve(async (req) => {
             // Step 7: Save sorted appointments as the main sheet CSV
             csvContent = jsonToCsv(apptItems);
             rowCount = apptItems.length;
+
+            // Cache sorted appointment data + field keys for resume
+            try {
+              const cacheBlob = new Blob([JSON.stringify({
+                items: apptItems,
+                sampleKeys, patientNameKey, lastNameKey, firstNameKey, dateKey, typeKey, checkinKey,
+              })], { type: "application/json" });
+              await serviceClient.storage.from("scraped-data").remove([apptCachePath]);
+              await serviceClient.storage.from("scraped-data").upload(apptCachePath, cacheBlob, { contentType: "application/json" });
+              logParts.push(`📦 Cached appointment data for resume (${apptItems.length} rows)`);
+            } catch (e) {
+              logParts.push(`⚠️ Cache save error: ${(e as any).message}`);
+            }
+
+            // Free raw apptItems from memory after caching — only patientGroups needed below
+            } // end else (non-resume path)
 
             // Step 8: Group by patient and generate per-patient PDF summaries
             const patientGroups = new Map<string, Record<string, unknown>[]>();
@@ -1718,12 +1765,14 @@ Deno.serve(async (req) => {
             for (let pi = apptPdfIndex; pi < patientNames.length; pi++) {
               if (isTimingOut()) {
                 // Save state and self-invoke
+                // Save appointmentsIndex to storage before self-invoke
+                await appendToStorageArray("appointmentsIndex", appointmentsIndex);
+                appointmentsIndex = []; // clear so selfInvoke doesn't double-save
                 await selfInvoke({
                   resumeIndex: 0,
                   dataTypeIndex: dataTypes.indexOf(dataType),
                   apptPdfResumeIndex: pi,
                   apptPdfCount,
-                  appointmentsIndex,
                 });
                 return new Response(JSON.stringify({ success: true, jobId: job.id, batching: true }), {
                   headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -2539,7 +2588,7 @@ ${body}
 
     // Cleanup temp batch storage files
     try {
-      const tmpFiles = ["collectedSheets", "soapIndex", "financialsLedgerRows", "appointmentsIndex", "patientList"];
+      const tmpFiles = ["collectedSheets", "soapIndex", "financialsLedgerRows", "appointmentsIndex", "patientList", "apptData"];
       await serviceClient.storage.from("scraped-data").remove(
         tmpFiles.map(f => `_batch_tmp/${job.id}/${f}.json`)
       );
