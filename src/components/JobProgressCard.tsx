@@ -266,7 +266,7 @@ export default function JobProgressCard({
                     </Button>
                   )}
 
-                  {/* Download buttons */}
+                  {/* Download button */}
                   {job.status === "completed" && jobResults.length > 0 && (
                     <div className="space-y-1.5">
                       {jobResults.map((r) => (
