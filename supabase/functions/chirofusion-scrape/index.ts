@@ -254,23 +254,31 @@ function generateTextPdf(title: string, lines: string[]): Uint8Array {
   for (let p = 0; p < numPages; p++) {
     const pageLines = pageGroups[p];
 
-    // Build content stream
+    // Build content stream — use relative Td offsets (Td is cumulative in PDF)
     let stream = "BT\n";
-    let y = MARGIN_TOP;
+    let currentX = 0;
+    let currentY = 0;
     for (let l = 0; l < pageLines.length; l++) {
       const line = pageLines[l];
       const isTitle = (p === 0 && l === 0);
+      const targetX = MARGIN_LEFT;
+      const targetY = MARGIN_TOP - (isTitle ? 0 : (l === 0 ? 0 : 0));
+      // Calculate actual Y position for this line
+      let yPos = MARGIN_TOP;
+      for (let prev = 0; prev < l; prev++) {
+        yPos -= (p === 0 && prev === 0) ? TITLE_HEIGHT : LINE_HEIGHT;
+      }
+      const dx = targetX - currentX;
+      const dy = yPos - currentY;
       if (isTitle) {
         stream += `/F2 14 Tf\n`;
-        stream += `${MARGIN_LEFT} ${y} Td\n`;
-        stream += `(${escPdf(line)}) Tj\n`;
-        y -= TITLE_HEIGHT;
       } else {
         stream += `/F1 9 Tf\n`;
-        stream += `${MARGIN_LEFT} ${y} Td\n`;
-        stream += `(${escPdf(line)}) Tj\n`;
-        y -= LINE_HEIGHT;
       }
+      stream += `${dx} ${dy} Td\n`;
+      stream += `(${escPdf(line)}) Tj\n`;
+      currentX = targetX;
+      currentY = yPos;
     }
     stream += "ET\n";
 

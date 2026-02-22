@@ -57,7 +57,7 @@ const DATA_TYPE_LABELS: Record<string, string> = {
   financials: "Financials",
   consolidated_export: "📊 Consolidated Spreadsheet",
   patient_summary: "📋 Patient Summary (Demographics, SOAP & Appt Index)",
-  financials_ledger: "💰 Financials Ledger (CSV)",
+  financials_ledger: "💰 Financials Ledger",
 };
 
 export default function JobProgressCard({
