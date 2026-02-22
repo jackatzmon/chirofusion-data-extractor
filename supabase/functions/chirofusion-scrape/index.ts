@@ -411,10 +411,13 @@ Deno.serve(async (req) => {
     }
 
     let sessionCookies = "";
-    // On resume, load logParts from DB instead of HTTP body
+    // On resume, DON'T load full log history into memory — just keep recent entries
     const logParts: string[] = [];
     if (_batchJobId && job.log_output) {
-      logParts.push(...job.log_output.split("\n"));
+      // Only keep last 50 lines to save memory; full log is preserved in DB
+      const allLines = job.log_output.split("\n");
+      logParts.push(`... (${allLines.length} previous log lines in DB) ...`);
+      logParts.push(...allLines.slice(-50));
     }
     const startTime = Date.now();
     const MAX_RUNTIME_MS = 55_000; // 55s — login+demographics re-fetch takes ~25-30s, need margin before 150s hard timeout
@@ -458,9 +461,17 @@ Deno.serve(async (req) => {
         logParts.push(`⚠️ Storage save error: ${(storageErr as any).message}`);
       }
 
+      // Append new log lines to existing DB log (don't replace with truncated version)
+      let fullLog = logParts.join("\n");
+      if (_batchJobId && job.log_output) {
+        // Merge: keep original DB log and append only NEW lines (skip the "previous log" prefix)
+        const newLines = logParts.filter(l => !l.startsWith("... ("));
+        fullLog = job.log_output + "\n" + newLines.join("\n");
+      }
+
       // Only save minimal counters in batch_state (small JSONB)
       await serviceClient.from("scrape_jobs").update({
-        log_output: logParts.join("\n"),
+        log_output: fullLog,
         batch_state: {
           resumeIndex: batchState.resumeIndex,
           pdfCount: batchState.pdfCount,
@@ -1018,13 +1029,25 @@ Deno.serve(async (req) => {
       : (dbBatchState.appointmentsIndex || []);
 
     // Shared: get full patient list with IDs for per-patient scraping
-    // Caches result so it's only fetched once even if multiple data types need it
-    // Get patient names from GetPatientReports (no IDs needed)
+    // MEMORY OPTIMIZATION: Cache patient list in Storage after first fetch.
+    // On batch resume, load the slim JSON (~100KB) instead of re-fetching 2.8MB HTML + parsing.
     let _cachedPatientNames: { firstName: string; lastName: string }[] | null = null;
+    const PATIENT_LIST_STORAGE_KEY = "patientList";
+
     async function getAllPatientNames(): Promise<{ firstName: string; lastName: string }[]> {
       if (_cachedPatientNames) return _cachedPatientNames;
 
-      // Load Scheduler page and run report
+      // On batch resume, try loading from storage first (fast, ~100KB vs 2.8MB)
+      if (_batchJobId) {
+        const cached = await loadLargeDataFromStorage(PATIENT_LIST_STORAGE_KEY, null);
+        if (cached && Array.isArray(cached) && cached.length > 0) {
+          _cachedPatientNames = cached;
+          logParts.push(`✅ Patient names: ${cached.length} (loaded from cache)`);
+          return _cachedPatientNames;
+        }
+      }
+
+      // First run or cache miss: fetch from ChiroFusion
       const { body: schedHtml } = await fetchWithCookies(`${BASE_URL}/User/Scheduler`);
       setPracticeId(schedHtml);
 
@@ -1060,6 +1083,13 @@ Deno.serve(async (req) => {
               lastName: p.LastName || "",
             }));
             logParts.push(`✅ Patient names: ${_cachedPatientNames.length} from GetPatientReports`);
+            // Cache to storage for future batch resumes (~100KB vs 2.8MB re-fetch)
+            try {
+              await saveLargeDataToStorage(PATIENT_LIST_STORAGE_KEY, _cachedPatientNames);
+              logParts.push(`💾 Patient list cached to storage`);
+            } catch (e) {
+              logParts.push(`⚠️ Failed to cache patient list: ${(e as any).message}`);
+            }
             return _cachedPatientNames;
           }
         } catch { /* not JSON */ }
@@ -2463,7 +2493,7 @@ ${body}
 
     // Cleanup temp batch storage files
     try {
-      const tmpFiles = ["collectedSheets", "soapIndex", "financialsLedgerRows", "appointmentsIndex"];
+      const tmpFiles = ["collectedSheets", "soapIndex", "financialsLedgerRows", "appointmentsIndex", "patientList"];
       await serviceClient.storage.from("scraped-data").remove(
         tmpFiles.map(f => `_batch_tmp/${job.id}/${f}.json`)
       );
@@ -2473,7 +2503,9 @@ ${body}
     await serviceClient.from("scrape_jobs").update({
       status: "completed",
       progress: 100,
-      log_output: logParts.join("\n"),
+      log_output: (_batchJobId && job.log_output) 
+        ? job.log_output + "\n" + logParts.filter(l => !l.startsWith("... (")).join("\n")
+        : logParts.join("\n"),
       error_message: finalMessage,
     }).eq("id", job.id);
 
