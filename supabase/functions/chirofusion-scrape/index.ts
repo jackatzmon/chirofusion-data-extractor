@@ -2167,11 +2167,12 @@ Deno.serve(async (req) => {
             let ledgerEmpty = bs.ledgerEmpty || 0;
             let ledgerSearchFailed = bs.ledgerSearchFailed || 0;
 
-            // Restore previously collected rows from batch_state
-            const allLedgerRows: Record<string, string>[] = [...financialsLedgerRows];
+            // MEMORY FIX: Don't load previous rows into memory. Only collect current batch's rows.
+            // Previous batches' rows are already saved in storage via appendToStorageArray.
+            const allLedgerRows: Record<string, string>[] = [];
 
             if (processedCount > 0) {
-              logParts.push(`🔄 Resuming ledgers from patient ${processedCount}/${patients.length} (${allLedgerRows.length} rows collected)`);
+              logParts.push(`🔄 Resuming ledgers from patient ${processedCount}/${patients.length} (previous rows in storage)`);
             } else {
               logParts.push(`Processing ${patients.length} patients for account ledgers`);
             }
@@ -2193,11 +2194,11 @@ Deno.serve(async (req) => {
             for (let i = processedCount; i < effectivePatients.length; i++) {
               const patient = effectivePatients[i];
               if (isTimingOut()) {
-                // Save collected ledger rows to batch_state and self-invoke
+                // MEMORY FIX: Save current batch's ledger rows to storage (not inline)
+                await appendToStorageArray("financialsLedgerRows", allLedgerRows);
                 await selfInvoke({
                   resumeIndex: i,
                   ledgerFetched, ledgerEmpty, ledgerSearchFailed,
-                  financialsLedgerRows: allLedgerRows,
                   dataTypeIndex: dataTypes.indexOf(dataType),
                 });
                 return new Response(JSON.stringify({ success: true, jobId: job.id, batching: true }), {
