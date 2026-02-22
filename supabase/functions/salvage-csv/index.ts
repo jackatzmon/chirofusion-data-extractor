@@ -147,38 +147,14 @@ serve(async (req) => {
     if (apptIndex) apptIndex.length = 0;
     if (patientList) patientList.length = 0;
 
-    // Upload XLSX (3 sheets: Patient Summary + SOAP + Appointments)
-    let xlsxPath = "";
-    if (wb.SheetNames.length > 0) {
-      const xlsxBuffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-      xlsxPath = `${userId}/patient_summary_${Date.now()}.xlsx`;
-      const { error: uploadError } = await serviceClient.storage
-        .from(bucket)
-        .upload(xlsxPath, new Blob([xlsxBuffer], {
-          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        }), {
-          contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          upsert: true,
-        });
-      if (uploadError) throw new Error(`XLSX upload failed: ${uploadError.message}`);
-      await serviceClient.from("scraped_data_results").insert({
-        user_id: userId, scrape_job_id: jobId,
-        data_type: "patient_summary", file_path: xlsxPath, row_count: demoCount,
-      });
-    }
-
-    // Sheet 4: Financials as separate XLSX — loaded after freeing everything else
+    // Sheet 4: Financials — add to same workbook
     const ledgerRaw = await downloadJson(`${tmpPrefix}/financialsLedgerRows.json`);
     let finCount = 0;
-    let finPath = "";
     if (ledgerRaw?.length) {
       finCount = ledgerRaw.length;
-      // Add DOB in-place
       for (const row of ledgerRaw) {
         row.DOB = dobByName[(row.PatientName || row.Patient || row.patient || "").trim()] || "";
       }
-      // Build a separate lean workbook for financials only
-      const finWb = XLSX.utils.book_new();
       const keys = Object.keys(ledgerRaw[0]);
       const aoa: (string | number)[][] = [keys];
       for (const row of ledgerRaw) {
@@ -187,33 +163,36 @@ serve(async (req) => {
       ledgerRaw.length = 0;
       const ws = XLSX.utils.aoa_to_sheet(aoa);
       aoa.length = 0;
-      XLSX.utils.book_append_sheet(finWb, ws, "Financials");
-      const finBuffer = XLSX.write(finWb, { type: "buffer", bookType: "xlsx" });
-      finPath = `${userId}/financials_ledger_${Date.now()}.xlsx`;
-      const { error: finErr } = await serviceClient.storage
-        .from(bucket)
-        .upload(finPath, new Blob([finBuffer], {
-          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        }), {
-          contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          upsert: true,
-        });
-      if (finErr) throw new Error(`Financials upload failed: ${finErr.message}`);
-      await serviceClient.from("scraped_data_results").insert({
-        user_id: userId, scrape_job_id: jobId,
-        data_type: "financials_ledger", file_path: finPath, row_count: finCount,
-      });
+      XLSX.utils.book_append_sheet(wb, ws, "Financials");
     }
 
-    if (!xlsxPath && !finPath) {
+    if (wb.SheetNames.length === 0) {
       return new Response(JSON.stringify({ ok: false, message: "No data files found" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
+    // Write single workbook with all sheets
+    const xlsxBuffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+    const xlsxPath = `${userId}/patient_data_${Date.now()}.xlsx`;
+    const { error: uploadError } = await serviceClient.storage
+      .from(bucket)
+      .upload(xlsxPath, new Blob([xlsxBuffer], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      }), {
+        contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        upsert: true,
+      });
+    if (uploadError) throw new Error(`XLSX upload failed: ${uploadError.message}`);
+
+    await serviceClient.from("scraped_data_results").insert({
+      user_id: userId, scrape_job_id: jobId,
+      data_type: "consolidated_export", file_path: xlsxPath, row_count: demoCount + finCount,
+    });
+
     return new Response(JSON.stringify({
-      ok: true, xlsxPath, finPath,
-      message: `Patient Summary XLSX (${demoCount} patients) + Financials XLSX (${finCount} rows)`,
+      ok: true, xlsxPath,
+      message: `Complete workbook: ${demoCount} patients, ${finCount} financial rows`,
     }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
   } catch (e: any) {
     return new Response(JSON.stringify({ error: e.message }), {
