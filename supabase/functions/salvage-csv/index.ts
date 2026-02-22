@@ -42,17 +42,19 @@ serve(async (req) => {
     const soapSummary: Record<string, string> = {};
     if (soapIndex) {
       for (const s of soapIndex) {
-        const name = (s.Patient || "").trim();
+        const name = (s.PatientName || s.Patient || "").trim();
         if (!soapSummary[name]) soapSummary[name] = "";
-        if (s.Date) soapSummary[name] += (soapSummary[name] ? ", " : "") + s.Date;
+        const info = s.Documents ? `${s.Documents} docs` : s.Date || "";
+        if (info) soapSummary[name] += (soapSummary[name] ? ", " : "") + info;
       }
     }
     const apptSummary: Record<string, string> = {};
     if (apptIndex) {
       for (const a of apptIndex) {
-        const name = (a.Patient || "").trim();
+        const name = (a.PatientName || a.Patient || "").trim();
         if (!apptSummary[name]) apptSummary[name] = "";
-        if (a.Date) apptSummary[name] += (apptSummary[name] ? ", " : "") + a.Date;
+        const info = a.Appointments ? `${a.Appointments} appts` : a.Date || "";
+        if (info) apptSummary[name] += (apptSummary[name] ? ", " : "") + info;
       }
     }
     // Build DOB + demographic lookups from patient list
@@ -102,10 +104,13 @@ serve(async (req) => {
 
     // Sheet 2: SOAP Notes Index (build sheet then discard source)
     if (soapIndex?.length) {
-      const sheetData = soapIndex.map((row: any) => ({
-        Patient: row.Patient || "", DOB: dobByName[(row.Patient || "").trim()] || "",
-        Date: row.Date || "", Status: row.Status || "", PDFLink: row.PDFLink || "",
-      }));
+      const sheetData = soapIndex.map((row: any) => {
+        const name = (row.PatientName || row.Patient || "").trim();
+        return {
+          Patient: name, DOB: dobByName[name] || "",
+          Documents: row.Documents ?? "", Status: row.Status || "", PDFLink: row.PDFLink || "",
+        };
+      });
       const ws = XLSX.utils.json_to_sheet(sheetData);
       for (let r = 0; r < sheetData.length; r++) {
         const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: 4 });
@@ -113,16 +118,19 @@ serve(async (req) => {
           ws[cellRef] = { t: "s", v: "📎 Open PDF", l: { Target: sheetData[r].PDFLink, Tooltip: "Open SOAP Note PDF" } };
         }
       }
-      ws["!cols"] = [{ wch: 30 }, { wch: 12 }, { wch: 12 }, { wch: 15 }, { wch: 20 }];
+      ws["!cols"] = [{ wch: 30 }, { wch: 12 }, { wch: 10 }, { wch: 20 }, { wch: 20 }];
       XLSX.utils.book_append_sheet(wb, ws, "SOAP Notes Index");
     }
 
     // Sheet 3: Appointments Index
     if (apptIndex?.length) {
-      const sheetData = apptIndex.map((row: any) => ({
-        Patient: row.Patient || "", DOB: dobByName[(row.Patient || "").trim()] || "",
-        Date: row.Date || "", Status: row.Status || "", PDFLink: row.PDFLink || "",
-      }));
+      const sheetData = apptIndex.map((row: any) => {
+        const name = (row.PatientName || row.Patient || "").trim();
+        return {
+          Patient: name, DOB: dobByName[name] || "",
+          Appointments: row.Appointments ?? "", Status: row.Status || "", PDFLink: row.PDFLink || "",
+        };
+      });
       const ws = XLSX.utils.json_to_sheet(sheetData);
       for (let r = 0; r < sheetData.length; r++) {
         const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: 4 });
@@ -130,7 +138,7 @@ serve(async (req) => {
           ws[cellRef] = { t: "s", v: "📎 Open PDF", l: { Target: sheetData[r].PDFLink, Tooltip: "Open Appointment PDF" } };
         }
       }
-      ws["!cols"] = [{ wch: 30 }, { wch: 12 }, { wch: 12 }, { wch: 15 }, { wch: 20 }];
+      ws["!cols"] = [{ wch: 30 }, { wch: 12 }, { wch: 10 }, { wch: 20 }, { wch: 20 }];
       XLSX.utils.book_append_sheet(wb, ws, "Appointments Index");
     }
 
