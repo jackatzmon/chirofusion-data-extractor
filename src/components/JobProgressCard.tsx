@@ -3,7 +3,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "@/hooks/use-toast";
-import { Square, ChevronDown, ChevronUp, FileSpreadsheet, Trash2, Monitor } from "lucide-react";
+import { Square, ChevronDown, ChevronUp, FileSpreadsheet, Trash2, Monitor, RotateCcw } from "lucide-react";
 
 type ScrapeJob = {
   id: string;
@@ -71,7 +71,37 @@ export default function JobProgressCard({
 }) {
   const [expandedJobLog, setExpandedJobLog] = useState<string | null>(null);
   const [aborting, setAborting] = useState(false);
+  const [resuming, setResuming] = useState(false);
   const { toast } = useToast();
+
+  const handleResume = async (job: ScrapeJob) => {
+    if (!job.batch_state) return;
+    setResuming(true);
+    try {
+      // Set job back to running
+      await supabase.from("scrape_jobs").update({ 
+        status: "running", 
+        error_message: null 
+      }).eq("id", job.id);
+
+      // Invoke edge function with saved batch state
+      const { error } = await supabase.functions.invoke("chirofusion-scrape", {
+        body: {
+          dataTypes: job.data_types,
+          mode: job.mode,
+          _batchJobId: job.id,
+          _batchState: job.batch_state,
+        },
+      });
+      if (error) throw error;
+      toast({ title: "Resumed", description: "Job is continuing from where it left off." });
+      onRefresh();
+    } catch (e: any) {
+      toast({ title: "Resume failed", description: e.message, variant: "destructive" });
+    } finally {
+      setResuming(false);
+    }
+  };
 
   const handleAbort = async (jobId: string) => {
     setAborting(true);
@@ -213,6 +243,20 @@ export default function JobProgressCard({
                     <p className="text-xs text-destructive">
                       {job.error_message}
                     </p>
+                  )}
+
+                  {/* Resume button for failed/aborted jobs with batch state */}
+                  {(job.status === "failed" || job.status === "aborted") && job.batch_state && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="w-full"
+                      onClick={() => handleResume(job)}
+                      disabled={resuming || !!runningJob}
+                    >
+                      <RotateCcw className="h-4 w-4 mr-2" />
+                      {resuming ? "Resuming..." : `Resume from patient ${(job.batch_state as any)?.resumeIndex || 0}`}
+                    </Button>
                   )}
 
                   {/* Download button for completed jobs */}
