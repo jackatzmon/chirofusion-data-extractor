@@ -1761,6 +1761,8 @@ Deno.serve(async (req) => {
               if (!patientGroups.has(name)) patientGroups.set(name, []);
               patientGroups.get(name)!.push(item);
             }
+            // Free the full appointment array — only patientGroups needed from here
+            apptItems.length = 0;
 
             logParts.push(`Generating PDF summaries for ${patientGroups.size} patients...`);
 
@@ -1851,8 +1853,16 @@ Deno.serve(async (req) => {
                 appointmentsIndex.push({ PatientName: pName, Appointments: pAppts.length, PDFLink: "", Status: "Error" });
               }
 
+              // Free processed patient data to reduce memory
+              patientGroups.delete(pName);
+
               if ((pi + 1) % 100 === 0) {
                 logParts.push(`Appt PDF progress: ${pi + 1}/${patientNames.length} (${apptPdfCount} PDFs)`);
+                // Flush appointmentsIndex to storage periodically to free memory
+                if (appointmentsIndex.length > 0) {
+                  await appendToStorageArray("appointmentsIndex", appointmentsIndex);
+                  appointmentsIndex.length = 0; // clear after flushing
+                }
                 await serviceClient.from("scrape_jobs").update({
                   progress: Math.min(progress + Math.round(((pi + 1) / patientNames.length) * (100 / totalTypes)), 99),
                   log_output: logParts.join("\n"),
@@ -1862,7 +1872,13 @@ Deno.serve(async (req) => {
               await new Promise(r => setTimeout(r, 50));
             }
 
-            logParts.push(`✅ Appointments complete: ${apptItems.length} rows sorted, ${apptPdfCount} PDF summaries from ${patientGroups.size} patients`);
+            // Flush any remaining appointmentsIndex entries to storage
+            if (appointmentsIndex.length > 0) {
+              await appendToStorageArray("appointmentsIndex", appointmentsIndex);
+              appointmentsIndex.length = 0;
+            }
+
+            logParts.push(`✅ Appointments complete: ${apptPdfCount} PDF summaries from ${patientNames.length} patients`);
             break;
           }
 
