@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import * as XLSX from "https://esm.sh/xlsx@0.18.5";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -22,7 +23,6 @@ serve(async (req) => {
 
     const bucket = "scraped-data";
     const tmpPrefix = `_batch_tmp/${jobId}`;
-    const results: string[] = [];
 
     async function downloadJson(path: string): Promise<any> {
       const { data, error } = await serviceClient.storage.from(bucket).download(path);
@@ -31,52 +31,109 @@ serve(async (req) => {
       return JSON.parse(text);
     }
 
-    function csvEscape(val: any): string {
-      if (val === null || val === undefined) return "";
-      const s = String(val);
-      if (s.includes(",") || s.includes('"') || s.includes("\n")) {
-        return `"${s.replace(/"/g, '""')}"`;
-      }
-      return s;
-    }
+    const wb = XLSX.utils.book_new();
 
-    async function convertAndUpload(name: string, dataType: string, data: any[]) {
-      const headers = Object.keys(data[0]);
-      const csvLines = [headers.map(csvEscape).join(",")];
-      for (const row of data) {
-        csvLines.push(headers.map(h => csvEscape(row[h])).join(","));
-      }
-      const csvContent = csvLines.join("\n");
-      const filePath = `${userId}/salvaged_${name}_${jobId.slice(0,8)}.csv`;
-      await serviceClient.storage.from(bucket).upload(filePath, new Blob([csvContent], { type: "text/csv" }), { upsert: true });
-      results.push(`${name}: ${data.length} rows → ${filePath}`);
-      await serviceClient.from("scraped_data_results").insert({
-        user_id: userId, scrape_job_id: jobId, data_type: dataType, file_path: filePath, row_count: data.length,
-      });
-    }
+    // Process one sheet at a time to stay within memory limits
 
+    // 1. Demographics
     const patientList = await downloadJson(`${tmpPrefix}/patientList.json`);
-    if (patientList?.length) await convertAndUpload("demographics", "demographics", patientList);
+    if (patientList?.length) {
+      const ws = XLSX.utils.json_to_sheet(patientList);
+      XLSX.utils.book_append_sheet(wb, ws, "Demographics");
+    }
+    // Free memory
+    const demoCount = patientList?.length || 0;
 
-    const ledgerRows = await downloadJson(`${tmpPrefix}/financialsLedgerRows.json`);
-    if (ledgerRows?.length) await convertAndUpload("financials", "financials", ledgerRows);
-
+    // 2. SOAP Notes Index
     const soapIndex = await downloadJson(`${tmpPrefix}/soapIndex.json`);
-    if (soapIndex?.length) await convertAndUpload("soap_notes", "soap_notes", soapIndex);
+    if (soapIndex?.length) {
+      const sheetData = soapIndex.map((row: any) => ({
+        Patient: row.Patient || "",
+        Date: row.Date || "",
+        Status: row.Status || "",
+        PDFLink: row.PDFLink || "",
+      }));
+      const ws = XLSX.utils.json_to_sheet(sheetData);
+      for (let r = 0; r < soapIndex.length; r++) {
+        const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: 3 });
+        if (soapIndex[r].PDFLink) {
+          ws[cellRef] = {
+            t: "s", v: "📎 Open PDF",
+            l: { Target: soapIndex[r].PDFLink, Tooltip: "Open SOAP Note PDF" },
+          };
+        }
+      }
+      ws["!cols"] = [{ wch: 30 }, { wch: 12 }, { wch: 15 }, { wch: 20 }];
+      XLSX.utils.book_append_sheet(wb, ws, "SOAP Notes Index");
+    }
 
+    // 3. Appointments Index
     const apptIndex = await downloadJson(`${tmpPrefix}/appointmentsIndex.json`);
-    if (apptIndex?.length) await convertAndUpload("appointments", "appointments", apptIndex);
+    if (apptIndex?.length) {
+      const apptSheetData = apptIndex.map((row: any) => ({
+        Patient: row.Patient || "",
+        Date: row.Date || "",
+        Status: row.Status || "",
+        PDFLink: row.PDFLink || "",
+      }));
+      const apptWs = XLSX.utils.json_to_sheet(apptSheetData);
+      for (let r = 0; r < apptIndex.length; r++) {
+        const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: 3 });
+        if (apptIndex[r].PDFLink) {
+          apptWs[cellRef] = {
+            t: "s", v: "📎 Open PDF",
+            l: { Target: apptIndex[r].PDFLink, Tooltip: "Open Appointment PDF" },
+          };
+        }
+      }
+      apptWs["!cols"] = [{ wch: 30 }, { wch: 12 }, { wch: 15 }, { wch: 20 }];
+      XLSX.utils.book_append_sheet(wb, apptWs, "Appointments Index");
+    }
 
-    const apptData = await downloadJson(`${tmpPrefix}/apptData.json`);
-    if (apptData?.length) await convertAndUpload("appointment_details", "appointments", apptData);
+    // 4. Financials - this is the big one (47k rows). 
+    // Load and add directly, then immediately write workbook.
+    const ledgerRows = await downloadJson(`${tmpPrefix}/financialsLedgerRows.json`);
+    if (ledgerRows?.length) {
+      const ws = XLSX.utils.json_to_sheet(ledgerRows);
+      XLSX.utils.book_append_sheet(wb, ws, "Financials");
+    }
+    const finCount = ledgerRows?.length || 0;
 
-    if (results.length === 0) {
+    if (wb.SheetNames.length === 0) {
       return new Response(JSON.stringify({ ok: false, message: "No data files found" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    return new Response(JSON.stringify({ ok: true, results }), {
+    // Write workbook
+    const xlsxBuffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+    const filePath = `${userId}/consolidated_export_${Date.now()}.xlsx`;
+    const xlsxBlob = new Blob([xlsxBuffer], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const { error: uploadError } = await serviceClient.storage
+      .from(bucket)
+      .upload(filePath, xlsxBlob, {
+        contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        upsert: true,
+      });
+
+    if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
+
+    await serviceClient.from("scraped_data_results").insert({
+      user_id: userId,
+      scrape_job_id: jobId,
+      data_type: "consolidated_export",
+      file_path: filePath,
+      row_count: demoCount + finCount,
+    });
+
+    return new Response(JSON.stringify({
+      ok: true,
+      filePath,
+      sheets: wb.SheetNames,
+      message: `Created workbook with ${wb.SheetNames.length} sheets`,
+    }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (e: any) {
