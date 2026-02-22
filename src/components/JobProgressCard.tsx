@@ -57,7 +57,7 @@ const DATA_TYPE_LABELS: Record<string, string> = {
   financials: "Financials",
   consolidated_export: "📊 Consolidated Spreadsheet",
   patient_summary: "📋 Patient Summary (Demographics, SOAP & Appt Index)",
-  financials_ledger: "💰 Financials Ledger",
+  financials_ledger: "💰 Financials Ledger (CSV)",
 };
 
 export default function JobProgressCard({
@@ -266,22 +266,10 @@ export default function JobProgressCard({
                     </Button>
                   )}
 
-                  {/* Download button */}
-                  {job.status === "completed" && consolidatedResult && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="w-full"
-                      onClick={() => onDownload(consolidatedResult.file_path)}
-                    >
-                      <FileSpreadsheet className="h-4 w-4 mr-2" />
-                      📊 Open Spreadsheet
-                      {consolidatedResult.row_count ? ` (${consolidatedResult.row_count.toLocaleString()} rows)` : ""}
-                    </Button>
-                  )}
-                  {job.status === "completed" && !consolidatedResult && individualResults.length > 0 && (
+                  {/* Download buttons */}
+                  {job.status === "completed" && jobResults.length > 0 && (
                     <div className="space-y-1.5">
-                      {individualResults.map((r) => (
+                      {jobResults.map((r) => (
                         <Button
                           key={r.id}
                           variant="outline"
