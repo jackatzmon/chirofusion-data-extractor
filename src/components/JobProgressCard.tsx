@@ -134,6 +134,7 @@ export default function JobProgressCard({
           </CardHeader>
           <CardContent className="space-y-4">
             <ActiveJobSpinner job={runningJob} />
+            <LiveLogViewer logOutput={runningJob.log_output} />
             <LivePageViewer />
             <Button
               variant="destructive"
@@ -342,6 +343,41 @@ function ActiveJobSpinner({ job }: { job: ScrapeJob }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+/** Live log viewer — shows log_output with auto-scroll */
+function LiveLogViewer({ logOutput }: { logOutput: string | null }) {
+  const preRef = useRef<HTMLPreElement>(null);
+  const [pinned, setPinned] = useState(true);
+
+  useEffect(() => {
+    if (pinned && preRef.current) {
+      preRef.current.scrollTop = preRef.current.scrollHeight;
+    }
+  }, [logOutput, pinned]);
+
+  const handleScroll = useCallback(() => {
+    if (!preRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = preRef.current;
+    setPinned(scrollHeight - scrollTop - clientHeight < 40);
+  }, []);
+
+  if (!logOutput) return null;
+
+  return (
+    <div className="rounded-md border border-border overflow-hidden">
+      <div className="px-3 py-2 bg-muted/50">
+        <span className="text-xs font-medium text-foreground">Live Log</span>
+      </div>
+      <pre
+        ref={preRef}
+        onScroll={handleScroll}
+        className="p-3 bg-muted/20 text-xs text-muted-foreground overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap break-words"
+      >
+        {logOutput}
+      </pre>
     </div>
   );
 }

@@ -62,7 +62,7 @@ async function cleanupStaleJobs(supabase: any) {
   await supabase.from("scrape_jobs")
     .update({ status: "failed", error_message: "Job timed out. Please retry." })
     .eq("status", "running")
-    .lt("created_at", oneHourAgo);
+    .lt("updated_at", oneHourAgo);
 }
 
 /** Convert JSON array to CSV string */
@@ -384,7 +384,7 @@ Deno.serve(async (req) => {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "Authorization": authHeader!,
+            "Authorization": "Bearer " + Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
           },
           body: JSON.stringify({
             dataTypes, mode, dateFrom, dateTo,
@@ -478,7 +478,7 @@ Deno.serve(async (req) => {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": authHeader!,
+          "Authorization": "Bearer " + Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
         },
         body: JSON.stringify({
           dataTypes, mode, dateFrom, dateTo,
@@ -2001,7 +2001,7 @@ Deno.serve(async (req) => {
               }
 
               processedCount = i + 1;
-              if (processedCount % 50 === 0) {
+              if (processedCount % 10 === 0) {
                 logParts.push(`Progress: ${processedCount}/${patients.length} (${skippedDefaultCase} default-case skipped, ${withFiles} with files, ${pdfCount} PDFs)`);
                 const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
                 await serviceClient.from("scrape_jobs").update({ 
@@ -2306,7 +2306,7 @@ ${body}
               }
 
               processedCount = i + 1;
-              if (processedCount % 50 === 0) {
+              if (processedCount % 10 === 0) {
                 logParts.push(`Ledger progress: ${processedCount}/${patients.length} (${ledgerFetched} with data, ${ledgerEmpty} empty, ${ledgerSearchFailed} failed, ${allLedgerRows.length} total rows)`);
                 const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
                 await serviceClient.from("scrape_jobs").update({
