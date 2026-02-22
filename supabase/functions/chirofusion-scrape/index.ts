@@ -2152,16 +2152,30 @@ Deno.serve(async (req) => {
               processedCount = i + 1;
               if (processedCount % 10 === 0) {
                 logParts.push(`Progress: ${processedCount}/${patients.length} (${skippedDefaultCase} default-case skipped, ${withFiles} with files, ${pdfCount} PDFs)`);
+                // Flush soapIndex to storage periodically to free memory
+                if (soapIndex.length > 0) {
+                  await appendToStorageArray("soapIndex", soapIndex);
+                  soapIndex.length = 0;
+                }
                 const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
                 await serviceClient.from("scrape_jobs").update({ 
                   progress: Math.min(progress + newProgress, 99), 
                   log_output: logParts.join("\n") 
                 }).eq("id", job.id);
+                // Trim log to last 80 lines to prevent memory growth
+                if (logParts.length > 80) {
+                  logParts.splice(0, logParts.length - 60);
+                }
               }
 
               await new Promise(r => setTimeout(r, 150));
             }
 
+            // Flush any remaining soapIndex entries to storage
+            if (soapIndex.length > 0) {
+              await appendToStorageArray("soapIndex", soapIndex);
+              soapIndex.length = 0;
+            }
             logParts.push(`✅ Medical Files complete: ${pdfCount} PDFs from ${processedCount} patients (${withFiles} with files, ${skippedDefaultCase} default-case skipped, ${searchFailed} search failures)`);
             hasAnyData = pdfCount > 0;
             break;
@@ -2457,28 +2471,35 @@ ${body}
 
               processedCount = i + 1;
               if (processedCount % 10 === 0) {
-                logParts.push(`Ledger progress: ${processedCount}/${patients.length} (${ledgerFetched} with data, ${ledgerEmpty} empty, ${ledgerSearchFailed} failed, ${allLedgerRows.length} total rows)`);
+                logParts.push(`Ledger progress: ${processedCount}/${patients.length} (${ledgerFetched} with data, ${ledgerEmpty} empty, ${ledgerSearchFailed} failed, ${allLedgerRows.length} rows in batch)`);
                 const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
                 await serviceClient.from("scrape_jobs").update({
                   progress: Math.min(progress + newProgress, 99),
                   log_output: logParts.join("\n"),
                 }).eq("id", job.id);
+                // Trim log to last 80 lines to prevent memory growth
+                if (logParts.length > 80) {
+                  logParts.splice(0, logParts.length - 60);
+                }
+              }
+
+              // Flush ledger rows to storage every 100 patients to prevent memory overflow
+              if (allLedgerRows.length >= 500) {
+                await appendToStorageArray("financialsLedgerRows", allLedgerRows);
+                allLedgerRows.length = 0; // free memory
               }
 
               await new Promise(r => setTimeout(r, 150));
             }
 
-            logParts.push(`✅ Patient Ledgers complete: ${allLedgerRows.length} rows from ${processedCount} patients (${ledgerFetched} with data, ${ledgerEmpty} empty, ${ledgerSearchFailed} search failures)`);
-
+            // Flush any remaining ledger rows to storage
             if (allLedgerRows.length > 0) {
-              // Reorder columns so PatientName is first
-              const reordered = allLedgerRows.map(row => {
-                const { PatientName, ...rest } = row;
-                return { PatientName, ...rest };
-              });
-              csvContent = jsonToCsv(reordered);
-              rowCount = reordered.length;
+              await appendToStorageArray("financialsLedgerRows", allLedgerRows);
+              allLedgerRows.length = 0;
             }
+
+            logParts.push(`✅ Patient Ledgers complete: ${processedCount} patients (${ledgerFetched} with data, ${ledgerEmpty} empty, ${ledgerSearchFailed} search failures)`);
+            // Rows are all in storage now — will be loaded during XLSX consolidation
             break;
           }
         }
