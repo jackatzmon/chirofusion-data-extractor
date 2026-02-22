@@ -429,10 +429,37 @@ Deno.serve(async (req) => {
     // Self-invoke to continue processing in a new batch
     // CRITICAL: Large data is stored in Supabase Storage to avoid batch_state JSONB size limits
     // which cause DB statement timeouts with 16MB+ payloads.
+    // MEMORY OPTIMIZATION: Use streaming append — don't load full arrays into memory.
     async function saveLargeDataToStorage(key: string, data: any): Promise<void> {
       const path = `_batch_tmp/${job.id}/${key}.json`;
       const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
-      // Upsert: remove first then upload (storage doesn't support overwrite by default)
+      await serviceClient.storage.from("scraped-data").remove([path]);
+      await serviceClient.storage.from("scraped-data").upload(path, blob, { contentType: "application/json" });
+    }
+
+    // Append new items to an existing storage array WITHOUT loading the full array into memory.
+    // Reads old file as text, splices in new JSON items, writes back.
+    async function appendToStorageArray(key: string, newItems: any[]): Promise<void> {
+      if (newItems.length === 0) return;
+      const path = `_batch_tmp/${job.id}/${key}.json`;
+      let existingText = "[]";
+      try {
+        const { data, error } = await serviceClient.storage.from("scraped-data").download(path);
+        if (data && !error) existingText = await data.text();
+      } catch { /* no existing file */ }
+      
+      // Splice: remove trailing "]", add comma if needed, append new items
+      const trimmed = existingText.trim();
+      let merged: string;
+      if (trimmed === "[]" || trimmed === "") {
+        merged = JSON.stringify(newItems);
+      } else {
+        // Remove trailing "]", append new items
+        const withoutClose = trimmed.slice(0, -1); // remove "]"
+        merged = withoutClose + "," + JSON.stringify(newItems).slice(1); // remove "[" from new
+      }
+      
+      const blob = new Blob([merged], { type: "application/json" });
       await serviceClient.storage.from("scraped-data").remove([path]);
       await serviceClient.storage.from("scraped-data").upload(path, blob, { contentType: "application/json" });
     }
@@ -449,13 +476,13 @@ Deno.serve(async (req) => {
     async function selfInvoke(batchState: any) {
       logParts.push(`🔄 Batch timeout — continuing from patient ${batchState.resumeIndex}...`);
       
-      // Save large data arrays to Storage instead of batch_state to avoid statement timeouts
+      // APPEND new items from this batch to storage (don't overwrite — previous batches' data is already there)
       try {
         await Promise.all([
-          saveLargeDataToStorage("collectedSheets", collectedSheets),
-          saveLargeDataToStorage("soapIndex", soapIndex),
-          saveLargeDataToStorage("financialsLedgerRows", batchState.financialsLedgerRows || []),
-          saveLargeDataToStorage("appointmentsIndex", batchState.appointmentsIndex || []),
+          appendToStorageArray("collectedSheets", collectedSheets),
+          appendToStorageArray("soapIndex", soapIndex),
+          appendToStorageArray("financialsLedgerRows", batchState.financialsLedgerRows || financialsLedgerRows),
+          appendToStorageArray("appointmentsIndex", batchState.appointmentsIndex || appointmentsIndex),
         ]);
       } catch (storageErr) {
         logParts.push(`⚠️ Storage save error: ${(storageErr as any).message}`);
@@ -1012,21 +1039,14 @@ Deno.serve(async (req) => {
     let progress = 0;
     const totalTypes = dataTypes.length;
     let hasAnyData = false;
-    // Collectors for consolidated workbook — restore from Storage on resume
+    // MEMORY OPTIMIZATION: Don't load accumulated data into memory on resume.
+    // Only accumulate NEW items during this batch. Append to storage in selfInvoke.
+    // Full arrays are only loaded at the very end for workbook generation.
     const dbBatchState = _batchJobId && job.batch_state ? job.batch_state as any : {};
-    const useStorage = dbBatchState._dataInStorage === true;
-    const collectedSheets: { type: string; csv: string }[] = useStorage
-      ? await loadLargeDataFromStorage("collectedSheets", [])
-      : (dbBatchState.collectedSheets || []);
-    const soapIndex: { PatientName: string; Documents: number; PDFLink: string; Status: string }[] = useStorage
-      ? await loadLargeDataFromStorage("soapIndex", [])
-      : (dbBatchState.soapIndex || []);
-    const financialsLedgerRows: Record<string, string>[] = useStorage
-      ? await loadLargeDataFromStorage("financialsLedgerRows", [])
-      : (dbBatchState.financialsLedgerRows || []);
-    const appointmentsIndex: { PatientName: string; Appointments: number; PDFLink: string; Status: string }[] = useStorage
-      ? await loadLargeDataFromStorage("appointmentsIndex", [])
-      : (dbBatchState.appointmentsIndex || []);
+    const collectedSheets: { type: string; csv: string }[] = [];
+    const soapIndex: { PatientName: string; Documents: number; PDFLink: string; Status: string }[] = [];
+    const financialsLedgerRows: Record<string, string>[] = [];
+    const appointmentsIndex: { PatientName: string; Appointments: number; PDFLink: string; Status: string }[] = [];
 
     // Shared: get full patient list with IDs for per-patient scraping
     // MEMORY OPTIMIZATION: Cache patient list in Storage after first fetch.
@@ -2388,6 +2408,14 @@ ${body}
     }
 
     // ==================== BUILD CONSOLIDATED XLSX WORKBOOK ====================
+    // MEMORY NOTE: At this point processing is complete. We need to load the full
+    // accumulated arrays from storage to build the final workbook. This is the ONLY
+    // time we load them fully. If this still causes OOM on very large datasets,
+    // we'd need to stream directly to XLSX — but typically final consolidation is fine.
+    const finalCollectedSheets = [...collectedSheets, ...await loadLargeDataFromStorage("collectedSheets", [])];
+    const finalSoapIndex = [...soapIndex, ...await loadLargeDataFromStorage("soapIndex", [])];
+    const finalAppointmentsIndex = [...appointmentsIndex, ...await loadLargeDataFromStorage("appointmentsIndex", [])];
+
     const wb = XLSX.utils.book_new();
     const typeLabels: Record<string, string> = {
       demographics: "Demographics",
@@ -2395,18 +2423,23 @@ ${body}
       financials: "Patient Ledgers",
     };
 
-    for (const { type, csv } of collectedSheets) {
+    // Merge sheets of the same type (multiple batches may have contributed)
+    const mergedByType = new Map<string, Record<string, string>[]>();
+    for (const { type, csv } of finalCollectedSheets) {
       const rows = csvToJson(csv);
       if (rows.length > 0) {
-        const ws = XLSX.utils.json_to_sheet(rows);
-        XLSX.utils.book_append_sheet(wb, ws, typeLabels[type] || type);
+        if (!mergedByType.has(type)) mergedByType.set(type, []);
+        mergedByType.get(type)!.push(...rows);
       }
+    }
+    for (const [type, rows] of mergedByType) {
+      const ws = XLSX.utils.json_to_sheet(rows);
+      XLSX.utils.book_append_sheet(wb, ws, typeLabels[type] || type);
     }
 
     // Add SOAP Notes Index sheet with PDF download links (clickable hyperlinks)
-    if (soapIndex.length > 0) {
-      // Build sheet data without the raw URL — use "📎 Open PDF" as display text
-      const sheetData = soapIndex.map(row => ({
+    if (finalSoapIndex.length > 0) {
+      const sheetData = finalSoapIndex.map(row => ({
         PatientName: row.PatientName,
         Documents: row.Documents,
         Status: row.Status,
@@ -2415,13 +2448,13 @@ ${body}
       const ws = XLSX.utils.json_to_sheet(sheetData);
       
       // Add clickable hyperlinks to PDFLink column (column D, index 3)
-      for (let r = 0; r < soapIndex.length; r++) {
+      for (let r = 0; r < finalSoapIndex.length; r++) {
         const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: 3 }); // +1 for header row
-        if (soapIndex[r].PDFLink) {
+        if (finalSoapIndex[r].PDFLink) {
           ws[cellRef] = {
             t: "s",
             v: "📎 Open PDF",
-            l: { Target: soapIndex[r].PDFLink },
+            l: { Target: finalSoapIndex[r].PDFLink },
           };
         }
       }
@@ -2438,8 +2471,8 @@ ${body}
     }
 
     // Add Appointments Index sheet with PDF summary links
-    if (appointmentsIndex.length > 0) {
-      const apptSheetData = appointmentsIndex.map(row => ({
+    if (finalAppointmentsIndex.length > 0) {
+      const apptSheetData = finalAppointmentsIndex.map(row => ({
         PatientName: row.PatientName,
         Appointments: row.Appointments,
         Status: row.Status,
@@ -2447,13 +2480,13 @@ ${body}
       }));
       const apptWs = XLSX.utils.json_to_sheet(apptSheetData);
       
-      for (let r = 0; r < appointmentsIndex.length; r++) {
+      for (let r = 0; r < finalAppointmentsIndex.length; r++) {
         const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: 3 });
-        if (appointmentsIndex[r].PDFLink) {
+        if (finalAppointmentsIndex[r].PDFLink) {
           apptWs[cellRef] = {
             t: "s",
             v: "📎 Open PDF",
-            l: { Target: appointmentsIndex[r].PDFLink },
+            l: { Target: finalAppointmentsIndex[r].PDFLink },
           };
         }
       }
@@ -2479,7 +2512,7 @@ ${body}
       if (uploadError) {
         logParts.push(`❌ Workbook upload error: ${uploadError.message}`);
       } else {
-        const totalRows = collectedSheets.reduce((sum, s) => sum + csvToJson(s.csv).length, 0) + soapIndex.length;
+        const totalRows = finalCollectedSheets.reduce((sum: number, s: any) => sum + csvToJson(s.csv).length, 0) + finalSoapIndex.length;
         await serviceClient.from("scraped_data_results").insert({
           scrape_job_id: job.id,
           user_id: userId,
