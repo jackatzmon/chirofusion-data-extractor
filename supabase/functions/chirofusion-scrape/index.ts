@@ -509,7 +509,7 @@ Deno.serve(async (req) => {
           ledgerFetched: batchState.ledgerFetched,
           ledgerEmpty: batchState.ledgerEmpty,
           ledgerSearchFailed: batchState.ledgerSearchFailed,
-          apptPdfIndex: batchState.apptPdfIndex,
+          apptPdfResumeIndex: batchState.apptPdfResumeIndex || batchState.apptPdfIndex,
           apptPdfCount: batchState.apptPdfCount,
           apptSearchFailed: batchState.apptSearchFailed,
           // Flag to indicate large data is in storage
