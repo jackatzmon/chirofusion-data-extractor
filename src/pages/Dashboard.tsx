@@ -34,6 +34,7 @@ type ScrapeResult = {
   file_path: string;
   row_count: number | null;
   created_at: string;
+  scrape_job_id?: string;
 };
 
 const Dashboard = () => {

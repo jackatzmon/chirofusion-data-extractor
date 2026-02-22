@@ -23,6 +23,7 @@ type ScrapeResult = {
   file_path: string;
   row_count: number | null;
   created_at: string;
+  scrape_job_id?: string;
 };
 
 function parseProgressFromLog(log: string | null, batchState: any): { current: number; total: number; completedTypes: string[] } {
@@ -192,10 +193,13 @@ export default function JobProgressCard({
           <CardContent className="space-y-3">
             {otherJobs.map((job) => {
               const jobResults = results.filter((r) =>
-                r.created_at >= job.created_at
+                r.scrape_job_id === job.id || r.created_at >= job.created_at
               );
               const consolidatedResult = jobResults.find(
                 (r) => r.data_type === "consolidated_export"
+              );
+              const individualResults = jobResults.filter(
+                (r) => r.data_type !== "consolidated_export"
               );
 
               return (
@@ -259,7 +263,7 @@ export default function JobProgressCard({
                     </Button>
                   )}
 
-                  {/* Download button for completed jobs */}
+                  {/* Download button for consolidated export */}
                   {job.status === "completed" && consolidatedResult && (
                     <Button
                       variant="outline"
@@ -270,6 +274,26 @@ export default function JobProgressCard({
                       <FileSpreadsheet className="h-4 w-4 mr-2" />
                       Open Spreadsheet
                     </Button>
+                  )}
+
+                  {/* Individual file downloads */}
+                  {job.status === "completed" && !consolidatedResult && individualResults.length > 0 && (
+                    <div className="space-y-1.5">
+                      <p className="text-xs font-medium text-foreground">Downloads:</p>
+                      {individualResults.map((r) => (
+                        <Button
+                          key={r.id}
+                          variant="outline"
+                          size="sm"
+                          className="w-full justify-start"
+                          onClick={() => onDownload(r.file_path)}
+                        >
+                          <FileSpreadsheet className="h-4 w-4 mr-2" />
+                          {DATA_TYPE_LABELS[r.data_type] || r.data_type}
+                          {r.row_count ? ` (${r.row_count.toLocaleString()} rows)` : ""}
+                        </Button>
+                      ))}
+                    </div>
                   )}
 
                   {/* Log toggle */}
