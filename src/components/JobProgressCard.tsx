@@ -266,11 +266,22 @@ export default function JobProgressCard({
                     </Button>
                   )}
 
-                  {/* Download buttons */}
-                  {job.status === "completed" && jobResults.length > 0 && (
+                  {/* Download button */}
+                  {job.status === "completed" && consolidatedResult && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="w-full"
+                      onClick={() => onDownload(consolidatedResult.file_path)}
+                    >
+                      <FileSpreadsheet className="h-4 w-4 mr-2" />
+                      📊 Open Spreadsheet
+                      {consolidatedResult.row_count ? ` (${consolidatedResult.row_count.toLocaleString()} rows)` : ""}
+                    </Button>
+                  )}
+                  {job.status === "completed" && !consolidatedResult && individualResults.length > 0 && (
                     <div className="space-y-1.5">
-                      <p className="text-xs font-medium text-foreground">Downloads:</p>
-                      {jobResults.map((r) => (
+                      {individualResults.map((r) => (
                         <Button
                           key={r.id}
                           variant="outline"
