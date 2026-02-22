@@ -55,12 +55,25 @@ serve(async (req) => {
         if (a.Date) apptSummary[name] += (apptSummary[name] ? ", " : "") + a.Date;
       }
     }
+    // Build DOB + demographic lookups from patient list
     const dobByName: Record<string, string> = {};
+    const demoByName: Record<string, { address: string; phone: string; dob: string; email: string }> = {};
     if (patientList) {
       for (const p of patientList) {
-        const name = (p.Patient_Name || p.Name || p.Patient || Object.values(p)[0] || "").toString().trim();
-        const dob = p.DOB || p.Date_Of_Birth || p.dob || "";
-        if (name && dob) dobByName[name] = dob;
+        // Patient list may store {firstName, lastName} or {Patient_Name, ...}
+        const name = p.firstName && p.lastName
+          ? `${p.lastName}, ${p.firstName}`.trim()
+          : (p.Patient_Name || p.Name || p.Patient || Object.values(p)[0] || "").toString().trim();
+        const dob = p.dob || p.DOB || p.Date_Of_Birth || "";
+        if (name) {
+          dobByName[name] = dob;
+          demoByName[name] = {
+            address: p.address || p.Address || "",
+            phone: p.phone || p.Phone || p.Phone_Number || "",
+            dob,
+            email: p.email || p.Email || "",
+          };
+        }
       }
     }
 
@@ -68,13 +81,16 @@ serve(async (req) => {
     const demoCount = patientList?.length || 0;
     if (patientList?.length) {
       const summaryRows = patientList.map((p: any) => {
-        const name = (p.Patient_Name || p.Name || p.Patient || Object.values(p)[0] || "").toString().trim();
+        const name = p.firstName && p.lastName
+          ? `${p.lastName}, ${p.firstName}`.trim()
+          : (p.Patient_Name || p.Name || p.Patient || Object.values(p)[0] || "").toString().trim();
+        const demo = demoByName[name] || { address: "", phone: "", dob: "", email: "" };
         return {
           "Patient Name": name,
-          Address: p.Address || p.address || "",
-          Phone: p.Phone || p.phone || p.Phone_Number || "",
-          DOB: p.DOB || p.Date_Of_Birth || p.dob || "",
-          Email: p.Email || p.email || "",
+          Address: demo.address,
+          Phone: demo.phone,
+          DOB: demo.dob,
+          Email: demo.email,
           "SOAP Notes": soapSummary[name] || "None",
           Appointments: apptSummary[name] || "None",
         };
