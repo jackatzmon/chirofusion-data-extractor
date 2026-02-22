@@ -2529,120 +2529,29 @@ ${body}
     }
 
     // ==================== BUILD CONSOLIDATED XLSX WORKBOOK ====================
-    // MEMORY NOTE: At this point processing is complete. We need to load the full
-    // accumulated arrays from storage to build the final workbook. This is the ONLY
-    // time we load them fully. If this still causes OOM on very large datasets,
-    // we'd need to stream directly to XLSX — but typically final consolidation is fine.
-    const finalCollectedSheets = [...collectedSheets, ...await loadLargeDataFromStorage("collectedSheets", [])];
-    const finalSoapIndex = [...soapIndex, ...await loadLargeDataFromStorage("soapIndex", [])];
-    const finalAppointmentsIndex = [...appointmentsIndex, ...await loadLargeDataFromStorage("appointmentsIndex", [])];
-
-    const wb = XLSX.utils.book_new();
-    const typeLabels: Record<string, string> = {
-      demographics: "Demographics",
-      appointments: "Appointments",
-      financials: "Patient Ledgers",
-    };
-
-    // Merge sheets of the same type (multiple batches may have contributed)
-    const mergedByType = new Map<string, Record<string, string>[]>();
-    for (const { type, csv } of finalCollectedSheets) {
-      const rows = csvToJson(csv);
-      if (rows.length > 0) {
-        if (!mergedByType.has(type)) mergedByType.set(type, []);
-        mergedByType.get(type)!.push(...rows);
-      }
-    }
-    for (const [type, rows] of mergedByType) {
-      const ws = XLSX.utils.json_to_sheet(rows);
-      XLSX.utils.book_append_sheet(wb, ws, typeLabels[type] || type);
-    }
-
-    // Add SOAP Notes Index sheet with PDF download links (clickable hyperlinks)
-    if (finalSoapIndex.length > 0) {
-      const sheetData = finalSoapIndex.map(row => ({
-        PatientName: row.PatientName,
-        Documents: row.Documents,
-        Status: row.Status,
-        PDFLink: row.PDFLink || "",
-      }));
-      const ws = XLSX.utils.json_to_sheet(sheetData);
-      
-      // Add clickable hyperlinks to PDFLink column (column D, index 3)
-      for (let r = 0; r < finalSoapIndex.length; r++) {
-        const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: 3 }); // +1 for header row
-        if (finalSoapIndex[r].PDFLink) {
-          ws[cellRef] = {
-            t: "s",
-            v: "📎 Open PDF",
-            l: { Target: finalSoapIndex[r].PDFLink },
-          };
-        }
-      }
-      
-      // Set column widths
-      ws["!cols"] = [
-        { wch: 30 }, // PatientName
-        { wch: 12 }, // Documents
-        { wch: 20 }, // Status
-        { wch: 15 }, // PDFLink
-      ];
-      
-      XLSX.utils.book_append_sheet(wb, ws, "SOAP Notes Index");
-    }
-
-    // Add Appointments Index sheet with PDF summary links
-    if (finalAppointmentsIndex.length > 0) {
-      const apptSheetData = finalAppointmentsIndex.map(row => ({
-        PatientName: row.PatientName,
-        Appointments: row.Appointments,
-        Status: row.Status,
-        PDFLink: row.PDFLink || "",
-      }));
-      const apptWs = XLSX.utils.json_to_sheet(apptSheetData);
-      
-      for (let r = 0; r < finalAppointmentsIndex.length; r++) {
-        const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: 3 });
-        if (finalAppointmentsIndex[r].PDFLink) {
-          apptWs[cellRef] = {
-            t: "s",
-            v: "📎 Open PDF",
-            l: { Target: finalAppointmentsIndex[r].PDFLink },
-          };
-        }
-      }
-      
-      apptWs["!cols"] = [
-        { wch: 30 },
-        { wch: 14 },
-        { wch: 18 },
-        { wch: 15 },
-      ];
-      
-      XLSX.utils.book_append_sheet(wb, apptWs, "Appointments Index");
-    }
-
-    if (wb.SheetNames.length > 0) {
-      hasAnyData = true;
-      const xlsxBuffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-      const filePath = `${userId}/consolidated_export_${Date.now()}.xlsx`;
-      const xlsxBlob = new Blob([xlsxBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-      const { error: uploadError } = await serviceClient.storage
-        .from("scraped-data")
-        .upload(filePath, xlsxBlob, { contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-      if (uploadError) {
-        logParts.push(`❌ Workbook upload error: ${uploadError.message}`);
+    // Delegate to salvage-csv function which runs in a fresh memory context.
+    // This avoids OOM when loading all accumulated data (47K+ financial rows,
+    // 2300+ patient indices, SOAP index, etc.) into a single invocation.
+    try {
+      logParts.push(`📦 Delegating XLSX consolidation to salvage-csv...`);
+      const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+      const salvageRes = await fetch(`${supabaseUrl}/functions/v1/salvage-csv`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+        },
+        body: JSON.stringify({ jobId: job.id }),
+      });
+      const salvageResult = await salvageRes.json();
+      if (salvageResult.ok && salvageResult.xlsxPath) {
+        hasAnyData = true;
+        logParts.push(`✅ ${salvageResult.message}`);
       } else {
-        const totalRows = finalCollectedSheets.reduce((sum: number, s: any) => sum + csvToJson(s.csv).length, 0) + finalSoapIndex.length;
-        await serviceClient.from("scraped_data_results").insert({
-          scrape_job_id: job.id,
-          user_id: userId,
-          data_type: "consolidated_export",
-          file_path: filePath,
-          row_count: totalRows,
-        });
-        logParts.push(`✅ Consolidated workbook: ${filePath} (${wb.SheetNames.join(", ")} — ${totalRows} total rows)`);
+        logParts.push(`⚠️ Salvage returned: ${salvageResult.message || salvageResult.error || "unknown"}`);
       }
+    } catch (salvageErr) {
+      logParts.push(`❌ Salvage-csv error: ${(salvageErr as any).message}`);
     }
 
     // Cleanup temp batch storage files
