@@ -1101,6 +1101,10 @@ Deno.serve(async (req) => {
             _cachedPatientNames = items.map((p: any) => ({
               firstName: p.FirstName || "",
               lastName: p.LastName || "",
+              address: [p.Address1 || p.Address || "", p.Address2 || "", p.City || "", p.State || "", p.Zip || p.ZipCode || ""].filter(Boolean).join(", "),
+              phone: p.Phone || p.HomePhone || p.CellPhone || p.MobilePhone || p.WorkPhone || "",
+              dob: p.Dob || p.DOB || p.DateOfBirth || p.BirthDate || "",
+              email: p.Email || p.EmailAddress || "",
             }));
             logParts.push(`✅ Patient names: ${_cachedPatientNames.length} from GetPatientReports`);
             // Cache to storage for future batch resumes (~100KB vs 2.8MB re-fetch)
