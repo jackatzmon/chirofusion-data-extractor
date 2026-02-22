@@ -1,51 +1,48 @@
 
 
-# Patient Financials: Per-Patient Account Ledger Approach
+# Fixes for Batch Resume, Stale Cleanup, and Progress Updates
 
-## Overview
-Replace the current financials scraping (which uses `GetPatientStatementGridData`) with a per-patient account ledger approach that matches the manual browser workflow. This integrates into the existing per-patient loop pattern already used for SOAP notes/medical files.
+## Fix 1: Use service role key for self-invoke (prevents 401 after 1 hour)
 
-## How It Works
+The self-invoke calls currently pass the user's JWT (`authHeader`), which expires after ~1 hour. Both self-invoke locations will be changed to use the `SUPABASE_SERVICE_ROLE_KEY` instead.
 
-The new flow for each patient:
-1. **Set billing context** -- call `SetBillingDefaultPageInSession` with `billingDefaultPage=PatientAccounting`
-2. **Load patient ledger** -- call `ShowLedger` with `IsLedger=1&ShowUac=true` (returns HTML with all visit/transaction rows)
-3. **Parse the HTML response** -- extract the ledger table rows (charges, payments, adjustments, dates, CPT codes, balances) into structured data
-4. Since the "download" step produces a client-side PDF (Kendo UI), we skip it and instead parse the server-rendered HTML directly for structured data -- this is actually superior because we get machine-readable rows instead of a flat PDF
+**File:** `supabase/functions/chirofusion-scrape/index.ts`
 
-## Technical Changes
+- **Line 387** (initial self-invoke): Change `"Authorization": authHeader!` to `"Authorization": "Bearer " + Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!`
+- **Line 481** (batch continuation self-invoke): Same change
 
-### Edge Function (`supabase/functions/chirofusion-scrape/index.ts`)
+## Fix 2: Stale job cleanup checks `updated_at` instead of `created_at`
 
-**Replace the `financials` case** (currently lines 1553-1658) with a per-patient loop:
+Currently `cleanupStaleJobs` kills jobs created more than 1 hour ago, which kills legitimate long-running batch jobs. Change it to check `updated_at` so only jobs that haven't had any DB activity for 1 hour are cleaned up.
 
-1. Reuse the existing `getAllPatientNames()` and `findPatientInfo()` helpers (already built for SOAP notes)
-2. For each patient:
-   - Search for the patient to get their `patientId`
-   - Set patient context via `SetVisitIdInSession` (same as SOAP notes flow)
-   - Call `SetBillingDefaultPageInSession` to switch to Patient Accounting
-   - Call `ShowLedger` with `IsLedger=1&ShowUac=true` to get the ledger HTML
-   - Parse the HTML table for transaction rows (date, description, CPT code, charges, payments, adjustments, balance)
-   - Collect all rows with patient name prepended
-3. Add batch/timeout support (same pattern as SOAP notes -- call `selfInvoke` when timing out)
-4. Output all collected ledger rows as a CSV sheet in the consolidated workbook
+**File:** `supabase/functions/chirofusion-scrape/index.ts`
 
-**Add HTML table parser** -- a helper function to extract `<tr>` rows from the ShowLedger HTML response, pulling values from `<td>` cells
+- **Line 65**: Change `.lt("created_at", oneHourAgo)` to `.lt("updated_at", oneHourAgo)`
 
-### Dashboard UI (`src/pages/Dashboard.tsx`)
+## Fix 3: More frequent progress updates (every 10 patients instead of 50)
 
-- Update the `typeLabels` map to show "Patient Ledgers" for the financials sheet in the workbook
-- No other UI changes needed -- the existing "Financials" checkbox and download flow remain the same
+So you can see progress moving in the dashboard sooner rather than waiting for 50 patients to process.
 
-### Workbook Output
-- The "Financials" sheet in the consolidated Excel workbook will now contain per-patient ledger rows with columns like: PatientName, Date, Description, CPTCode, Charges, Payments, Adjustments, Balance
+**File:** `supabase/functions/chirofusion-scrape/index.ts`
 
-## Batch Processing
-- Uses the same timeout/self-invoke pattern as SOAP notes
-- Stores resume state (patient index, collected data) in the DB `batch_state` column
-- Each batch processes as many patients as possible within the 100s runtime limit
+- **Line 2004**: Change `% 50 === 0` to `% 10 === 0`
+- **Line 2309**: Change `% 50 === 0` to `% 10 === 0`
 
-## Risk & Fallback
-- If `ShowLedger` returns unexpected HTML or no table data for a patient, that patient is logged and skipped
-- The old `GetPatientStatementGridData` approach will be removed since you indicated this new method is better
+## Fix 4: Add live log viewer with auto-scroll to active job card
+
+Add the running job's log output directly in the active job card so you can see what's happening in real time, with auto-scroll to bottom.
+
+**File:** `src/components/JobProgressCard.tsx`
+
+- Add a scrollable `<pre>` block between `ActiveJobSpinner` and `LivePageViewer` (after line 136)
+- Shows `runningJob.log_output` in a max-height container with overflow scroll
+- Auto-scrolls to bottom on each update, but stops auto-scrolling if you manually scroll up
+- Uses a ref + onScroll handler to detect if you're pinned to the bottom
+
+## Summary of changes
+
+| File | What changes |
+|------|-------------|
+| `supabase/functions/chirofusion-scrape/index.ts` | Lines 65, 387, 481, 2004, 2309 |
+| `src/components/JobProgressCard.tsx` | Add live log viewer component after line 136 |
 
