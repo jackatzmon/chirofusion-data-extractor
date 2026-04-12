@@ -26,28 +26,56 @@ type ScrapeResult = {
   scrape_job_id?: string;
 };
 
-function parseProgressFromLog(log: string | null, batchState: any): { current: number; total: number; completedTypes: string[] } {
+function parseProgressFromLog(log: string | null, batchState: any): {
+  current: number; total: number; completedTypes: string[];
+  lastPatient: string; pdfCount: number; failedCount: number; skippedCount: number;
+  lastUpdate: string;
+} {
   const completedTypes: string[] = [];
   let total = 0;
   let current = 0;
+  let lastPatient = "";
+  let pdfCount = 0;
+  let failedCount = 0;
+  let skippedCount = 0;
+  let lastUpdate = "";
 
   if (log) {
-    // Extract total patients
-    const totalMatch = log.match(/Got (\d+) patients/);
+    const totalMatch = log.match(/Got (\d+) patients/) || log.match(/Processing (\d+) patients/);
     if (totalMatch) total = parseInt(totalMatch[1]);
 
-    // Check completed data types
     if (log.includes("✅ Demographics")) completedTypes.push("demographics");
     if (log.includes("✅ Appointments")) completedTypes.push("appointments");
     if (log.includes("✅ Financials") || log.includes("financials sheet")) completedTypes.push("financials");
-    if (log.includes("✅ SOAP") || log.includes("soap_notes sheet")) completedTypes.push("soap_notes");
+    if (log.includes("✅ Medical Files complete") || log.includes("✅ SOAP")) completedTypes.push("soap_notes");
+
+    // Parse latest status line: "📋 487/2150 | Smith, John | 312 PDFs | 3 failed | 45 skipped"
+    const statusLines = log.match(/📋 (\d+)\/(\d+) \| ([^|]+)\| (\d+) PDFs \| (\d+) failed \| (\d+) skipped/g);
+    if (statusLines && statusLines.length > 0) {
+      const last = statusLines[statusLines.length - 1];
+      const m = last.match(/📋 (\d+)\/(\d+) \| ([^|]+)\| (\d+) PDFs \| (\d+) failed \| (\d+) skipped/);
+      if (m) {
+        current = parseInt(m[1]);
+        total = parseInt(m[2]) || total;
+        lastPatient = m[3].trim();
+        pdfCount = parseInt(m[4]);
+        failedCount = parseInt(m[5]);
+        skippedCount = parseInt(m[6]);
+      }
+    }
   }
 
+  // Batch state may have more recent info
   if (batchState) {
-    current = batchState.resumeIndex || 0;
+    if (batchState.resumeIndex) current = Math.max(current, batchState.resumeIndex);
+    if (batchState.lastPatient) lastPatient = batchState.lastPatient;
+    if (batchState.pdfCount != null) pdfCount = Math.max(pdfCount, batchState.pdfCount);
+    if (batchState.searchFailed != null) failedCount = Math.max(failedCount, batchState.searchFailed);
+    if (batchState.skippedDefaultCase != null) skippedCount = Math.max(skippedCount, batchState.skippedDefaultCase);
+    if (batchState.lastUpdate) lastUpdate = batchState.lastUpdate;
   }
 
-  return { current, total, completedTypes };
+  return { current, total, completedTypes, lastPatient, pdfCount, failedCount, skippedCount, lastUpdate };
 }
 
 const DATA_TYPE_LABELS: Record<string, string> = {
@@ -321,7 +349,7 @@ export default function JobProgressCard({
 }
 
 function ActiveJobSpinner({ job }: { job: ScrapeJob }) {
-  const { current, total, completedTypes } = parseProgressFromLog(
+  const { current, total, completedTypes, lastPatient, pdfCount, failedCount, skippedCount, lastUpdate } = parseProgressFromLog(
     job.log_output,
     job.batch_state
   );
@@ -331,70 +359,79 @@ function ActiveJobSpinner({ job }: { job: ScrapeJob }) {
   const currentType = activeTypes[0];
   const pct = total > 0 ? Math.round((current / total) * 100) : 0;
 
+  // Stall detection: warn if no update in 2+ minutes
+  const minutesSinceUpdate = lastUpdate
+    ? Math.round((Date.now() - new Date(lastUpdate).getTime()) / 60000)
+    : 0;
+  const isStalled = lastUpdate && minutesSinceUpdate >= 2;
+
   return (
     <div className="flex flex-col items-center gap-3">
       {/* Circular spinner */}
       <div className="relative h-28 w-28">
         <svg className="h-28 w-28 -rotate-90" viewBox="0 0 112 112">
-          {/* Background circle */}
+          <circle cx="56" cy="56" r="48" fill="none" className="stroke-muted" strokeWidth="8" />
           <circle
-            cx="56"
-            cy="56"
-            r="48"
-            fill="none"
-            className="stroke-muted"
-            strokeWidth="8"
-          />
-          {/* Progress arc */}
-          <circle
-            cx="56"
-            cy="56"
-            r="48"
-            fill="none"
+            cx="56" cy="56" r="48" fill="none"
             className="stroke-primary transition-all duration-500"
-            strokeWidth="8"
-            strokeLinecap="round"
+            strokeWidth="8" strokeLinecap="round"
             strokeDasharray={`${2 * Math.PI * 48}`}
             strokeDashoffset={`${2 * Math.PI * 48 * (1 - pct / 100)}`}
           />
         </svg>
-        {/* Spinning overlay for active feel */}
         <div className="absolute inset-0 flex items-center justify-center">
           <div className="animate-spin h-28 w-28 rounded-full border-2 border-transparent border-t-primary/30" />
         </div>
-        {/* Center text */}
         <div className="absolute inset-0 flex flex-col items-center justify-center">
           <span className="text-lg font-bold text-foreground">{pct}%</span>
           {total > 0 && (
-            <span className="text-[10px] text-muted-foreground">
-              {current}/{total}
-            </span>
+            <span className="text-[10px] text-muted-foreground">{current}/{total}</span>
           )}
         </div>
       </div>
 
-      {/* Status line */}
-      <p className="text-sm text-center text-muted-foreground">
-        {total > 0 ? (
-          <>
-            Patient {current}/{total}
-            {currentType && (
-              <> — <span className="font-medium text-foreground">{DATA_TYPE_LABELS[currentType] || currentType}</span></>
-            )}
-          </>
-        ) : (
-          "Starting up..."
+      {/* Status details */}
+      <div className="text-center space-y-1 w-full">
+        {currentType && (
+          <p className="text-sm font-medium text-foreground">
+            {DATA_TYPE_LABELS[currentType] || currentType}
+          </p>
         )}
-      </p>
+        {lastPatient && (
+          <p className="text-sm text-muted-foreground">
+            Current: <span className="font-medium text-foreground">{lastPatient}</span>
+          </p>
+        )}
+        {total > 0 && (
+          <div className="grid grid-cols-3 gap-2 text-xs text-muted-foreground mt-2">
+            <div className="text-center">
+              <span className="block text-lg font-bold text-primary">{pdfCount}</span>
+              PDFs
+            </div>
+            <div className="text-center">
+              <span className={`block text-lg font-bold ${failedCount > 0 ? 'text-destructive' : 'text-muted-foreground'}`}>{failedCount}</span>
+              Failed
+            </div>
+            <div className="text-center">
+              <span className="block text-lg font-bold text-muted-foreground">{skippedCount}</span>
+              Skipped
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Stall warning */}
+      {isStalled && (
+        <div className="rounded-md bg-yellow-500/10 border border-yellow-500/30 px-3 py-2 text-xs text-yellow-600 dark:text-yellow-400 w-full text-center">
+          No update in {minutesSinceUpdate} minutes — scraper may be stalled or switching batches
+        </div>
+      )}
 
       {/* Completed types badges */}
       {completedTypes.length > 0 && (
         <div className="flex flex-wrap gap-1.5 justify-center">
           {completedTypes.map((t) => (
-            <span
-              key={t}
-              className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full"
-            >
+            <span key={t} className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full">
               ✓ {DATA_TYPE_LABELS[t] || t}
             </span>
           ))}

@@ -2195,19 +2195,28 @@ Deno.serve(async (req) => {
                 await appendToStorageArray("soapIndex", soapIndex);
                 soapIndex.length = 0;
               }
-              if (processedCount % 10 === 0) {
-                logParts.push(`Progress: ${processedCount}/${patients.length} (${skippedDefaultCase} default-case skipped, ${withFiles} with files, ${pdfCount} PDFs)`);
-                // Flush soapIndex to storage periodically to free memory
-                if (soapIndex.length > 0) {
-                  await appendToStorageArray("soapIndex", soapIndex);
-                  soapIndex.length = 0;
-                }
-                const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
-                await serviceClient.from("scrape_jobs").update({
-                  progress: Math.min(progress + newProgress, 99),
-                  log_output: logParts.join("\n")
-                }).eq("id", job.id);
-              }
+
+              // === PER-PATIENT PROGRESS UPDATE ===
+              const pctOfType = Math.round(((i + 1) / effectivePatients.length) * 100);
+              const statusLine = `📋 ${i + 1}/${effectivePatients.length} | ${patient.lastName}, ${patient.firstName} | ${pdfCount} PDFs | ${searchFailed} failed | ${skippedDefaultCase} skipped`;
+              logParts.push(statusLine);
+
+              const newProgress = Math.round(pctOfType * (100 / totalTypes));
+              await serviceClient.from("scrape_jobs").update({
+                progress: Math.min(progress + newProgress, 99),
+                log_output: (_batchJobId && job.log_output)
+                  ? job.log_output + "\n" + logParts.filter(l => !l.startsWith("... (")).slice(-25).join("\n")
+                  : logParts.slice(-25).join("\n"),
+                batch_state: {
+                  ...(job.batch_state as any || {}),
+                  resumeIndex: i + 1,
+                  pdfCount, searchFailed, withFiles, skippedDefaultCase,
+                  dataTypeIndex: dataTypes.indexOf(dataType),
+                  lastPatient: `${patient.lastName}, ${patient.firstName}`,
+                  lastUpdate: new Date().toISOString(),
+                  _dataInStorage: true,
+                },
+              }).eq("id", job.id);
 
               await new Promise(r => setTimeout(r, 500));
               // Aggressive log trimming to prevent memory growth
