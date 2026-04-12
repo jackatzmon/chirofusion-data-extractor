@@ -428,7 +428,7 @@ Deno.serve(async (req) => {
       logParts.push(...allLines.slice(-50));
     }
     const startTime = Date.now();
-    const MAX_RUNTIME_MS = 55_000; // 55s — login+demographics re-fetch takes ~25-30s, need margin before 150s hard timeout
+    const MAX_RUNTIME_MS = 45_000; // 45s — more margin for self-invoke and storage operations at end of batch
 
     function isTimingOut(): boolean {
       return (Date.now() - startTime) > MAX_RUNTIME_MS;
@@ -2150,6 +2150,14 @@ Deno.serve(async (req) => {
               }
 
               processedCount = i + 1;
+              // Free memory from this patient's data
+              if (typeof searchData !== 'undefined') searchData = null as any;
+              if (typeof filesData !== 'undefined') filesData = null as any;
+              // Flush soapIndex to storage frequently to prevent memory buildup
+              if (soapIndex.length >= 5) {
+                await appendToStorageArray("soapIndex", soapIndex);
+                soapIndex.length = 0;
+              }
               if (processedCount % 10 === 0) {
                 logParts.push(`Progress: ${processedCount}/${patients.length} (${skippedDefaultCase} default-case skipped, ${withFiles} with files, ${pdfCount} PDFs)`);
                 // Flush soapIndex to storage periodically to free memory
@@ -2158,17 +2166,18 @@ Deno.serve(async (req) => {
                   soapIndex.length = 0;
                 }
                 const newProgress = Math.round((processedCount / patients.length) * (100 / totalTypes));
-                await serviceClient.from("scrape_jobs").update({ 
-                  progress: Math.min(progress + newProgress, 99), 
-                  log_output: logParts.join("\n") 
+                await serviceClient.from("scrape_jobs").update({
+                  progress: Math.min(progress + newProgress, 99),
+                  log_output: logParts.join("\n")
                 }).eq("id", job.id);
-                // Trim log to last 80 lines to prevent memory growth
-                if (logParts.length > 80) {
-                  logParts.splice(0, logParts.length - 60);
-                }
               }
 
-              await new Promise(r => setTimeout(r, 150));
+              await new Promise(r => setTimeout(r, 500));
+              // Aggressive log trimming to prevent memory growth
+              if (logParts.length > 40) {
+                logParts.splice(0, logParts.length - 15);
+                logParts.unshift("... (earlier log entries persisted to DB) ...");
+              }
             }
 
             // Flush any remaining soapIndex entries to storage
