@@ -482,9 +482,9 @@ Deno.serve(async (req) => {
     }
 
     async function selfInvoke(batchState: any) {
-      logParts.push(`🔄 Batch timeout — continuing from patient ${batchState.resumeIndex}...`);
-      
-      // APPEND new items from this batch to storage (don't overwrite — previous batches' data is already there)
+      logParts.push(`🔄 Batch timeout — saving progress at patient ${batchState.resumeIndex}...`);
+
+      // Save data to storage FIRST
       try {
         await Promise.all([
           appendToStorageArray("collectedSheets", collectedSheets),
@@ -496,68 +496,76 @@ Deno.serve(async (req) => {
         logParts.push(`⚠️ Storage save error: ${(storageErr as any).message}`);
       }
 
-      // Append new log lines to existing DB log (don't replace with truncated version)
+      // Persist full log to DB
       let fullLog = logParts.join("\n");
       if (_batchJobId && job.log_output) {
-        // Merge: keep original DB log and append only NEW lines (skip the "previous log" prefix)
         const newLines = logParts.filter(l => !l.startsWith("... ("));
         fullLog = job.log_output + "\n" + newLines.join("\n");
       }
 
-      // Only save minimal counters in batch_state (small JSONB)
+      const batchStateForDb = {
+        resumeIndex: batchState.resumeIndex,
+        pdfCount: batchState.pdfCount,
+        searchFailed: batchState.searchFailed,
+        withFiles: batchState.withFiles,
+        skippedDefaultCase: batchState.skippedDefaultCase,
+        dataTypeIndex: batchState.dataTypeIndex,
+        ledgerFetched: batchState.ledgerFetched,
+        ledgerEmpty: batchState.ledgerEmpty,
+        ledgerSearchFailed: batchState.ledgerSearchFailed,
+        apptPdfResumeIndex: batchState.apptPdfResumeIndex || batchState.apptPdfIndex,
+        apptPdfCount: batchState.apptPdfCount,
+        apptSearchFailed: batchState.apptSearchFailed,
+        _dataInStorage: true,
+      };
+
       await serviceClient.from("scrape_jobs").update({
         log_output: fullLog,
-        batch_state: {
-          resumeIndex: batchState.resumeIndex,
-          pdfCount: batchState.pdfCount,
-          searchFailed: batchState.searchFailed,
-          withFiles: batchState.withFiles,
-          skippedDefaultCase: batchState.skippedDefaultCase,
-          dataTypeIndex: batchState.dataTypeIndex,
-          ledgerFetched: batchState.ledgerFetched,
-          ledgerEmpty: batchState.ledgerEmpty,
-          ledgerSearchFailed: batchState.ledgerSearchFailed,
-          apptPdfResumeIndex: batchState.apptPdfResumeIndex || batchState.apptPdfIndex,
-          apptPdfCount: batchState.apptPdfCount,
-          apptSearchFailed: batchState.apptSearchFailed,
-          // Flag to indicate large data is in storage
-          _dataInStorage: true,
-        },
+        batch_state: batchStateForDb,
       }).eq("id", job.id);
 
+      // Self-invoke with 3 retries
       const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
       const fnUrl = `${supabaseUrl}/functions/v1/chirofusion-scrape`;
-      // Fire the next batch — don't await the response (it takes 100s+)
-      // Just ensure the request leaves the network stack with a short delay
-      fetch(fnUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": "Bearer " + Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-        },
-        body: JSON.stringify({
-          dataTypes, mode, dateFrom, dateTo,
-          testLimit, testPatientName,
-          _batchJobId: job.id,
-          _batchState: {
-            resumeIndex: batchState.resumeIndex,
-            pdfCount: batchState.pdfCount,
-            searchFailed: batchState.searchFailed,
-            withFiles: batchState.withFiles,
-            skippedDefaultCase: batchState.skippedDefaultCase,
-            dataTypeIndex: batchState.dataTypeIndex,
-            ledgerFetched: batchState.ledgerFetched,
-            ledgerEmpty: batchState.ledgerEmpty,
-            ledgerSearchFailed: batchState.ledgerSearchFailed,
-            apptPdfResumeIndex: batchState.apptPdfResumeIndex,
-            apptPdfCount: batchState.apptPdfCount,
-            apptSearchFailed: batchState.apptSearchFailed,
-          },
-        }),
-      }).then(r => console.log(`Self-invoke response: ${r.status}`))
-        .catch(err => console.error("Self-invoke error:", err));
-      // Wait briefly to ensure the request is dispatched before this function returns
-      await new Promise(r => setTimeout(r, 3000));
+      const invokeBody = JSON.stringify({
+        dataTypes, mode, dateFrom, dateTo,
+        testLimit, testPatientName,
+        _batchJobId: job.id,
+        _batchState: batchStateForDb,
+      });
+
+      let invokeSuccess = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const res = await fetch(fnUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer " + Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+            },
+            body: invokeBody,
+          });
+          if (res.ok || res.status === 200) {
+            invokeSuccess = true;
+            console.log(`Self-invoke succeeded on attempt ${attempt}`);
+            break;
+          }
+          console.log(`Self-invoke attempt ${attempt}: status ${res.status}`);
+        } catch (err) {
+          console.error(`Self-invoke attempt ${attempt} error:`, err);
+        }
+        if (attempt < 3) await new Promise(r => setTimeout(r, 3000));
+      }
+
+      if (!invokeSuccess) {
+        await serviceClient.from("scrape_jobs").update({
+          status: "failed",
+          error_message: `Batch chain broke after patient ${batchState.resumeIndex}. Click Resume to continue.`,
+          batch_state: batchStateForDb,
+        }).eq("id", job.id);
+      }
+
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     // Helper: follow redirects manually preserving cookies
@@ -1937,6 +1945,35 @@ Deno.serve(async (req) => {
                 return new Response(JSON.stringify({ success: true, jobId: job.id, batching: true }), {
                   headers: { ...corsHeaders, "Content-Type": "application/json" },
                 });
+              }
+
+              // Every 20 patients, verify ChiroFusion session is still valid
+              if (i > 0 && i % 20 === 0) {
+                try {
+                  const healthRes = await ajaxFetch("/Patient/Patient/GetFileCategory", { method: "GET" });
+                  if (healthRes.status !== 200 || healthRes.body.toLowerCase().includes("login") || healthRes.body.toLowerCase().includes("unauthorized")) {
+                    logParts.push("⚠️ Session expired — re-authenticating...");
+                    await fetchWithCookies(`${BASE_URL}/Account`);
+                    const reLoginRes = await fetch(`${BASE_URL}/Account/Login/DoLogin`, {
+                      method: "POST",
+                      headers: {
+                        ...browserHeaders,
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Cookie": sessionCookies,
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": `${BASE_URL}/Account`,
+                        "Origin": BASE_URL,
+                      },
+                      body: new URLSearchParams({ userName: creds.cf_username, password: creds.cf_password }).toString(),
+                      redirect: "manual",
+                    });
+                    sessionCookies = mergeCookies(sessionCookies, reLoginRes);
+                    const reLoginBody = await reLoginRes.text();
+                    logParts.push(`✅ Re-authenticated: ${reLoginBody.substring(0, 50)}`);
+                  }
+                } catch (healthErr) {
+                  logParts.push(`⚠️ Health check error (non-fatal): ${(healthErr as any).message}`);
+                }
               }
 
               try {
