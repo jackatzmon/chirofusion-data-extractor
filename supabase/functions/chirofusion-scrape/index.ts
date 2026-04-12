@@ -2019,17 +2019,15 @@ Deno.serve(async (req) => {
                   continue;
                 }
 
-                // Check if ALL case entries are "Default Case" — if so, skip (no medical files possible)
                 const allDefault = searchData.every((entry: any) => {
                   const caseName = (entry.CaseName || "").toLowerCase();
                   return caseName.includes("default case");
                 });
 
-                if (allDefault) {
-                  skippedDefaultCase++;
-                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: "Default case only" });
-                  processedCount++;
-                  continue;
+                // Don't skip default-case patients — they may still have files
+                // We'll count them as skipped only if they have zero files later
+                if (allDefault && i < 5) {
+                  logParts.push(`ℹ️ ${patient.lastName}, ${patient.firstName}: all cases "Default Case" — checking for files anyway`);
                 }
 
                 // Use first non-default-case entry to get patientId and caseId
@@ -2100,7 +2098,8 @@ Deno.serve(async (req) => {
                 }
 
                 if (filesRes.status !== 200 || filesRes.body.length < 10) {
-                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: "No files" });
+                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: allDefault ? "Default case - no files" : "No files" });
+                  if (allDefault) skippedDefaultCase++;
                   processedCount++;
                   continue;
                 }
@@ -2113,7 +2112,8 @@ Deno.serve(async (req) => {
                   logParts.push(`  Parsed: ${files.length} files, keys: ${files.length > 0 ? Object.keys(files[0]).join(", ") : "N/A"}`);
                 }
                 if (files.length === 0) {
-                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: "No files" });
+                  soapIndex.push({ PatientName: `${patient.lastName}, ${patient.firstName}`, Documents: 0, PDFLink: "", Status: allDefault ? "Default case - no files" : "No files" });
+                  if (allDefault) skippedDefaultCase++;
                   processedCount++;
                   continue;
                 }
