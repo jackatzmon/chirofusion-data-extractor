@@ -621,6 +621,24 @@ Deno.serve(async (req) => {
       return { status: res.status, body: responseBody, contentType: res.headers.get("content-type") || "" };
     }
 
+    /** Wrapper around ajaxFetch that retries on server errors or rate limiting */
+    async function ajaxFetchWithRetry(url: string, opts: RequestInit = {}, maxRetries = 2): Promise<{ status: number; body: string; contentType: string }> {
+      for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+        const res = await ajaxFetch(url, opts);
+        // Success or definitive client error — return immediately
+        if (res.status === 200 || res.status === 404 || res.status === 400) return res;
+        // Retryable: rate limit or server error
+        if ((res.status === 429 || res.status >= 500) && attempt <= maxRetries) {
+          const delay = 2000 * Math.pow(2, attempt - 1); // 2s, 4s
+          console.log(`Retry ${attempt}/${maxRetries} for ${url}: status ${res.status}, waiting ${delay}ms`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        return res; // Non-retryable or max retries exceeded
+      }
+      return { status: 0, body: "Max retries exceeded", contentType: "" };
+    }
+
     // ==================== LOGIN ====================
     try {
       console.log("Logging in...");
@@ -1979,7 +1997,7 @@ Deno.serve(async (req) => {
               try {
                 // 1. Search for patient to get File_Number and check CaseName
                 const searchText = `${patient.lastName}, ${patient.firstName}`.trim();
-                const searchRes = await ajaxFetch("/Patient/Patient/GetSearchedPatient", {
+                const searchRes = await ajaxFetchWithRetry("/Patient/Patient/GetSearchedPatient", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -2049,7 +2067,7 @@ Deno.serve(async (req) => {
                 }
 
                 // 2. Set patient context via SetVisitIdInSession (critical for GetFilesFromBlob)
-                const visitRes = await ajaxFetch("/Patient/Patient/SetVisitIdInSession", {
+                const visitRes = await ajaxFetchWithRetry("/Patient/Patient/SetVisitIdInSession", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -2078,7 +2096,7 @@ Deno.serve(async (req) => {
                 });
 
                 // 3. Get file list
-                const filesRes = await ajaxFetch("/Patient/Patient/GetFilesFromBlob", {
+                const filesRes = await ajaxFetchWithRetry("/Patient/Patient/GetFilesFromBlob", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
