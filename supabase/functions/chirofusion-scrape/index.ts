@@ -1080,7 +1080,7 @@ Deno.serve(async (req) => {
     const collectedSheets: { type: string; csv: string }[] = [];
     const soapIndex: { PatientName: string; Documents: number; PDFLink: string; Status: string }[] = [];
     const financialsLedgerRows: Record<string, string>[] = [];
-    const appointmentsIndex: { PatientName: string; Appointments: number; PDFLink: string; Status: string }[] = [];
+    let appointmentsIndex: { PatientName: string; Appointments: number; PDFLink: string; Status: string }[] = [];
 
     // Shared: get full patient list with IDs for per-patient scraping
     // MEMORY OPTIMIZATION: Cache patient list in Storage after first fetch.
@@ -1854,7 +1854,7 @@ Deno.serve(async (req) => {
                 const pdfBytes = generateTextPdf(`Appointment Summary — ${pName}`, pdfLines);
                 const filePath = `${userId}/appointment_summaries/${safeName}_${Date.now()}.pdf`;
 
-                const pdfBlob = new Blob([pdfBytes], { type: "application/pdf" });
+                const pdfBlob = new Blob([new Uint8Array(pdfBytes)], { type: "application/pdf" });
                 const { error: uploadError } = await serviceClient.storage
                   .from("scraped-data")
                   .upload(filePath, pdfBlob, { contentType: "application/pdf" });
@@ -2205,9 +2205,7 @@ Deno.serve(async (req) => {
               }
 
               processedCount = i + 1;
-              // Free memory from this patient's data
-              if (typeof searchData !== 'undefined') searchData = null as any;
-              if (typeof filesData !== 'undefined') filesData = null as any;
+              // Memory for searchData/filesData is freed when the loop iteration's block scope ends
               // Flush soapIndex to storage frequently to prevent memory buildup
               if (soapIndex.length >= 5) {
                 await appendToStorageArray("soapIndex", soapIndex);
@@ -2346,7 +2344,7 @@ Deno.serve(async (req) => {
 <div id="hdr">
 <b>📍 STEP:</b> ${stepName}<br>
 <b>🌐 URL:</b> <span class="url">${url}</span><br>
-<b>👤 Patient:</b> ${patientName} (id=${info.id}, caseId=${useCaseId})<br>
+<b>👤 Patient:</b> ${patientName} (id=${info?.id}, caseId=${useCaseId})<br>
 <b>📊 HTTP Status:</b> ${status} &nbsp;|&nbsp; <b>Size:</b> ${body.length} bytes<br>
 <b>🕐 Time:</b> ${new Date().toISOString()}
 </div>
