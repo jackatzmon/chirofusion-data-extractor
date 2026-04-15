@@ -7,6 +7,20 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
+// Master tab placeholder columns (Module 10 will populate the rows).
+const MASTER_COLUMNS = [
+  "Patient Name", "DOB", "Address", "Phone", "Email", "First Visit", "Last Visit", "Total Visits",
+  "SOAP Notes", "SOAP PDF Link", "Total Charged", "Total Paid", "Total Adjustments", "Current Balance",
+  "Top CPT Codes", "Top ICD Codes", "All CPT Codes",
+];
+
+// Hard-coded canonical Financials column order (matches Module 8 parser output).
+// Row ordering is now stable regardless of which row the JSON happens to land first.
+const FINANCIALS_COLUMNS = [
+  "PatientName","DOB","Date","Type","CPTCode","ICDCodes",
+  "Description","Charges","Payments","Adjustments","Balance","Notes","Status",
+];
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -23,7 +37,6 @@ serve(async (req) => {
 
     const bucket = "scraped-data";
     const tmpPrefix = `_batch_tmp/${jobId}`;
-    const uploadedFiles: string[] = [];
     let totalRows = 0;
 
     async function downloadJson(path: string): Promise<any> {
@@ -33,10 +46,9 @@ serve(async (req) => {
       return JSON.parse(text);
     }
 
-    async function uploadWorkbook(wb: any, name: string, rowCount: number, dataType: string): Promise<void> {
+    async function uploadWorkbook(wb: any, xlsxPath: string, rowCount: number, dataType: string): Promise<void> {
       if (wb.SheetNames.length === 0) return;
       const xlsxBuffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-      const xlsxPath = `${userId}/${name}_${Date.now()}.xlsx`;
       const { error: uploadError } = await serviceClient.storage
         .from(bucket)
         .upload(xlsxPath, new Blob([xlsxBuffer], {
@@ -45,27 +57,41 @@ serve(async (req) => {
           contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
           upsert: true,
         });
-      if (uploadError) throw new Error(`Upload failed for ${name}: ${uploadError.message}`);
+      if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
+
+      // Best-effort cleanup of any prior result rows for this (job, data_type) so
+      // re-runs of salvage-csv don't accumulate duplicate dashboard entries.
+      await serviceClient.from("scraped_data_results")
+        .delete()
+        .eq("scrape_job_id", jobId)
+        .eq("data_type", dataType);
 
       await serviceClient.from("scraped_data_results").insert({
         user_id: userId, scrape_job_id: jobId,
         data_type: dataType, file_path: xlsxPath, row_count: rowCount,
       });
-      uploadedFiles.push(name);
-      totalRows += rowCount;
     }
 
-    // ==================== WORKBOOK 1: Patient Summary + SOAP + Appointments ====================
-    // These are lightweight index sheets — safe to combine
-    {
-      const wb = XLSX.utils.book_new();
+    // ==================== UNIFIED WORKBOOK ====================
+    const wb = XLSX.utils.book_new();
 
-      // Load patient list for lookups
+    // ---- Tab 1: Master (placeholder header row only — Module 10 fills rows) ----
+    const masterWs = XLSX.utils.aoa_to_sheet([MASTER_COLUMNS]);
+    masterWs["!cols"] = [
+      { wch: 30 }, { wch: 12 }, { wch: 40 }, { wch: 15 }, { wch: 30 },
+      { wch: 12 }, { wch: 12 }, { wch: 12 },
+      { wch: 15 }, { wch: 15 },
+      { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 },
+      { wch: 40 }, { wch: 40 }, { wch: 80 },
+    ];
+    XLSX.utils.book_append_sheet(wb, masterWs, "Master");
+
+    // ---- Tabs 2–4: Patient Summary, SOAP Notes Index, Appointments Index ----
+    {
       const patientList = await downloadJson(`${tmpPrefix}/patientList.json`);
       const soapIndex = await downloadJson(`${tmpPrefix}/soapIndex.json`);
       const apptIndex = await downloadJson(`${tmpPrefix}/appointmentsIndex.json`);
 
-      // Build lookup maps (lightweight — just strings)
       const soapSummary: Record<string, string> = {};
       if (soapIndex) {
         for (const s of soapIndex) {
@@ -104,8 +130,7 @@ serve(async (req) => {
         }
       }
 
-      // Sheet 1: Patient Summary
-      const demoCount = patientList?.length || 0;
+      // Tab 2: Patient Summary
       if (patientList?.length) {
         const summaryRows = patientList.map((p: any) => {
           const name = p.firstName && p.lastName
@@ -125,9 +150,11 @@ serve(async (req) => {
         const ws = XLSX.utils.json_to_sheet(summaryRows);
         ws["!cols"] = [{ wch: 30 }, { wch: 40 }, { wch: 15 }, { wch: 12 }, { wch: 30 }, { wch: 50 }, { wch: 50 }];
         XLSX.utils.book_append_sheet(wb, ws, "Patient Summary");
+        totalRows += summaryRows.length;
+        summaryRows.length = 0;
       }
 
-      // Sheet 2: SOAP Notes Index
+      // Tab 3: SOAP Notes Index
       if (soapIndex?.length) {
         const sheetData = soapIndex.map((row: any) => {
           const name = (row.PatientName || row.Patient || "").trim();
@@ -145,9 +172,11 @@ serve(async (req) => {
         }
         ws["!cols"] = [{ wch: 30 }, { wch: 12 }, { wch: 10 }, { wch: 20 }, { wch: 20 }];
         XLSX.utils.book_append_sheet(wb, ws, "SOAP Notes Index");
+        totalRows += sheetData.length;
+        sheetData.length = 0;
       }
 
-      // Sheet 3: Appointments Index
+      // Tab 4: Appointments Index
       if (apptIndex?.length) {
         const sheetData = apptIndex.map((row: any) => {
           const name = (row.PatientName || row.Patient || "").trim();
@@ -165,19 +194,17 @@ serve(async (req) => {
         }
         ws["!cols"] = [{ wch: 30 }, { wch: 12 }, { wch: 10 }, { wch: 20 }, { wch: 20 }];
         XLSX.utils.book_append_sheet(wb, ws, "Appointments Index");
+        totalRows += sheetData.length;
+        sheetData.length = 0;
       }
-
-      if (wb.SheetNames.length > 0) {
-        await uploadWorkbook(wb, "patient_data", demoCount + (soapIndex?.length || 0) + (apptIndex?.length || 0), "consolidated_export");
-      }
+      // Block scope ends — patientList, soapIndex, apptIndex, and lookup maps eligible for GC
     }
-    // Block scope ends — patientList, soapIndex, apptIndex, and all maps are now eligible for GC
 
-    // ==================== WORKBOOK 2: Financials (separate — can be huge) ====================
+    // ---- Tab 5: Financials (canonical 13-col schema, AOA for low-memory build) ----
     {
       const ledgerRaw = await downloadJson(`${tmpPrefix}/financialsLedgerRows.json`);
       if (ledgerRaw?.length) {
-        // Build DOB lookup again from patient list (small cost, big memory savings vs keeping it around)
+        // Rebuild DOB lookup from patient list (small CPU cost; big memory savings vs holding state across blocks).
         const patientListForDob = await downloadJson(`${tmpPrefix}/patientList.json`);
         const dobLookup: Record<string, string> = {};
         if (patientListForDob) {
@@ -187,44 +214,38 @@ serve(async (req) => {
               : (p.Patient_Name || p.Name || p.Patient || Object.values(p)[0] || "").toString().trim();
             dobLookup[name] = p.dob || p.DOB || p.Date_Of_Birth || "";
           }
+          patientListForDob.length = 0;
         }
-        // Free patient list immediately
-        if (patientListForDob) patientListForDob.length = 0;
 
-        const finCount = ledgerRaw.length;
+        // Stamp DOB onto every row before serializing.
         for (const row of ledgerRaw) {
           row.DOB = dobLookup[(row.PatientName || row.Patient || row.patient || "").trim()] || "";
         }
 
-        // Build sheet using AOA (array-of-arrays) for lower memory than json_to_sheet
-        const keys = Object.keys(ledgerRaw[0]);
-        const aoa: (string | number)[][] = [keys];
+        const finCount = ledgerRaw.length;
+        const aoa: (string | number)[][] = [FINANCIALS_COLUMNS];
         for (const row of ledgerRaw) {
-          aoa.push(keys.map(k => row[k] ?? ""));
+          aoa.push(FINANCIALS_COLUMNS.map(k => row[k] ?? ""));
         }
-        // Free ledgerRaw before building worksheet
+        // Free ledgerRaw before building worksheet (large array).
         ledgerRaw.length = 0;
 
-        const wb = XLSX.utils.book_new();
         const ws = XLSX.utils.aoa_to_sheet(aoa);
-        // Free aoa before adding to workbook (sheet already built)
+        // Free aoa intermediate (sheet already built).
         aoa.length = 0;
         XLSX.utils.book_append_sheet(wb, ws, "Financials");
-
-        await uploadWorkbook(wb, "financials", finCount, "financials_ledger");
+        totalRows += finCount;
       }
     }
 
-    if (uploadedFiles.length === 0) {
-      return new Response(JSON.stringify({ ok: false, message: "No data files found" }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    // ---- Single upload, jobId-based filename (idempotent across re-runs) ----
+    const xlsxPath = `${userId}/chirofusion_export_${jobId}.xlsx`;
+    await uploadWorkbook(wb, xlsxPath, totalRows, "consolidated_export");
 
     return new Response(JSON.stringify({
       ok: true,
-      xlsxPath: `${userId}/patient_data_latest.xlsx`,
-      message: `Uploaded ${uploadedFiles.length} workbook(s): ${uploadedFiles.join(", ")} (${totalRows} total rows)`,
+      xlsxPath,
+      message: `Uploaded unified workbook (${wb.SheetNames.length} tabs, ${totalRows} total rows)`,
     }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
   } catch (e: any) {
     return new Response(JSON.stringify({ error: e.message }), {
