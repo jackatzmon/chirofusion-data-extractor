@@ -116,31 +116,60 @@ function parseNetDate(dateStr: string | null): string {
   return dateStr;
 }
 
-/** Parse ShowLedger HTML response to extract ledger table rows */
+/** Parse ShowLedger HTML response to extract ledger table rows.
+ *
+ * Always returns rows with the canonical 10-key shape (PatientName/DOB/Status
+ * are added by the caller):
+ *   Date, Type, CPTCode, ICDCodes, Description, Charges, Payments, Adjustments, Balance, Notes
+ */
 function parseLedgerHtml(html: string): Record<string, string>[] {
   const rows: Record<string, string>[] = [];
 
-  // Extract all <tr> rows from the ledger table
-  const trRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-  let trMatch;
+  // Canonical (parser-owned) keys — always present on every returned row.
+  const CANONICAL_KEYS = [
+    "Date", "Type", "CPTCode", "ICDCodes", "Description",
+    "Charges", "Payments", "Adjustments", "Balance", "Notes",
+  ] as const;
 
-  // First, try to find headers from <th> elements
-  const headers: string[] = [];
+  // Map a raw HTML header to one of: a canonical key, "Item" (CPT+ICD source),
+  // "Transaction" (routed by Type), or "" (ignored).
+  // Recognized aliases: "Date" | "Type" | "Item" | "Description"/"Desc"/"Procedure"
+  // | "Transaction"/"Amount" | "Charges"/"Charge" | "Payments"/"Payment"
+  // | "Adjustments"/"Adj"/"Adjustment" | "Balance"/"Running Balance"/"Bal"
+  // | "Notes"/"Memo"/"Comment"
+  function canonicalizeHeader(raw: string): string {
+    const h = raw.trim().toLowerCase();
+    if (h === "date") return "Date";
+    if (h === "type") return "Type";
+    if (h === "item") return "Item";
+    if (h === "description" || h === "desc" || h === "procedure") return "Description";
+    if (h === "transaction" || h === "amount") return "Transaction";
+    if (h === "charges" || h === "charge") return "Charges";
+    if (h === "payments" || h === "payment") return "Payments";
+    if (h === "adjustments" || h === "adj" || h === "adjustment") return "Adjustments";
+    if (h === "balance" || h === "running balance" || h === "bal") return "Balance";
+    if (h === "notes" || h === "memo" || h === "comment") return "Notes";
+    return "";
+  }
+
+  // Extract headers from <thead><th>...</th></thead>
+  const rawHeaders: string[] = [];
   const theadMatch = html.match(/<thead[^>]*>([\s\S]*?)<\/thead>/i);
   if (theadMatch) {
     const thRegex = /<th[^>]*>([\s\S]*?)<\/th>/gi;
     let thMatch;
     while ((thMatch = thRegex.exec(theadMatch[1])) !== null) {
-      // Strip HTML tags from header text
       const text = thMatch[1].replace(/<[^>]*>/g, "").trim();
-      headers.push(text || `Column${headers.length}`);
+      rawHeaders.push(text);
     }
   }
-
-  // If no headers found, use default ledger columns
-  if (headers.length === 0) {
-    headers.push("Date", "Description", "CPTCode", "Charges", "Payments", "Adjustments", "Balance");
+  // If no headers found, assume default ChiroFusion column order.
+  if (rawHeaders.length === 0) {
+    rawHeaders.push("Date", "Type", "Item", "Description", "Transaction", "Balance", "Notes");
   }
+
+  const headerSlots = rawHeaders.map(canonicalizeHeader);
+  const hasExplicitDescription = headerSlots.includes("Description");
 
   // Extract ALL <tbody> sections (there may be one per visit/date group)
   let bodyContent = "";
@@ -149,34 +178,71 @@ function parseLedgerHtml(html: string): Record<string, string>[] {
   while ((tbodyMatch = tbodyRegex.exec(html)) !== null) {
     bodyContent += tbodyMatch[1] + "\n";
   }
-  // If no tbody found, use full HTML
   if (!bodyContent) bodyContent = html;
 
+  const trRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let trMatch;
   while ((trMatch = trRegex.exec(bodyContent)) !== null) {
     const trContent = trMatch[1];
-    // Skip header rows (already parsed above)
     if (trContent.includes("<th")) continue;
 
     const cells: string[] = [];
     const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
     let tdMatch;
     while ((tdMatch = tdRegex.exec(trContent)) !== null) {
-      // Strip HTML tags and trim whitespace
       const text = tdMatch[1].replace(/<[^>]*>/g, "").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").trim();
       cells.push(text);
     }
-
     if (cells.length === 0) continue;
 
-    // Map cells to headers
+    // Seed canonical row with empty strings.
     const row: Record<string, string> = {};
-    for (let c = 0; c < Math.min(cells.length, headers.length); c++) {
-      row[headers[c]] = cells[c];
+    for (const k of CANONICAL_KEYS) row[k] = "";
+
+    // First pass: capture Type so Transaction routing knows where to land.
+    for (let c = 0; c < Math.min(cells.length, headerSlots.length); c++) {
+      if (headerSlots[c] === "Type") row.Type = cells[c];
     }
-    // If more cells than headers, append extras
-    for (let c = headers.length; c < cells.length; c++) {
-      row[`Extra${c}`] = cells[c];
+
+    let itemRaw = "";
+    for (let c = 0; c < Math.min(cells.length, headerSlots.length); c++) {
+      const slot = headerSlots[c];
+      const value = cells[c];
+      if (!slot) continue;
+      switch (slot) {
+        case "Type":
+          // already captured
+          break;
+        case "Item":
+          itemRaw = value;
+          break;
+        case "Transaction": {
+          const t = (row.Type || "").toUpperCase();
+          if (t === "C") row.Charges = value;
+          else if (t === "P") row.Payments = value;
+          else if (t === "A") row.Adjustments = value;
+          else row.Charges = row.Charges || value;
+          break;
+        }
+        default:
+          row[slot] = value;
+      }
     }
+
+    // CPT + ICD extraction from the Item cell.
+    if (itemRaw) {
+      const itemStr = String(itemRaw);
+      const cptMatch = itemStr.match(/^\s*(\d{4,5}(?:-\d+)?)/);
+      const cpt = cptMatch ? cptMatch[1] : "";
+      const icdRegex = /[A-Z]\d{2}\.[\d.A-Z]+/g;
+      const icds = [...itemStr.matchAll(icdRegex)].map(m => m[0]);
+      const icdCodes = icds.join(", ");
+      if (cpt) row.CPTCode = cpt;
+      if (icdCodes) row.ICDCodes = icdCodes;
+      // Only fall back to Item text for Description if HTML had no Description col.
+      if (!hasExplicitDescription && !row.Description) row.Description = itemStr;
+    }
+
     rows.push(row);
   }
 
@@ -2465,7 +2531,17 @@ ${body}
                   ledgerEmpty++;
                   allLedgerRows.push({
                     PatientName: patientName,
-                    Date: "", Description: "", CPTCode: "", Charges: "", Payments: "", Adjustments: "", Balance: "",
+                    DOB: "",
+                    Date: "",
+                    Type: "",
+                    CPTCode: "",
+                    ICDCodes: "",
+                    Description: "",
+                    Charges: "",
+                    Payments: "",
+                    Adjustments: "",
+                    Balance: "",
+                    Notes: "",
                     Status: "No visits found",
                   });
                   processedCount = i + 1;
@@ -2513,13 +2589,17 @@ ${body}
                   // Add a status row so every patient appears in the output
                   allLedgerRows.push({
                     PatientName: patientName,
+                    DOB: "",
                     Date: "",
-                    Description: "",
+                    Type: "",
                     CPTCode: "",
+                    ICDCodes: "",
+                    Description: "",
                     Charges: "",
                     Payments: "",
                     Adjustments: "",
                     Balance: "",
+                    Notes: "",
                     Status: "No transactions",
                   });
                   if (isDebug) logParts.push(`  No ledger rows parsed for ${patientName}`);
@@ -2527,9 +2607,11 @@ ${body}
                   continue;
                 }
 
-                // Prepend patient name to each row
+                // Prepend patient name to each row and ensure canonical 13-col shape
                 for (const row of ledgerRows) {
                   row["PatientName"] = patientName;
+                  if (row["DOB"] === undefined) row["DOB"] = "";
+                  if (row["Status"] === undefined) row["Status"] = "";
                 }
 
                 allLedgerRows.push(...ledgerRows);
