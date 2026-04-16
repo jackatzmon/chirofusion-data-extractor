@@ -39,6 +39,35 @@ serve(async (req) => {
     const tmpPrefix = `_batch_tmp/${jobId}`;
     let totalRows = 0;
 
+    // Per-patient aggregator for the Master roll-up tab. Seeded in the indices
+    // block (demographics + SOAP), updated in the Financials block (totals,
+    // visits, CPT/ICD histograms).
+    type MasterAgg = {
+      name: string;
+      demo: { address: string; phone: string; dob: string; email: string };
+      soap: string;
+      soapPdf: string;
+      firstVisit: string;
+      lastVisit: string;
+      visitCount: number;
+      totalCharged: number;
+      totalPaid: number;
+      totalAdjustments: number;
+      currentBalance: number;
+      cptCounts: Record<string, number>;
+      icdCounts: Record<string, number>;
+      allCpts: Set<string>;
+    };
+    const masterByPatient: Record<string, MasterAgg> = {};
+
+    // Parse ChiroFusion dollar strings like "$1,234.56" into a number.
+    const parseAmount = (v: any): number => {
+      if (v == null || v === "") return 0;
+      const s = String(v).replace(/[\$,\s]/g, "");
+      const n = parseFloat(s);
+      return isNaN(n) ? 0 : n;
+    };
+
     async function downloadJson(path: string): Promise<any> {
       const { data, error } = await serviceClient.storage.from(bucket).download(path);
       if (error || !data) return null;
@@ -127,6 +156,41 @@ serve(async (req) => {
               email: p.email || p.Email || "",
             };
           }
+        }
+      }
+
+      // ---- Seed Master aggregator (one entry per demographics patient) ----
+      // Every patient appears in Master even with zero financial activity.
+      if (patientList) {
+        for (const p of patientList) {
+          const name = p.firstName && p.lastName
+            ? `${p.lastName}, ${p.firstName}`.trim()
+            : (p.Patient_Name || p.Name || p.Patient || Object.values(p)[0] || "").toString().trim();
+          if (!name || masterByPatient[name]) continue;
+          masterByPatient[name] = {
+            name,
+            demo: demoByName[name] || { address: "", phone: "", dob: "", email: "" },
+            soap: soapSummary[name] || "None",
+            soapPdf: "",
+            firstVisit: "",
+            lastVisit: "",
+            visitCount: 0,
+            totalCharged: 0,
+            totalPaid: 0,
+            totalAdjustments: 0,
+            currentBalance: 0,
+            cptCounts: {},
+            icdCounts: {},
+            allCpts: new Set<string>(),
+          };
+        }
+      }
+      // Attach first non-empty SOAP PDF link per patient.
+      if (soapIndex) {
+        for (const s of soapIndex) {
+          const name = (s.PatientName || s.Patient || "").trim();
+          const m = masterByPatient[name];
+          if (m && !m.soapPdf && s.PDFLink) m.soapPdf = s.PDFLink;
         }
       }
 
@@ -222,9 +286,50 @@ serve(async (req) => {
           row.DOB = dobLookup[(row.PatientName || row.Patient || row.patient || "").trim()] || "";
         }
 
+        // Sort in place by (PatientName, Date) so the currentBalance "last wins"
+        // rule is chronologically correct. Walk ledgerRaw ONCE — no duplicate array.
+        ledgerRaw.sort((a: any, b: any) => {
+          const an = (a.PatientName || "").toString();
+          const bn = (b.PatientName || "").toString();
+          if (an !== bn) return an.localeCompare(bn);
+          return (a.Date || "").toString().localeCompare((b.Date || "").toString());
+        });
+
         const finCount = ledgerRaw.length;
         const aoa: (string | number)[][] = [FINANCIALS_COLUMNS];
         for (const row of ledgerRaw) {
+          // --- Master aggregation ---
+          const name = (row.PatientName || "").toString().trim();
+          const m = masterByPatient[name];
+          if (m) {
+            const date = row.Date || "";
+            const chargeAmt = parseAmount(row.Charges);
+            const isCharge = (row.Type === "C") || chargeAmt > 0;
+            if (isCharge && date) {
+              m.visitCount++;
+              if (!m.firstVisit || date < m.firstVisit) m.firstVisit = date;
+              if (!m.lastVisit || date > m.lastVisit) m.lastVisit = date;
+            }
+            m.totalCharged += chargeAmt;
+            m.totalPaid += parseAmount(row.Payments);
+            m.totalAdjustments += parseAmount(row.Adjustments);
+            if (row.Balance) {
+              const b = parseAmount(row.Balance);
+              if (!isNaN(b)) m.currentBalance = b; // last-in-sorted-order wins
+            }
+            if (row.CPTCode) {
+              const cpt = String(row.CPTCode);
+              m.cptCounts[cpt] = (m.cptCounts[cpt] || 0) + 1;
+              m.allCpts.add(cpt);
+            }
+            if (row.ICDCodes) {
+              for (const icd of String(row.ICDCodes).split(",").map((s: string) => s.trim()).filter(Boolean)) {
+                m.icdCounts[icd] = (m.icdCounts[icd] || 0) + 1;
+              }
+            }
+          }
+
+          // --- AOA row (Financials tab) ---
           aoa.push(FINANCIALS_COLUMNS.map(k => row[k] ?? ""));
         }
         // Free ledgerRaw before building worksheet (large array).
@@ -236,6 +341,64 @@ serve(async (req) => {
         XLSX.utils.book_append_sheet(wb, ws, "Financials");
         totalRows += finCount;
       }
+    }
+
+    // ---- Populate Master tab (replaces the placeholder from earlier) ----
+    {
+      const topN = (counts: Record<string, number>, n: number): string =>
+        Object.entries(counts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, n)
+          .map(([code, ct]) => `${code} (${ct})`)
+          .join(", ");
+      const fmt = (n: number) => `$${n.toFixed(2)}`;
+
+      const masterRows = Object.values(masterByPatient)
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map(m => ({
+          "Patient Name": m.name,
+          "DOB": m.demo.dob || "",
+          "Address": m.demo.address || "",
+          "Phone": m.demo.phone || "",
+          "Email": m.demo.email || "",
+          "First Visit": m.firstVisit,
+          "Last Visit": m.lastVisit,
+          "Total Visits": m.visitCount,
+          "SOAP Notes": m.soap,
+          "SOAP PDF Link": m.soapPdf,
+          "Total Charged": fmt(m.totalCharged),
+          "Total Paid": fmt(m.totalPaid),
+          "Total Adjustments": fmt(m.totalAdjustments),
+          "Current Balance": fmt(m.currentBalance),
+          "Top CPT Codes": topN(m.cptCounts, 5),
+          "Top ICD Codes": topN(m.icdCounts, 5),
+          "All CPT Codes": [...m.allCpts].sort().join(" | "),
+        }));
+
+      const populatedMasterWs = XLSX.utils.json_to_sheet(masterRows, { header: MASTER_COLUMNS });
+      // Wire SOAP PDF Link column (index 9) as a clickable 📎 Open PDF hyperlink.
+      const soapLinkColIdx = MASTER_COLUMNS.indexOf("SOAP PDF Link");
+      for (let r = 0; r < masterRows.length; r++) {
+        const link = masterRows[r]["SOAP PDF Link"];
+        if (!link) continue;
+        const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: soapLinkColIdx });
+        populatedMasterWs[cellRef] = {
+          t: "s",
+          v: "📎 Open PDF",
+          l: { Target: link, Tooltip: "Open SOAP Note PDF" },
+        };
+      }
+      populatedMasterWs["!cols"] = [
+        { wch: 30 }, { wch: 12 }, { wch: 40 }, { wch: 15 }, { wch: 30 },
+        { wch: 12 }, { wch: 12 }, { wch: 12 },
+        { wch: 15 }, { wch: 15 },
+        { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 },
+        { wch: 40 }, { wch: 40 }, { wch: 80 },
+      ];
+      // Replace the header-only placeholder; Master stays as the first tab.
+      wb.Sheets["Master"] = populatedMasterWs;
+      totalRows += masterRows.length;
+      masterRows.length = 0;
     }
 
     // ---- Single upload, jobId-based filename (idempotent across re-runs) ----
