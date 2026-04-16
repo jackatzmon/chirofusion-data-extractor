@@ -2620,6 +2620,17 @@ ${body}
 
               } catch (err) {
                 logParts.push(`❌ Ledger ${patient.firstName} ${patient.lastName}: ${(err as any).message}`);
+                // Error-path flush: a per-patient failure often precedes OOM or a
+                // cold kill. Persist whatever's buffered so we don't lose the
+                // rows accumulated for nearby patients.
+                if (allLedgerRows.length > 0) {
+                  try {
+                    await appendToStorageArray("financialsLedgerRows", allLedgerRows);
+                    allLedgerRows.length = 0;
+                  } catch (flushErr) {
+                    logParts.push(`  (flush after error also failed: ${(flushErr as any).message})`);
+                  }
+                }
               }
 
               processedCount = i + 1;
@@ -2636,10 +2647,22 @@ ${body}
                 }
               }
 
-              // Flush ledger rows to storage every 100 patients to prevent memory overflow
-              if (allLedgerRows.length >= 500) {
+              // Crash-safe flush: every 25 processed patients (regardless of row count)
+              // flush the buffer AND persist resumeIndex so a mid-batch crash doesn't
+              // lose the accumulated rows or re-do those patients.
+              if (processedCount > 0 && processedCount % 25 === 0) {
                 await appendToStorageArray("financialsLedgerRows", allLedgerRows);
-                allLedgerRows.length = 0; // free memory
+                allLedgerRows.length = 0;
+                await serviceClient.from("scrape_jobs").update({
+                  batch_state: {
+                    ...(_batchState || {}),
+                    resumeIndex: processedCount,
+                    dataTypeIndex: dataTypes.indexOf(dataType),
+                    ledgerFetched,
+                    ledgerEmpty,
+                    ledgerSearchFailed,
+                  },
+                }).eq("id", job.id);
               }
 
               await new Promise(r => setTimeout(r, 150));

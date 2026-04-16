@@ -88,17 +88,25 @@ serve(async (req) => {
         });
       if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
 
-      // Best-effort cleanup of any prior result rows for this (job, data_type) so
-      // re-runs of salvage-csv don't accumulate duplicate dashboard entries.
-      await serviceClient.from("scraped_data_results")
-        .delete()
-        .eq("scrape_job_id", jobId)
-        .eq("data_type", dataType);
+      // Upsert on (scrape_job_id, data_type) so re-runs of salvage-csv don't
+      // accumulate duplicate dashboard entries. Falls back to delete+insert if
+      // the unique constraint isn't defined.
+      const { error: upsertError } = await serviceClient.from("scraped_data_results")
+        .upsert({
+          user_id: userId, scrape_job_id: jobId,
+          data_type: dataType, file_path: xlsxPath, row_count: rowCount,
+        }, { onConflict: "scrape_job_id,data_type" });
 
-      await serviceClient.from("scraped_data_results").insert({
-        user_id: userId, scrape_job_id: jobId,
-        data_type: dataType, file_path: xlsxPath, row_count: rowCount,
-      });
+      if (upsertError) {
+        await serviceClient.from("scraped_data_results")
+          .delete()
+          .eq("scrape_job_id", jobId)
+          .eq("data_type", dataType);
+        await serviceClient.from("scraped_data_results").insert({
+          user_id: userId, scrape_job_id: jobId,
+          data_type: dataType, file_path: xlsxPath, row_count: rowCount,
+        });
+      }
     }
 
     // ==================== UNIFIED WORKBOOK ====================
