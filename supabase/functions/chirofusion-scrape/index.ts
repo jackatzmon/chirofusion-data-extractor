@@ -1931,7 +1931,7 @@ Deno.serve(async (req) => {
                 } else {
                   const { data: signedUrlData } = await serviceClient.storage
                     .from("scraped-data")
-                    .createSignedUrl(filePath, 2592000); // 30 days
+                    .createSignedUrl(filePath, 3153600000); // 100 years — effectively permanent; links are embedded in the exported workbook and must never time out
                   appointmentsIndex.push({
                     PatientName: pName,
                     Appointments: pAppts.length,
@@ -2250,10 +2250,11 @@ Deno.serve(async (req) => {
                     if (uploadError) {
                       logParts.push(`❌ Upload error ${patient.firstName}: ${uploadError.message}`);
                     } else {
-                      // Generate signed URL (30 days) for the workbook link
+                      // Generate a signed URL (100 years — effectively permanent) for the workbook link.
+                      // SOAP PDF links live inside the exported workbook and were expiring after 30 days.
                       const { data: signedUrlData } = await serviceClient.storage
                         .from("scraped-data")
-                        .createSignedUrl(filePath, 2592000);
+                        .createSignedUrl(filePath, 3153600000);
                       soapIndex.push({
                         PatientName: `${patient.lastName}, ${patient.firstName}`,
                         Documents: blobNames.length,
