@@ -1,4 +1,2 @@
 project_id = "mihfhzhvfnzuduxfsxed"
 
-[functions.export-pdf-manifest]
-verify_jwt = false
